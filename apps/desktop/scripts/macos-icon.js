@@ -28,14 +28,33 @@ const ICONSET_SIZES = [
  * actool compiles the Icon Composer document, but it ships with the full Xcode
  * app and not with the Command Line Tools. Without it the icon is built from
  * the app icon PNG, which every Mac has the tools for.
+ *
+ * `xcrun` only finds actool once the developer directory points at a full
+ * Xcode, which takes a root password to set. The binary itself sits in the
+ * Xcode app, so it is looked up there too and used without switching.
  */
-async function actoolAvailable() {
+const ACTOOL_PATHS = [
+  '/Applications/Xcode.app/Contents/Developer/usr/bin/actool',
+  '/Applications/Xcode-beta.app/Contents/Developer/usr/bin/actool',
+]
+
+async function findActool() {
   try {
-    await execFileAsync('xcrun', ['--find', 'actool'])
-    return true
+    const { stdout } = await execFileAsync('xcrun', ['--find', 'actool'])
+    const found = stdout.trim()
+    if (found) return found
   } catch {
-    return false
+    // No full Xcode in the developer directory: the paths below are the way.
   }
+  for (const candidate of ACTOOL_PATHS) {
+    try {
+      await execFileAsync('/usr/bin/test', ['-x', candidate])
+      return candidate
+    } catch {
+      continue
+    }
+  }
+  return undefined
 }
 
 async function buildIcnsFromPng(outputPath) {
@@ -83,9 +102,9 @@ export async function installMacOSIcon(appBundle) {
     await mkdir(resourcesDirectory, { recursive: true })
     const plistPath = path.join(appBundle, 'Contents', 'Info.plist')
 
-    if (await actoolAvailable()) {
-      await execFileAsync('xcrun', [
-        'actool',
+    const actool = await findActool()
+    if (actool) {
+      await execFileAsync(actool, [
         iconDocument,
         '--compile',
         outputDirectory,
