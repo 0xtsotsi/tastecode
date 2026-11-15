@@ -1,0 +1,9152 @@
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from 'react'
+import type {
+  AnimationEvent as ReactAnimationEvent,
+  ComponentProps,
+  CSSProperties,
+  TransitionEvent as ReactTransitionEvent,
+} from 'react'
+import type {
+  Account,
+  AccountId,
+  ApprovalDecision,
+  ApprovalMode,
+  DomainEvent,
+  Model,
+  ProviderId,
+  ProviderStatus,
+  PullRequestListItem,
+  PullRequestTarget,
+  QueuedTurn,
+  ResultOf,
+  SidebarSettings,
+  ThreadSettings,
+} from '@harness/contracts'
+import { DEFAULT_ACCOUNT_ID } from '@harness/contracts'
+import {
+  isDesktop,
+  isMacOS,
+  onNativeMenuAction,
+  ownServerToken,
+  pickFolder,
+  reportStartupMilestone,
+  setDesktopTheme,
+  syncNativeMenuShortcuts,
+} from './bridge.js'
+import {
+  clearAgentBrowserEvents,
+  deliverAgentBrowserEvent,
+  showBrowserThread,
+} from './browser-capability.js'
+import {
+  createDefaultKeybindings,
+  DEBUG_SETTINGS_SHORTCUT,
+  KEYBINDING_DEFINITIONS,
+  matchesShortcut,
+  readKeybindings,
+  shortcutLabel,
+  shortcutRoute,
+  WORKSPACE_TOOL_SHORTCUTS,
+  writeKeybindings,
+  type KeybindingId,
+  type Shortcut,
+} from './shortcuts.js'
+import { sliceCodeUnits } from './slice-code-units.js'
+import { readTerminalPlacement, subscribeTerminalPlacement } from './terminal-placement.js'
+import { useChatNotifications } from './use-chat-notifications.js'
+import { useAppUpdateInstallGate } from './app-update-install.js'
+import { ProviderUpdateNotice } from './ui/ProviderUpdates.js'
+import { AppUpdateToast } from './ui/AppUpdateToast.js'
+import { NoticeBody } from './ui/Notice.js'
+import { IndeterminateRequestError, Transport, type MissingServer } from './transport.js'
+import { OptimisticMutations } from './optimistic-mutations.js'
+import {
+  appendUserMessage,
+  beginOptimisticTurn,
+  createOptimisticMessageId,
+  emptyThread,
+  lastSentPrompt,
+  removeOptimisticMessage,
+  type ThreadState,
+} from './thread-store.js'
+import {
+  ThreadController,
+  removePendingSubmission,
+  type PaneSlot,
+  type PendingSubmission,
+  type RecoverableDraft,
+} from './thread-controller.js'
+
+import {
+  hasWorkspaceStartForPath,
+  indexQueueItemIdsForChecks,
+  indexWorkspaceSessions,
+  ThreadOwnedMap,
+  workspaceProjectActivity,
+} from './workspace-idle.js'
+import { createPaletteChatSearch, createPaletteChatSearchCache } from './palette-chat-search.js'
+import { createProjectChoiceProjector } from './project-choices.js'
+import {
+  findSession,
+  markSessionRead,
+  promoteSession,
+  reconcileProjectList,
+  removeSession,
+  sessionOnProvider,
+  updateSession,
+  updateSessions,
+  withoutDeletedSessions,
+  withStoppingSessions,
+} from './project-store.js'
+import {
+  applyProjectOrder,
+  moveRailSession,
+  parseStoredProjectOrder,
+  parseStoredSessionOrder,
+  sidebarSessions,
+} from './sidebar-order.js'
+import { createSessionOrderSerializer } from './session-order-serializer.js'
+import type { CommandScope, PaletteCommand } from './ui/CommandPalette.js'
+import type { AppScreen } from './app-commands.js'
+import { browserCommentImages, browserCommentsAsPlainText } from './ui/browser-comments.js'
+import { Composer, type SendAvailability, type WorkspaceInfo } from './ui/Composer.js'
+import { composerWireText } from './ui/composer-chips.js'
+import {
+  formatModelName,
+  getFastModeOffValue,
+  getFastServiceTier,
+  getNextServiceTierForModel,
+} from './ui/model-selector-utils.js'
+import type { Checkpoint } from './ui/RollbackDialog.js'
+import { SessionSearchHost, type SessionSearchHandle } from './ui/SessionSearchHost.js'
+import { useStageGlide } from './ui/stage-glide.js'
+import type { SettingsSection } from './ui/Settings.js'
+import { Sidebar, type Project, type Session } from './ui/Sidebar.js'
+import {
+  accountAtLimit,
+  continueAccounts,
+  continuationNote,
+  continuedIn,
+  type EarlierChanges,
+  lastRequest,
+} from './continue-account.js'
+import { Skeleton, SkeletonStatus, ThreadSkeleton } from './ui/Skeleton.js'
+import {
+  PullRequestsSkeleton,
+  SettingsSkeleton,
+  WorkspacePanelSkeleton,
+} from './ui/SurfaceSkeletons.js'
+import { PanelToggles, StageHeader } from './ui/StageHeader.js'
+import { PaneComposer, SplitPane } from './ui/SplitPane.js'
+import { loadSplitViewStyles } from './ui/split-view-context.js'
+import { useChatDrop } from './ui/chat-drop.js'
+import { ChatDropOverlay } from './ui/ChatDropOverlay.js'
+import { SurfaceErrorBoundary } from './ui/SurfaceErrorBoundary.js'
+import { surfaceLoadFailed } from './surface-load-error.js'
+import { preloadWhenIdle } from './idle-preload.js'
+import { NoticePresence } from './ui/NoticePresence.js'
+import type { ComposerError } from './ui/ComposerErrors.js'
+import { LazyThread } from './ui/LazyThread.js'
+import { ModelNameContext, type ModelName } from './model-name.js'
+import { TitleBar } from './ui/TitleBar.js'
+import { ZoomHud } from './ui/ZoomHud.js'
+import { useDeferredArchiveQueue } from './ui/useDeferredArchiveQueue.js'
+import { serverBaseUrl } from './server-url.js'
+import { addDesignBriefing } from './design-agent/briefing.js'
+import { sourceSupportsAttachments } from './attachment-capability.js'
+import { canCaptureVoice, type VoiceRecording } from './voice-capability.js'
+import { pollUsageLimits, UsageLimitsController, type LimitTarget } from './usage-limits-state.js'
+import { sameAccount } from './usage-summary-state.js'
+import { UsageResetController, usageResetAt } from './usage-reset.js'
+import { poolsOf, recommendedAccounts } from './account-pool.js'
+import {
+  AccountLabelContext,
+  accountLabelOf,
+  accountsOf,
+  activeAccountOf,
+  namedNewChatAccount,
+  useProviderAccounts,
+  type AccountLabel,
+  type ProviderAccountsSnapshot,
+} from './provider-accounts-state.js'
+import {
+  agentMark,
+  choicesFor,
+  customModelChoice,
+  customModelKey,
+  isCustomModelChoice,
+  modelChoiceKey,
+  modelVisibilityDefaults,
+  providerDisplayName,
+  providerMark,
+  resolveReasoningEffort,
+  sourceKey,
+  type ModelChoice,
+} from './model-catalog.js'
+import {
+  chooseModelsVisibility,
+  EMPTY_MODEL_VISIBILITY,
+  hiddenModelKeys,
+  importLegacyModelVisibility,
+  legacyHiddenChoices,
+  parseModelVisibility,
+  recordModelSuccessors,
+  serializeModelVisibility,
+  settleModelVisibilitySource,
+  type ModelVisibilityRecord,
+} from './model-catalog-visibility.js'
+import {
+  freshModelCatalogChoices,
+  isModelCatalogSourceFresh,
+  parseModelCatalogCache,
+  serializeModelCatalogCache,
+} from './model-catalog-cache.js'
+import { parseSideChatCommand } from './side-chat-command.js'
+import { FEEDBACK_SENT_NOTICE, useFeedbackStatus, type FeedbackRequest } from './feedback-state.js'
+import {
+  composerDraftKey,
+  isEmptyComposerDraft,
+  NEW_CHAT_DRAFT_KEY,
+  type ComposerDraft,
+} from './composer-drafts.js'
+import type { ComposerResource } from './ui/ComposerResourcePicker.js'
+import {
+  clearInstall,
+  installState,
+  loginKey,
+  subscribeInstalls,
+  type ProviderLoginTerminalTarget,
+} from './provider-install.js'
+import {
+  PROVIDER_RECHECK_INTERVAL_MS,
+  providerScanChanged,
+  useRecheckOnFocus,
+} from './provider-recheck.js'
+import {
+  lastSignIn,
+  rememberedSignIn,
+  rememberedSignInsVersion,
+  rememberSignIn,
+  subscribeRememberedSignIns,
+} from './remembered-sign-in.js'
+import { knownSignIn, providerCanRun } from './provider-availability.js'
+import {
+  defaultsScope,
+  isDefaultsScope,
+  pinnedModelChoice,
+  readProviderDefaults,
+  scopedDefault,
+  writeProviderDefaults,
+  type DefaultsScope,
+  type ProviderDefault,
+  type ProviderDefaults,
+} from './provider-defaults.js'
+import type {
+  SideChatParentStatus,
+  SideChatPromptRequest,
+  SideChatStartOptions,
+} from './ui/workspace/WorkspaceSideChat.js'
+import type { BrowserNavigationRequest } from './ui/workspace/WorkspaceBrowser.js'
+import type { AnnotationDraft } from './ui/workspace/browser-annotations.js'
+import type { WorkspaceTool } from './ui/workspace/WorkspacePanel.js'
+import { useCheckoutPullRequest } from './ui/pull-requests/useCheckoutPullRequest.js'
+import {
+  DEFAULT_BOTTOM_PANEL_HEIGHT,
+  restoreWorkspacePanelWidth,
+} from './ui/workspace/workspace-panel-width.js'
+import { useWindowChrome } from './window-chrome.js'
+import { AppBackground } from './ui/AppBackground.js'
+import { backdropColorScheme } from './theme-colors.js'
+import { adoptedSelection, shareSavedSetups, sharedSetup } from './thread-settings.js'
+import {
+  readProfileIdentityPreferences,
+  writeProfileIdentityPreferences,
+  type ProfileIdentityPreferences,
+} from './profile-preferences.js'
+import {
+  agentRosterKey,
+  readProviderRoster,
+  rosterAgent,
+  rosterAllows,
+  seedProviderRoster,
+  writeProviderRoster,
+  type ProviderRoster,
+} from './provider-roster.js'
+import {
+  ACCENT_KEY,
+  applyAccentPreference,
+  applyBackdropPreference,
+  applyFontPreference,
+  applyGlassPreference,
+  applyTheme,
+  BACKDROP_KEY,
+  colorSchemeForTheme,
+  DARK_THEME_QUERY,
+  FONT_KEY,
+  GLASS_KEY,
+  appearanceKey,
+  readAppearancePreferences,
+  type AppearancePreference,
+  readSystemTheme,
+  readThemePreference,
+  THEME_KEY,
+  type Theme,
+  type ThemePreference,
+} from './theme.js'
+
+const SERVER_BASE_URL = serverBaseUrl(import.meta.env.VITE_HARNESS_SERVER_URL)
+const SETUP_KEY = 'harness.provider'
+const ONBOARDING_KEY = 'harness.onboarding.v1'
+const DRAFT_REPLACED_NOTICE = 'Your draft was replaced.'
+const PROVIDER_IDS = [
+  'claude-code',
+  'codex',
+  'grok',
+  'cursor',
+  'opencode',
+  'antigravity',
+  'pi',
+  'acp',
+  'api',
+] as const satisfies readonly ProviderId[]
+const PROVIDER_ID_SET = new Set<ProviderId>(PROVIDER_IDS)
+/** Engines a custom model can be attached to — ACP agents and API
+ *  connections carry their own roster concepts and stay out of this list. */
+const DIRECT_PROVIDER_IDS = PROVIDER_IDS.filter((id) => id !== 'acp' && id !== 'api' && id !== 'pi')
+const DIRECT_PROVIDER_ID_SET = new Set<ProviderId>(DIRECT_PROVIDER_IDS)
+/** Which named agent or custom harness source was chosen. */
+const AGENT_KEY = 'harness.acpAgent'
+const AGENT_NAME_KEY = 'harness.acpAgentName'
+const PROJECTS_KEY = 'harness.projects'
+const PROJECT_ORDER_KEY = 'harness.projectOrder'
+/** Only projects whose chats the user reordered by dragging. */
+const SESSION_ORDER_KEY = 'harness.sessionOrder.dragged'
+/** Snapshots of every project's order, dragged or not. They froze the order in
+ *  which provider histories happened to arrive, so they are discarded. */
+const LEGACY_SESSION_ORDER_KEY = 'harness.sessionOrder'
+const STARTUP_PROJECT_NAME_KEY = 'harness.startupProjectName'
+const PENDING_CHAT_DELETES_KEY = 'harness.pendingChatDeletes.v1'
+const MODEL_KEY = 'harness.model'
+const MODEL_CATALOG_KEY = 'harness.modelCatalog.v1'
+const MODEL_CATALOG_CACHE_WRITE_DELAY_MS = 1_000
+/** How old the last listing may get before focusing the window lists every model again. */
+const MODEL_CATALOG_REVALIDATE_MS = 6 * 60 * 60_000
+const CUSTOM_MODELS_KEY = 'harness.customModels.v1'
+/** Last model/effort/tier used per source, so returning to a provider
+ *  restores the exact working setup instead of a best-guess translation. */
+const MODEL_BY_SOURCE_KEY = 'harness.modelBySource'
+/** Last effort used per model of a source, whichever of its accounts ran it. */
+const EFFORT_BY_MODEL_KEY = 'harness.effortByModel'
+const MODEL_BY_THREAD_PREFIX = 'harness.modelByThread:'
+const COMPOSER_DRAFTS_KEY = 'harness.composerDrafts.v1'
+const EMPTY_PALETTE_COMMANDS: PaletteCommand[] = []
+const EMPTY_PROVIDER_ROSTER: ProviderRoster = []
+const NO_STOPPING_ROWS: ReadonlyMap<string, number> = new Map()
+/** Only the user's own visibility choices; the defaults follow the catalog. */
+const MODEL_VISIBILITY_KEY = 'harness.modelVisibility.v2'
+/** One complete hidden list, which mixed the defaults of the build that saved it with choices. */
+const LEGACY_HIDDEN_MODELS_KEY = 'harness.hiddenModels'
+/** The list's format version, and the version rows reached on their own. */
+const LEGACY_MODEL_VISIBILITY_VERSION_KEY = 'harness.modelVisibilityVersion'
+const LEGACY_MODEL_VISIBILITY_ROWS_KEY = 'harness.modelVisibilityRows'
+/** That list and its records, removed once the record above is saved. */
+const LEGACY_MODEL_VISIBILITY_KEYS = [
+  LEGACY_HIDDEN_MODELS_KEY,
+  LEGACY_MODEL_VISIBILITY_VERSION_KEY,
+  LEGACY_MODEL_VISIBILITY_ROWS_KEY,
+  'harness.listedModels',
+] as const
+const PALETTE_CHAT_SEARCH_CACHE = createPaletteChatSearchCache()
+const EFFORT_KEY = 'harness.effort'
+const SERVICE_TIER_KEY = 'harness.serviceTier'
+const APPROVAL_KEY = 'harness.approval'
+const APPROVAL_BY_PROVIDER_KEY = 'harness.approvalByProvider'
+const MACOS_FONT_SMOOTHING_KEY = 'harness.macosFontSmoothing'
+/** Debug settings stay unlocked across restarts until the shortcut locks them. */
+const DEBUG_SETTINGS_KEY = 'harness.debugSettings'
+const TERMINAL_HEIGHT_KEY = 'harness.terminal.height'
+const BOTTOM_TERMINAL_MOTION_MS = 260
+/** How long a project's branch list answers the new-chat branch menu without git. */
+const BRANCH_LIST_TTL_MS = 30_000
+const NO_BRANCHES: string[] = []
+const RAIL_WIDTH_KEY = 'harness.rail.width'
+const DEFAULT_RAIL_WIDTH = 256
+const WORKSPACE_PANEL_WIDTH_KEY = 'harness.workspacePanel.width'
+const DEFAULT_SIDEBAR_SETTINGS: SidebarSettings = { mode: 'classic', autoSettleDays: 3 }
+type BottomTerminalPhase = 'closed' | 'opening' | 'open' | 'closing'
+type ComposerProps = ComponentProps<typeof Composer>
+/** What the pane beside the focused one shows: a chat, or a new chat not yet started. */
+type BesidePane = { kind: 'chat'; id: string } | { kind: 'new'; projectPath: string | undefined }
+/**
+ * Split view: a second chat beside the focused one. The focused pane is App's
+ * active chat; the other pane keeps what it showed when it lost focus, so a
+ * focus swap moves nothing on screen.
+ */
+type SplitView = {
+  beside: BesidePane
+  /** The pane shown on the left; the one opened later sits to its right. */
+  start: PaneSlot
+  /** The unfocused pane's view, put back when it takes focus again. */
+  frozen: { composer: ComposerProps; entryKey: number; revealRequest: number }
+}
+const otherSlot = (slot: PaneSlot): PaneSlot => (slot === 0 ? 1 : 0)
+const splitBesideId = (split: SplitView | undefined): string | undefined =>
+  split?.beside.kind === 'chat' ? split.beside.id : undefined
+const PANE_SLOTS: readonly PaneSlot[] = [0, 1]
+const SPLIT_CONTENTS: CSSProperties = { display: 'contents' }
+const NO_CHECKPOINTS: Checkpoint[] = []
+const PullRequestsView = lazy(() =>
+  import('./ui/pull-requests/PullRequestsView.js').then((module) => ({
+    default: module.PullRequestsView,
+  })),
+)
+const ArchiveToast = lazy(() =>
+  import('./ui/ArchiveToast.js').then((module) => ({ default: module.ArchiveToast })),
+)
+type WorkspacePanelModule = typeof import('./ui/workspace/WorkspacePanel.js')
+type WorkspacePanelComponent = WorkspacePanelModule['WorkspacePanel']
+type LazyWorkspacePanelModule = { default: WorkspacePanelComponent }
+let workspacePanelPromise: Promise<LazyWorkspacePanelModule> | undefined
+let resolvedWorkspacePanel: WorkspacePanelComponent | undefined
+const loadWorkspacePanel = (): Promise<LazyWorkspacePanelModule> =>
+  (workspacePanelPromise ??= import('./ui/workspace/WorkspacePanel.js').then((module) => {
+    resolvedWorkspacePanel = module.WorkspacePanel
+    return { default: module.WorkspacePanel }
+  }))
+const WorkspacePanel = lazy(loadWorkspacePanel)
+type SettingsComponent = (typeof import('./ui/Settings.js'))['Settings']
+let settingsPromise: Promise<{ default: SettingsComponent }> | undefined
+let resolvedSettings: SettingsComponent | undefined
+/** One import for the idle preload and the first open; a failed one is tried again by the next caller. */
+const loadSettings = (): Promise<{ default: SettingsComponent }> =>
+  (settingsPromise ??= import('./ui/Settings.js').then(
+    (module) => {
+      resolvedSettings = module.Settings
+      return { default: module.Settings }
+    },
+    (error: unknown) => {
+      settingsPromise = undefined
+      throw error
+    },
+  ))
+const LazySettings = lazy(() => loadSettings().catch(surfaceLoadFailed))
+const CommandPalette = lazy(() =>
+  import('./ui/CommandPalette.js').then((module) => ({ default: module.CommandPalette })),
+)
+const CheckoutDiscardDialog = lazy(() =>
+  import('./ui/CheckoutDiscardDialog.js').then((module) => ({
+    default: module.CheckoutDiscardDialog,
+  })),
+)
+const RollbackDialog = lazy(() =>
+  import('./ui/RollbackDialog.js').then((module) => ({ default: module.RollbackDialog })),
+)
+const FeedbackDialog = lazy(() =>
+  import('./ui/FeedbackDialog.js').then((module) => ({ default: module.FeedbackDialog })),
+)
+const Onboarding = lazy(() =>
+  import('./ui/Onboarding.js').then((module) => ({ default: module.Onboarding })),
+)
+
+/**
+ * Projects and sessions used to live here. The server owns them now, so this
+ * only exists to hand what it finds over once and then get out of the way —
+ * dropping it would silently lose the projects of anyone upgrading.
+ */
+function takeLegacyProjects(): Array<{ path: string; name?: string }> {
+  try {
+    const raw = readSetting(PROJECTS_KEY)
+    if (!raw) return []
+    const value: unknown = JSON.parse(raw)
+    if (!Array.isArray(value)) return []
+    const projects: Array<{ path: string; name?: string }> = []
+    for (const entry of value) {
+      if (
+        !isRecord(entry) ||
+        typeof entry['path'] !== 'string' ||
+        (entry['name'] !== undefined && typeof entry['name'] !== 'string')
+      ) {
+        return []
+      }
+      projects.push({
+        path: entry['path'],
+        ...(entry['name'] ? { name: entry['name'] } : {}),
+      })
+    }
+    return projects
+  } catch {
+    return []
+  }
+}
+
+type CustomModel = {
+  provider: ProviderId
+  modelId: string
+  displayName: string
+}
+
+type CatalogAvailability = 'loading' | 'ready' | 'failed'
+type AccountCheck = {
+  provider: ProviderId
+  /** The further account the check is for; absent for the default account. */
+  accountId?: AccountId
+  state: CatalogAvailability
+  account?: Account
+  error?: ComposerError
+  /** Set on a read that is still running after ACCOUNT_CHECK_SEND_GRACE_MS. */
+  slow?: true
+  /** Set on a read of a provider whose last read said signed in (remembered-sign-in.ts). */
+  remembered?: true
+}
+
+/**
+ * How long a running account read keeps Send waiting. Some CLIs need far
+ * longer to answer on a busy machine (cursor-agent `status` took up to 13 s),
+ * and their reads may now run that long; past this point the composer treats
+ * the read like one that could not answer and lets the user send.
+ */
+export const ACCOUNT_CHECK_SEND_GRACE_MS = 5_000
+
+/** The counter makes a repeated request for the open section navigate again. */
+type SettingsSectionRequest = {
+  section: SettingsSection
+  request: number
+  /** Opens Providers on its picker rather than on the added providers. */
+  view?: 'add-providers' | undefined
+}
+
+type WorkspaceIdleProbe = {
+  inFlight: Promise<void> | undefined
+  pendingPath: string | undefined
+  idlePath: string | undefined
+  blockedPath: string | undefined
+  pendingStarts: Map<string, { path: string; tokens: number[] }>
+  submissionStarts: ThreadOwnedMap<{ threadId: string; token: number }>
+  queuedStarts: ThreadOwnedMap<{ threadId: string; token: number }>
+  claimedStarts: Set<string>
+  queueActions: ThreadOwnedMap<{
+    threadId: string
+    count: number
+    pending: number
+    steers: number
+  }>
+  unknownQueues: Set<string>
+  nextStart: number
+  revision: number
+  transportRevision: number
+  refreshedRevision: number
+  refreshedPath: string | undefined
+}
+
+type ShellStyle = CSSProperties & { '--rail-w': string }
+type WorkspaceLayoutStyle = CSSProperties & { '--workspace-panel-w': string }
+type ProviderLoginTerminalSession = ProviderLoginTerminalTarget & {
+  id: number
+  visible: boolean
+  restorePanelOpen: boolean
+  restorePanelExpanded: boolean
+  restoreSettings: boolean
+}
+
+function shellStyle(width: number): ShellStyle {
+  return { '--rail-w': `${width}px` }
+}
+
+function workspaceLayoutStyle(width: number): WorkspaceLayoutStyle {
+  return { '--workspace-panel-w': `${width}px` }
+}
+
+function requestSettingsSection(section: SettingsSection, view?: SettingsSectionRequest['view']) {
+  return (current: SettingsSectionRequest) => ({ section, view, request: current.request + 1 })
+}
+
+export function resolveSendAvailability(input: {
+  catalog: CatalogAvailability
+  serverBoundSession: boolean
+  activeProvider?: ProviderId | undefined
+  selectedChoice?: ModelChoice | undefined
+  providerStatuses: ProviderStatus[]
+  accountCheck: AccountCheck
+}): SendAvailability {
+  if (input.serverBoundSession && !input.selectedChoice) return 'ready'
+  if (input.catalog === 'loading') return 'loading'
+  if (input.catalog === 'failed') return 'unavailable'
+
+  const provider = input.activeProvider ?? input.selectedChoice?.provider
+  if (!provider) {
+    return input.providerStatuses.some(
+      (status) => !status.installed || status.auth === 'unauthenticated',
+    )
+      ? 'setup-required'
+      : 'unavailable'
+  }
+
+  if (input.selectedChoice?.agent && input.selectedChoice.provider !== 'acp') return 'ready'
+
+  const status = input.providerStatuses.find((entry) => entry.id === provider)
+  if (!status) return 'unavailable'
+  if (!status.installed) return 'setup-required'
+  if (status.problem || !status.capabilities) return 'unavailable'
+  if (input.accountCheck.provider === provider && input.accountCheck.state === 'ready') {
+    return input.accountCheck.account?.signedIn ? 'ready' : 'setup-required'
+  }
+  // The provider's status is its default account's; a further account's own
+  // check speaks for it.
+  const furtherAccount =
+    input.accountCheck.provider === provider && input.accountCheck.accountId !== undefined
+  if (!furtherAccount && status.auth === 'unauthenticated') return 'setup-required'
+  if (!furtherAccount && status.auth === 'authenticated') return 'ready'
+  if (input.accountCheck.provider !== provider) return 'loading'
+  // A check that could not answer in time, or still has not after the grace
+  // period, confirms nothing either way. Send stays available: a CLI that
+  // really is signed out says so in the turn.
+  // A read of a provider that was signed in last time keeps Send available
+  // too; an answer that it is signed out turns it off.
+  if (input.accountCheck.state === 'loading') {
+    return input.accountCheck.slow || input.accountCheck.remembered ? 'ready' : 'loading'
+  }
+  if (input.accountCheck.state === 'failed') return 'ready'
+  return input.accountCheck.account?.signedIn ? 'ready' : 'setup-required'
+}
+
+function readCustomModels(): CustomModel[] {
+  try {
+    const raw = readSetting(CUSTOM_MODELS_KEY)
+    if (!raw) return []
+    const entries: unknown = JSON.parse(raw)
+    if (!Array.isArray(entries)) return []
+    const models: CustomModel[] = []
+    for (const entry of entries) {
+      if (!isRecord(entry)) continue
+      const provider = entry['provider']
+      const storedModelId = entry['modelId']
+      if (
+        !isProviderId(provider) ||
+        !DIRECT_PROVIDER_ID_SET.has(provider) ||
+        typeof storedModelId !== 'string'
+      ) {
+        continue
+      }
+      const modelId = storedModelId.trim()
+      if (!modelId) continue
+      models.push({
+        provider,
+        modelId,
+        displayName: typeof entry['displayName'] === 'string' ? entry['displayName'].trim() : '',
+      })
+    }
+    return models
+  } catch {
+    return []
+  }
+}
+
+/** Custom entries append to the provider catalog, so they sit at the bottom
+ *  of their provider's group and can never shadow an enumerated model. The
+ *  keyed drop covers a cache-miss restore that already carried a custom
+ *  choice, so the same model can never appear twice. */
+function mergeCustomModels(catalog: ModelChoice[], custom: CustomModel[]): ModelChoice[] {
+  if (custom.length === 0) return catalog
+  const customChoices = custom.map((entry) =>
+    customModelChoice(entry, providerDisplayName(entry.provider), providerMark(entry.provider)),
+  )
+  const customKeys = new Set(customChoices.map((choice) => choice.key))
+  return [...catalog.filter((choice) => !customKeys.has(choice.key)), ...customChoices]
+}
+
+function modelSource(choice: ModelChoice): string {
+  return sourceKey({
+    provider: choice.provider,
+    connectionId: choice.connectionId,
+    agentId: choice.agent?.id,
+    accountId: choice.accountId,
+  })
+}
+
+/** A choice's source without its account: every account of a provider is the same provider. */
+function providerSource(choice: ModelChoice): string {
+  return sourceKey({
+    provider: choice.provider,
+    connectionId: choice.connectionId,
+    agentId: choice.agent?.id,
+  })
+}
+
+type CatalogSourceControls = {
+  relist: (source: string) => void
+  /** Without a source, every source the run left for later. */
+  discover: (source?: string) => void
+}
+
+/** Replaces one source's rows where they stood, so a source listed again does not move. */
+function replaceSourceRows(
+  catalog: ModelChoice[],
+  source: string,
+  rows: ModelChoice[],
+): ModelChoice[] {
+  const at = catalog.findIndex((choice) => modelSource(choice) === source)
+  const others = catalog.filter((choice) => modelSource(choice) !== source)
+  // Every row before the first one of this source belongs to another source.
+  return at < 0 ? [...others, ...rows] : [...others.slice(0, at), ...rows, ...others.slice(at)]
+}
+
+/** `transport` replaces the local server connection; the design sandbox passes one. */
+export function App({ transport: givenTransport }: { transport?: Transport } = {}) {
+  const [transport] = useState<Transport>(
+    () => givenTransport ?? new Transport(SERVER_BASE_URL, { ownServerToken }),
+  )
+  // StrictMode replays effect cleanup against this same memoized instance.
+  const usageController = useMemo(
+    () => new UsageLimitsController((params) => transport.request('usage.summary', params)),
+    [transport],
+  )
+  const usageDisposals = useRef(new Map<UsageLimitsController, number>())
+  const subscribeUsage = useCallback(
+    (listener: () => void) => usageController.subscribe(listener),
+    [usageController],
+  )
+  const readUsage = useCallback(() => usageController.snapshot(), [usageController])
+  const usageState = useSyncExternalStore(subscribeUsage, readUsage, readUsage)
+  const refreshUsage = useCallback(
+    (requestedProvider?: ProviderId, accountId?: AccountId) =>
+      usageController.refresh(requestedProvider, undefined, accountId),
+    [usageController],
+  )
+  const retryUsage = useCallback(
+    (requestedProvider: ProviderId, accountId?: AccountId) =>
+      usageController.refresh(requestedProvider, 'retry', accountId),
+    [usageController],
+  )
+  const refreshAllUsage = useCallback(
+    () => usageController.refresh(undefined, 'retry'),
+    [usageController],
+  )
+  const showUsage = useCallback(() => usageController.show(), [usageController])
+  const consumeReset = useCallback(
+    async (
+      requestedProvider: ProviderId,
+      idempotencyKey: string,
+      creditId?: string,
+      accountId?: AccountId,
+    ) => {
+      try {
+        return await transport.request('usage.consumeReset', {
+          provider: requestedProvider,
+          ...(accountId === undefined || accountId === DEFAULT_ACCOUNT_ID ? {} : { accountId }),
+          idempotencyKey,
+          ...(creditId === undefined ? {} : { creditId }),
+        })
+      } finally {
+        refreshUsage(requestedProvider, accountId)
+      }
+    },
+    [transport, refreshUsage],
+  )
+
+  useEffect(() => {
+    // Let StrictMode's immediate replay cancel disposal, while a real unmount
+    // or controller replacement still tears down trailing refresh timers.
+    window.clearTimeout(usageDisposals.current.get(usageController))
+    usageDisposals.current.delete(usageController)
+    return () => {
+      usageDisposals.current.set(
+        usageController,
+        window.setTimeout(() => {
+          usageDisposals.current.delete(usageController)
+          usageController.dispose()
+        }, 0),
+      )
+    }
+  }, [usageController])
+  const [provider, setProvider] = useState<ProviderId>(() => {
+    const stored = readSetting(SETUP_KEY)
+    // Only a launch without a usable stored provider starts here, and the
+    // first ready provider in providers.list order replaces it if needed.
+    return PROVIDER_IDS.find((id) => id === stored) ?? 'claude-code'
+  })
+  const providerRef = useRef(provider)
+  providerRef.current = provider
+  // Read once at mount. The provider-default choice persists the initial
+  // provider before providers.list answers, so by then storage can no longer
+  // tell that this launch started without a usable stored provider.
+  const [launchedUnchosen] = useState(() => !isProviderId(readSetting(SETUP_KEY)))
+  const providerUnchosenAtLaunch = useRef(launchedUnchosen)
+  const [sourceAgent, setSourceAgent] = useState<string | undefined>(
+    () => readSetting(AGENT_KEY) ?? undefined,
+  )
+  const sourceAgentRef = useRef(sourceAgent)
+  sourceAgentRef.current = sourceAgent
+  // Kept so the sidebar can say "Gemini CLI" rather than "acp". The name lives
+  // in the adapter package, which the renderer deliberately cannot import.
+  const [sourceAgentName, setSourceAgentName] = useState<string | undefined>(
+    () => readSetting(AGENT_NAME_KEY) ?? undefined,
+  )
+  // A cache of what the server says, not a source of truth. Every change goes
+  // to the server and comes back through here.
+  const [projects, setProjects] = useState<Project[]>([])
+  const removedProjectPaths = useRef(new Set<string>())
+  const projectStartRevisions = useRef(new Map<string, number>())
+  // Other projects follow the server's newest-first order, so chats imported
+  // later from another provider land by date instead of below a saved snapshot.
+  const [draggedSessionOrder] = useState(() => new Set(Object.keys(loadSessionOrder())))
+  const projectChoiceProjector = useMemo(createProjectChoiceProjector, [])
+  const projectChoices = useMemo(
+    () => projectChoiceProjector(projects),
+    [projectChoiceProjector, projects],
+  )
+  const [projectsStatus, setProjectsStatus] = useState<'loading' | 'ready' | 'failed'>('loading')
+  // Startup opens the first project, so its remembered name lets the first
+  // frame paint the new-chat heading instead of waiting for projects.list.
+  const [startupProjectName, setStartupProjectName] = useState(readStartupProjectName)
+  useEffect(() => {
+    if (projectsStatus === 'loading') return
+    setStartupProjectName(undefined)
+    if (projectsStatus === 'ready') saveStartupProjectName(projects[0])
+  }, [projects, projectsStatus])
+  const [onboardingDismissed, setOnboardingDismissed] = useState(
+    () => readSetting(ONBOARDING_KEY) === 'done',
+  )
+  const [debugSettingsVisible, setDebugSettingsVisible] = useState(
+    () => readSetting(DEBUG_SETTINGS_KEY) === 'on',
+  )
+  useEffect(() => {
+    if (debugSettingsVisible) writeSetting(DEBUG_SETTINGS_KEY, 'on')
+    else removeSetting(DEBUG_SETTINGS_KEY)
+  }, [debugSettingsVisible])
+  const [onboardingPreview, setOnboardingPreview] = useState(false)
+  /** The thread whose interrupt has been sent but not yet acknowledged. */
+  const [stoppingThreadId, setStoppingThreadId] = useState<string | undefined>()
+  /**
+   * Every chat whose Stop is on its way, with when it was clicked. Its sidebar row stops
+   * spinning at the click, as the chat does, not when the server has ended the turn: that
+   * waits for a turn still starting, which can take seconds.
+   */
+  const [stoppingRows, setStoppingRows] = useState<ReadonlyMap<string, number>>(NO_STOPPING_ROWS)
+
+  useEffect(() => {
+    if (projectsStatus !== 'ready' || projects.length === 0 || onboardingDismissed) return
+    writeSetting(ONBOARDING_KEY, 'done')
+    setOnboardingDismissed(true)
+  }, [projects, projectsStatus, onboardingDismissed])
+  const onboardingWanted =
+    onboardingPreview ||
+    (isDesktop && projectsStatus === 'ready' && projects.length === 0 && !onboardingDismissed)
+  // Setup stays mounted a moment after it stops being wanted — a project
+  // arrived, or the preview was closed — so it can open up into the app
+  // instead of vanishing. It unmounts itself through onDismiss.
+  const [onboardingMounted, setOnboardingMounted] = useState(onboardingWanted)
+  if (onboardingWanted && !onboardingMounted) setOnboardingMounted(true)
+  const [offline, setOffline] = useState(false)
+  /** This window works without its own server; it shows nothing from another app's. */
+  const [missingServer, setMissingServer] = useState<MissingServer | undefined>()
+  useEffect(() => transport.onMissingServer?.(setMissingServer), [transport])
+  const [threadController] = useState(
+    () =>
+      new ThreadController(transport, {
+        read: () => readSetting(COMPOSER_DRAFTS_KEY),
+        write: (drafts) =>
+          drafts === undefined
+            ? removeSetting(COMPOSER_DRAFTS_KEY)
+            : writeSetting(COMPOSER_DRAFTS_KEY, drafts),
+      }),
+  )
+  const [activeId, setActiveIdState] = useState<string | undefined>()
+  const setActiveId = useCallback(
+    (id: string | undefined) => {
+      threadController.activate(id)
+      setActiveIdState(id)
+    },
+    [threadController],
+  )
+  const [activePath, setActivePath] = useState<string | undefined>()
+  const [split, setSplitState] = useState<SplitView>()
+  const splitRef = useRef(split)
+  const setSplit = useCallback((next: SplitView | undefined) => {
+    splitRef.current = next
+    setSplitState(next)
+  }, [])
+  /** The column with focus. Without a split it is the only one shown. */
+  const [focusedSlot, setFocusedSlotState] = useState<PaneSlot>(0)
+  const focusedSlotRef = useRef<PaneSlot>(0)
+  const setFocusedSlot = useCallback(
+    (slot: PaneSlot) => {
+      focusedSlotRef.current = slot
+      threadController.focus(slot)
+      setFocusedSlotState(slot)
+    },
+    [threadController],
+  )
+  const besideId = split?.beside.kind === 'chat' ? split.beside.id : undefined
+  const [besideQueue, setBesideQueue] = useState<{ items: QueuedTurn[]; canSteer: boolean }>()
+  /** The composer props the focused pane rendered last, frozen when it loses focus. */
+  const liveComposerProps = useRef<ComposerProps | undefined>(undefined)
+  /** Set further down, where the split's actions are defined: a chat or project
+   * going away closes the pane that shows it. True when that was the focused pane. */
+  const splitRemovals = useRef({
+    chats: (_ids: readonly string[]): boolean => false,
+    project: (_path: string): boolean => false,
+  })
+  const threadFrameStore = threadController.columns[focusedSlot]
+  const thread = useSyncExternalStore(
+    threadFrameStore.subscribeStructure,
+    threadFrameStore.getStructureSnapshot,
+  )
+  /** Draw into the focused column, whatever it shows. */
+  const setThread = useCallback(
+    (next: ThreadState) => threadController.frames.publish(next),
+    [threadController],
+  )
+  /** Draw a chat's state if a column shows it; a hidden chat is only cached. */
+  const publishThread = useCallback(
+    (threadId: string, next: ThreadState) => threadController.publish(threadId, next),
+    [threadController],
+  )
+  const [loadingThreadId, setLoadingThreadId] = useState<string | undefined>()
+  const [historyFailure, setHistoryFailure] = useState<
+    { threadId: string; message: string } | undefined
+  >()
+  const composerDraftKeyRef = useRef(NEW_CHAT_DRAFT_KEY)
+  const injectedDraftTransition = useRef(false)
+  const pendingSession = useRef<
+    | {
+        id: string
+        promise: Promise<string | undefined>
+        threadId?: string | undefined
+        title: string
+        pinned?: boolean | undefined
+      }
+    | undefined
+  >(undefined)
+  const pendingInterruptThreadIds = useRef(new Set<string>())
+  // Chats stopped while a prompt sent from this window was still on its way to
+  // a turn. The server then rejects that prompt, which is the Stop, not an error.
+  const stoppedTurnStarts = useRef(new Set<string>())
+  const pendingProviderHistoryIds = useRef(new Set<string>())
+  const providerHistoryReads = useRef(new Map<string, object>())
+  const [queuedTurns, setQueuedTurns] = useState<QueuedTurn[]>([])
+  const [canSteerQueue, setCanSteerQueue] = useState(false)
+  const [customModels] = useState<CustomModel[]>(readCustomModels)
+  const customModelsRef = useRef(customModels)
+  customModelsRef.current = customModels
+  const [{ models: catalogModels, loaded: modelsLoaded, unvalidatedModelKeys }, setModelCatalog] =
+    useState<{
+      models: ModelChoice[]
+      loaded: boolean
+      unvalidatedModelKeys: Set<string>
+    }>(() => {
+      const cached = parseModelCatalogCache(readSetting(MODEL_CATALOG_KEY))
+      // Freshness controls whether cached metadata is trusted, not whether its
+      // display names may paint. Keep stale names visible while discovery
+      // refreshes them instead of flashing raw ids such as `gpt-5.6-sol`.
+      const cachedModels = cached?.models ?? []
+      const freshModelKeys = new Set(freshModelCatalogChoices(cached).map((choice) => choice.key))
+      const restored = cachedModels.length === 0 ? readStoredModelChoice(customModels) : undefined
+      return {
+        models: cachedModels.length > 0 ? cachedModels : restored ? [restored] : [],
+        loaded: cachedModels.length > 0 || restored !== undefined,
+        // Stale metadata and the upgrade fallback are presentational only.
+        // Until discovery refreshes them they cannot validate a service tier.
+        unvalidatedModelKeys: new Set(
+          cachedModels
+            .filter((choice) => !freshModelKeys.has(choice.key))
+            .map((choice) => choice.key)
+            .concat(restored && !isCustomModelChoice(restored) ? [restored.key] : []),
+        ),
+      }
+    })
+  const [providerStatuses, setProviderStatuses] = useState<ProviderStatus[]>([])
+  // The provider accounts, kept while an installed provider can have more
+  // than one: plan limits are read per account, and the views name them.
+  const { store: providerAccountsStore, snapshot: providerAccounts } = useProviderAccounts(
+    transport,
+    providerStatuses.some(
+      (status) => status.installed && status.capabilities?.multipleAccounts === true,
+    ),
+  )
+  /** For the model catalog's runs, which outlive a render. */
+  const providerAccountsRef = useRef(providerAccounts)
+  providerAccountsRef.current = providerAccounts
+  // A provider's accounts as one pool, worked out again only when the limits
+  // or the accounts change, never per streamed delta. The account each pool
+  // recommends stands in for the active one until the user picks an account
+  // for new chats. The server's `accounts.pool` can replace this later.
+  const accountPools = useMemo(
+    () => poolsOf(usageState, providerAccounts.accounts, Date.now()),
+    [usageState, providerAccounts.accounts],
+  )
+  useEffect(
+    () => providerAccountsStore.recommend(recommendedAccounts(accountPools)),
+    [providerAccountsStore, accountPools],
+  )
+  // Undefined until the first catalog run has listed them, so setup can tell
+  // an empty library from one that has not answered yet.
+  const [acpAgents, setAcpAgents] = useState<ResultOf<'acp.agents'>['agents'] | undefined>()
+  const [providerRoster, setProviderRoster] = useState(readProviderRoster)
+  // Read by the catalog run, which must not restart when a provider is added.
+  const providerRosterRef = useRef(providerRoster)
+  providerRosterRef.current = providerRoster
+  const [catalogRequest, setCatalogRequest] = useState(0)
+  /** When the catalog was last listed, however that started. */
+  const catalogRequestedAt = useRef(Date.now())
+  /**
+   * The current catalog run's sources: `relist` lists one again when the server
+   * says it changed, `discover` lists one (or every) source the run left for later.
+   */
+  const catalogSources = useRef<CatalogSourceControls | undefined>(undefined)
+  /** Set once the picker or Settings needed every source; later runs list them all at once. */
+  const everyModelSourceWanted = useRef(false)
+  const [pendingModelSources, setPendingModelSources] = useState<ReadonlySet<string>>(new Set())
+  const [providerCatalogSource, setProviderCatalogSource] = useState<
+    { transport: Transport; request: number } | undefined
+  >()
+  const [catalogAvailability, setCatalogAvailability] = useState<CatalogAvailability>('loading')
+  const [catalogError, setCatalogError] = useState<ComposerError>()
+  const [modelErrors, setModelErrors] = useState<Record<string, ComposerError>>({})
+  const startupMilestones = useRef({
+    projectsRequested: false,
+    projectsReceived: false,
+    projectsReconciled: false,
+    projects: false,
+    catalog: false,
+  })
+  useEffect(() => {
+    if (projectsStatus === 'ready' && !startupMilestones.current.projects) {
+      startupMilestones.current.projects = true
+      reportStartupMilestone('projects-ready')
+    }
+    if (catalogAvailability === 'ready' && !startupMilestones.current.catalog) {
+      startupMilestones.current.catalog = true
+      reportStartupMilestone('catalog-ready')
+    }
+  }, [catalogAvailability, projectsStatus])
+  // Settings is the largest lazy surface. Once the sidebar is up, its chunk
+  // loads in an idle moment, so the first open does not compile it on the click.
+  useEffect(() => {
+    if (projectsStatus !== 'ready') return
+    return preloadWhenIdle(loadSettings)
+  }, [projectsStatus])
+  const [modelVisibility, setModelVisibility] = useState(readModelVisibility)
+  // The catalog effect reads and settles the record per source without
+  // depending on it, so a visibility click never refetches any model list.
+  // Every update goes through `updateModelVisibility`, which keeps this
+  // current before React renders it.
+  const modelVisibilityRef = useRef(modelVisibility)
+  const updateModelVisibility = useCallback(
+    (update: (record: ModelVisibilityRecord) => ModelVisibilityRecord) => {
+      const next = update(modelVisibilityRef.current)
+      if (next === modelVisibilityRef.current) return
+      modelVisibilityRef.current = next
+      setModelVisibility(next)
+    },
+    [],
+  )
+  const [modelId, setModelId] = useState<string | undefined>(
+    () => readSetting(MODEL_KEY) ?? undefined,
+  )
+  const [effort, setEffort] = useState<string | undefined>(
+    () => readSetting(EFFORT_KEY) ?? undefined,
+  )
+  const [serviceTier, setServiceTier] = useState<string | undefined>(
+    () => readSetting(SERVICE_TIER_KEY) ?? undefined,
+  )
+  const pendingThreadModelSave = useRef<string | undefined>(undefined)
+  const [approvalByProvider, setApprovalByProvider] = useState<ApprovalPreferences>(() =>
+    readApprovalPreferences(provider),
+  )
+  const [providerDefaults, setProviderDefaults] = useState<ProviderDefaults>(readProviderDefaults)
+  const providerDefaultsRef = useRef(providerDefaults)
+  providerDefaultsRef.current = providerDefaults
+  const [activeThreadApproval, setActiveThreadApproval] = useState<ApprovalMode | undefined>()
+  /** The last mode each opened chat showed, so reopening it never waits on history. */
+  const threadApprovals = useRef(new Map<string, ApprovalMode>())
+  useEffect(() => {
+    if (activeId && activeThreadApproval)
+      threadApprovals.current.set(activeId, activeThreadApproval)
+  }, [activeId, activeThreadApproval])
+  const pendingThreadApprovals = useRef(new Map<string, ApprovalMode>())
+  const approvalChanges = useRef(new Map<string, Promise<void>>())
+  const [collapsed, setCollapsed] = useState(
+    () => globalThis.matchMedia?.('(max-width: 700px)').matches ?? false,
+  )
+  // Sampled once was not enough: resizing under the breakpoint left the
+  // absolutely-positioned rail permanently overlaying the thread.
+  useEffect(() => {
+    const media = globalThis.matchMedia?.('(max-width: 700px)')
+    if (!media) return
+    const onChange = (event: MediaQueryListEvent) => setCollapsed(event.matches)
+    media.addEventListener('change', onChange)
+    return () => media.removeEventListener('change', onChange)
+  }, [])
+  const [railWidth, setRailWidth] = useState(readRailWidth)
+  const [workspace, setWorkspace] = useState<WorkspaceInfo | undefined>()
+  const [branches, setBranches] = useState<string[]>([])
+  const [branchesPath, setBranchesPath] = useState<string>()
+  const projectBranches = useRef(new Map<string, string>())
+  /** Each project's checked-out branch, as workspace.info last said. */
+  const checkedOutBranches = useRef(new Map<string, string | undefined>())
+  /** Projects whose checkout had uncommitted changes when workspace.info last read it. */
+  const dirtyCheckouts = useRef(new Set<string>())
+  /** Branch lists by project, reused for BRANCH_LIST_TTL_MS. */
+  const branchLists = useRef(
+    new Map<string, { at: number; revision: number; branches: string[] }>(),
+  )
+  const [branchMenuOpened, setBranchMenuOpened] = useState(0)
+  const openBranchMenu = useCallback(() => setBranchMenuOpened((count) => count + 1), [])
+  /** Projects workspace.info read as folders without a branch: they cannot start isolated chats. */
+  const unbranchedProjects = useRef(new Set<string>())
+  const recordCheckout = useCallback((path: string, info: WorkspaceInfo | undefined) => {
+    checkedOutBranches.current.set(path, info?.branch)
+    if (info?.dirtyFiles) dirtyCheckouts.current.add(path)
+    else dirtyCheckouts.current.delete(path)
+    // A failed read says nothing about the folder, so only an answer changes this.
+    if (info && info.branch === undefined) unbranchedProjects.current.add(path)
+    else if (info) unbranchedProjects.current.delete(path)
+  }, [])
+  // A new chat in the shared checkout starts where it is while the checkout
+  // has uncommitted changes. Switching it then fails when a change touches a
+  // file the branches differ in, and otherwise carries the changes along. An
+  // isolated chat gets its own worktree, so any branch works as its base.
+  const newChatBranch = useCallback((path: string, isolate: boolean) => {
+    const checkedOut = checkedOutBranches.current.get(path)
+    return !isolate && checkedOut && dirtyCheckouts.current.has(path)
+      ? checkedOut
+      : projectBranches.current.get(path)
+  }, [])
+  const [workspaceRefreshRevision, setWorkspaceRefreshRevision] = useState(0)
+  const [account, setAccount] = useState<Account | undefined>()
+  const [profileIdentity, setProfileIdentity] = useState(readProfileIdentityPreferences)
+  const updateProfileIdentity = useCallback((updates: Partial<ProfileIdentityPreferences>) => {
+    setProfileIdentity((current) => {
+      const next = { ...current, ...updates }
+      writeProfileIdentityPreferences(next)
+      return next
+    })
+  }, [])
+  const [accountCheck, setAccountCheck] = useState<AccountCheck>({ provider, state: 'loading' })
+  const accountRequestRevision = useRef(0)
+  const [authStatusRequest, setAuthStatusRequest] = useState(0)
+  const [voiceAvailable, setVoiceAvailable] = useState(() => rememberedVoice(provider) ?? false)
+  const [voiceStatusLoading, setVoiceStatusLoading] = useState(
+    () => rememberedVoice(provider) === undefined,
+  )
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  // Settings that comes back in place of a provider login terminal skips its
+  // fade: while it faded in, the chat settling underneath showed through.
+  const [settingsReturning, setSettingsReturning] = useState(false)
+  const [keybindings, setKeybindings] = useState(readKeybindings)
+  const [surface, setSurface] = useState<'chat' | 'pull-requests'>('chat')
+  const [settingsSection, setSettingsSection] = useState<SettingsSectionRequest>({
+    section: 'workflows',
+    request: 0,
+  })
+  const [providerAuthRefreshRevision, setProviderAuthRefreshRevision] = useState(0)
+  const [pullRequestSetupRefreshRevision, setPullRequestSetupRefreshRevision] = useState(0)
+  const [sidebarSettings, setSidebarSettings] = useState(DEFAULT_SIDEBAR_SETTINGS)
+  const confirmedSidebarSettings = useRef(DEFAULT_SIDEBAR_SETTINGS)
+  const confirmedSidebarSettingsRevision = useRef(0)
+  const sidebarSettingsSourceRevision = useRef(0)
+  const sidebarSettingsUpdates = useRef(new Map<number, Partial<SidebarSettings>>())
+  const nextSidebarSettingsRevision = useRef(0)
+  const [paletteScope, setPaletteScope] = useState<CommandScope | null>(null)
+  const [preferredNewThreadProject, setPreferredNewThreadProject] = useState<string>()
+  const sessionSearch = useRef<SessionSearchHandle>(null)
+  const [searchJump, setSearchJump] = useState<{
+    threadId: string
+    turnId: string
+    request: number
+  }>()
+  const searchJumpRequests = useRef(0)
+  const [composerFocusRequest, setComposerFocusRequest] = useState(0)
+  const [composerDraft, setComposerDraft] = useState<ComposerProps['draftRequest']>()
+  const [threadRevealRequest, setThreadRevealRequest] = useState(0)
+  // Session entry gets a fresh virtualizer at the latest message. A pending
+  // session becoming durable keeps this key and preserves its live view.
+  const [threadEntryKey, setThreadEntryKey] = useState(0)
+  // Keys and requests only ever grow: a split pane put back into focus brings
+  // its own older values back, and a new one must differ from both panes'.
+  const threadEntryKeys = useRef(0)
+  const composerDraftRequests = useRef(0)
+  const threadEntryKeyRef = useRef(threadEntryKey)
+  threadEntryKeyRef.current = threadEntryKey
+  const threadRevealRequestRef = useRef(threadRevealRequest)
+  threadRevealRequestRef.current = threadRevealRequest
+  const [notice, setNotice] = useState<string | undefined>()
+  /** The unsent draft an "Edit as new prompt" replaced, offered back in the notice. */
+  const [replacedDraft, setReplacedDraft] = useState<{ owner: string; text: string } | undefined>()
+  const [actionError, setActionError] = useState<ComposerError>()
+  const reportError = useCallback((message: string) => {
+    setActionError({ id: crypto.randomUUID(), message })
+  }, [])
+  const usageResumes = useMemo(
+    () =>
+      new UsageResetController(
+        transport,
+        {
+          read: () => readSetting('harness.usage-resumes'),
+          write: (value) => localStorage.setItem('harness.usage-resumes', value),
+        },
+        reportError,
+      ),
+    [transport, reportError],
+  )
+  const scheduledResumes = useSyncExternalStore(usageResumes.subscribe, usageResumes.snapshot)
+  useEffect(() => usageResumes.start(), [usageResumes])
+  const feedback = useFeedbackStatus(transport)
+  const refreshFeedback = feedback.refresh
+  const [feedbackRequest, setFeedbackRequest] = useState<FeedbackRequest>()
+  /** The chat the dialog describes, read when it opens. Kept in a ref so openers stay stable. */
+  const feedbackContext = useRef<FeedbackRequest['context']>({})
+  const feedbackOpens = useRef(0)
+  const openFeedback = useCallback(
+    (
+      source: FeedbackRequest['source'],
+      options: { message?: string; error?: NonNullable<FeedbackRequest['context']['error']> } = {},
+    ) => {
+      setFeedbackRequest({
+        source,
+        ...(options.message ? { message: options.message } : {}),
+        context: {
+          ...feedbackContext.current,
+          ...(options.error ? { error: options.error } : {}),
+        },
+        id: ++feedbackOpens.current,
+      })
+      // A wait that started earlier is counted from the server's current answer.
+      refreshFeedback()
+    },
+    [refreshFeedback],
+  )
+  const openAccountFeedback = useCallback(() => openFeedback('account_menu'), [openFeedback])
+  const openCommandFeedback = useCallback(
+    (message: string) => openFeedback('slash_command', { message }),
+    [openFeedback],
+  )
+  const closeFeedback = useCallback(() => setFeedbackRequest(undefined), [])
+  const finishFeedback = useCallback(() => {
+    setFeedbackRequest(undefined)
+    setNotice(FEEDBACK_SENT_NOTICE)
+  }, [])
+  const [archiveToastDismissed, setArchiveToastDismissed] = useState(false)
+  const pendingDeletionChecks = useRef(new Map<string, object>())
+  const {
+    hiddenIds: queuedArchiveIds,
+    pendingIds: pendingArchives,
+    queue: enqueueArchive,
+    undo: undoQueuedArchives,
+    cancel: cancelQueuedArchive,
+  } = useDeferredArchiveQueue(10_000)
+  const [interruptedDeletes, setInterruptedDeletes] = useState(readPendingChatDeletes)
+  const archivingIds = useMemo(
+    () => [...queuedArchiveIds, ...interruptedDeletes.map((pending) => pending.threadId)],
+    [queuedArchiveIds, interruptedDeletes],
+  )
+  const cancelArchive = useCallback(
+    (id: string) => {
+      if (!cancelQueuedArchive(id)) return false
+      forgetPendingChatDeletes([id])
+      return true
+    },
+    [cancelQueuedArchive],
+  )
+  const archiveProjects = useMemo(() => {
+    if (archivingIds.length === 0) return projects
+    const hidden = new Set(archivingIds)
+    return projects.map((project) => ({
+      ...project,
+      sessions: project.sessions.filter((session) => !hidden.has(session.id)),
+    }))
+  }, [projects, archivingIds])
+  const sidebarProjects = useMemo(
+    () => withStoppingSessions(archiveProjects, stoppingRows),
+    [archiveProjects, stoppingRows],
+  )
+
+  const [checkpoints, setCheckpoints] = useState<Checkpoint[]>([])
+  const [rollbackOpen, setRollbackOpen] = useState(false)
+  const [rollbackInspection, setRollbackInspection] = useState<
+    { checkpoint: Checkpoint; files: string[] } | undefined
+  >()
+  const [rollbackLoadingId, setRollbackLoadingId] = useState<number | undefined>()
+  const [rollbackRestoring, setRollbackRestoring] = useState(false)
+  const rollbackInspectionRequest = useRef<object | undefined>(undefined)
+  const restoreInFlight = useRef(false)
+  useEffect(() => {
+    rollbackInspectionRequest.current = undefined
+    setRollbackInspection(undefined)
+    setRollbackLoadingId(undefined)
+  }, [activeId])
+  useEffect(() => {
+    if (rollbackOpen) return
+    rollbackInspectionRequest.current = undefined
+    setRollbackInspection(undefined)
+    setRollbackLoadingId(undefined)
+  }, [rollbackOpen])
+  const [undoRestore, setUndoRestore] = useState<{ threadId: string; token: string } | undefined>()
+  const [isolateSession, setIsolateSession] = useState(false)
+  const [designModes, setDesignModes] = useState<Record<string, boolean>>({})
+  const designMode = useMemo(
+    () =>
+      designModes[activeId ?? NEW_CHAT_DRAFT_KEY] ??
+      readThreadModelSelection(activeId)?.designMode ??
+      false,
+    [activeId, designModes],
+  )
+  const setThreadDesignMode = useCallback((threadId: string | undefined, enabled: boolean) => {
+    const saved = readThreadModelSelection(threadId)
+    if (threadId && saved) writeThreadModelSelection(threadId, { ...saved, designMode: enabled })
+    setDesignModes((current) => ({ ...current, [threadId ?? NEW_CHAT_DRAFT_KEY]: enabled }))
+  }, [])
+  const changeDesignMode = useCallback(
+    (enabled: boolean) => setThreadDesignMode(activeIdRef.current, enabled),
+    [setThreadDesignMode],
+  )
+  // A multi-chat delete can stop on several isolated checkouts; each one is
+  // confirmed in turn while the rest of the batch goes ahead.
+  const [checkoutDeletes, setCheckoutDeletes] = useState<
+    Array<{ id: string; title: string; branch: string }>
+  >([])
+  const checkoutDelete = checkoutDeletes[0]
+  const dropCheckoutDelete = useCallback(
+    (id: string) => setCheckoutDeletes((current) => current.filter((entry) => entry.id !== id)),
+    [],
+  )
+  const [checkoutDeleteBusy, setCheckoutDeleteBusy] = useState(false)
+  const macOS = isMacOS()
+  const [themePreference, setThemePreference] = useState<ThemePreference>(readThemePreference)
+  const [appearancePreferences, setAppearancePreferences] = useState(readAppearancePreferences)
+  const [systemTheme, setSystemTheme] = useState<Theme>(readSystemTheme)
+  const appearanceMode = themePreference === 'system' ? systemTheme : themePreference
+  const {
+    font: fontPreference,
+    accent: accentPreference,
+    backdrop: backdropPreference,
+    glass: sidebarGlass,
+  } = appearancePreferences[appearanceMode]
+  const updateAppearancePreference = useCallback(
+    (mode: Theme, updates: Partial<AppearancePreference>) => {
+      setAppearancePreferences((current) => ({
+        ...current,
+        [mode]: { ...current[mode], ...updates },
+      }))
+    },
+    [],
+  )
+  const customColorScheme = backdropColorScheme(backdropPreference)
+  const desktopThemePreference = customColorScheme ?? themePreference
+  const theme = customColorScheme ?? (themePreference === 'system' ? systemTheme : themePreference)
+  const themeColorScheme = colorSchemeForTheme(theme)
+  const [macOSFontSmoothing, setMacOSFontSmoothing] = useState(
+    () => readSetting(MACOS_FONT_SMOOTHING_KEY) !== 'false',
+  )
+  const [bottomTerminalPhase, setBottomTerminalPhase] = useState<BottomTerminalPhase>('closed')
+  const [bottomTerminalHasMounted, setBottomTerminalHasMounted] = useState(false)
+  const terminalOpen = bottomTerminalPhase === 'opening' || bottomTerminalPhase === 'open'
+  const bottomTerminalMounted = bottomTerminalHasMounted || bottomTerminalPhase !== 'closed'
+  const terminalPlacement = useSyncExternalStore(
+    subscribeTerminalPlacement,
+    readTerminalPlacement,
+    readTerminalPlacement,
+  )
+  const [bottomTerminalToggleRequest, setBottomTerminalToggleRequest] = useState(0)
+  const [terminalHeight, setTerminalHeight] = useState(readTerminalHeight)
+  const [workspacePanelOpen, setWorkspacePanelOpen] = useState(false)
+  const [workspacePanelHasMounted, setWorkspacePanelHasMounted] = useState(false)
+  const [workspacePanelExpanded, setWorkspacePanelExpanded] = useState(false)
+  const [workspacePanelWidth, setWorkspacePanelWidth] = useState(readWorkspacePanelWidth)
+  const [workspaceTerminalToggleRequest, setWorkspaceTerminalToggleRequest] = useState(0)
+  const [workspaceToolRequest, setWorkspaceToolRequest] = useState<{
+    request: number
+    kind: WorkspaceTool
+  }>()
+  const nextWorkspaceToolRequest = useRef(0)
+  const [workspaceDesignPreviewRequest, setWorkspaceDesignPreviewRequest] =
+    useState<BrowserNavigationRequest>()
+  /** The newest Design preview of each chat in the background, shown once that chat opens. */
+  const backgroundDesignPreviews = useRef(new Map<string, BrowserNavigationRequest>())
+  const [providerLoginTerminal, setProviderLoginTerminal] = useState<ProviderLoginTerminalSession>()
+  const nextProviderLoginTerminalId = useRef(1)
+  const providerLoginState = useSyncExternalStore(subscribeInstalls, () =>
+    providerLoginTerminal ? installState(providerLoginTerminal.installKey) : undefined,
+  )
+  const [sideChatPromptRequest, setSideChatPromptRequest] = useState<SideChatPromptRequest>()
+  const providerSignInState = useSyncExternalStore(subscribeInstalls, () =>
+    installState(loginKey({ provider, ...(sourceAgent ? { agent: sourceAgent } : {}) })),
+  )
+  /** The live catalog with user-defined models appended. Everything below
+   *  reads this merged list; the cache only ever stores the server catalog. */
+  const models = useMemo(
+    () =>
+      mergeCustomModels(catalogModels, customModels).filter(
+        (choice) =>
+          rosterAllows(providerRoster, modelSource(choice)) &&
+          // Once the server has answered, a cached or custom row for a provider
+          // this build does not offer is left out.
+          (providerStatuses.length === 0 ||
+            providerStatuses.some((status) => status.id === choice.provider)),
+      ),
+    [catalogModels, customModels, providerRoster, providerStatuses],
+  )
+  const catalogModelsRef = useRef(catalogModels)
+  catalogModelsRef.current = catalogModels
+  const modelsRef = useRef(models)
+  modelsRef.current = models
+  /** How every listed model starts, recomputed only when the catalog changes. */
+  const modelDefaults = useMemo(() => modelVisibilityDefaults(catalogModels), [catalogModels])
+  const modelDefaultsRef = useRef(modelDefaults)
+  modelDefaultsRef.current = modelDefaults
+  const hiddenModels = useMemo(
+    () => hiddenModelKeys(models, modelDefaults, modelVisibility),
+    [models, modelDefaults, modelVisibility],
+  )
+  const visibleModels = useMemo(
+    () => models.filter((choice) => !hiddenModels.has(choice.key)),
+    [models, hiddenModels],
+  )
+  // The phone offers the models this picker offers, so neither moves a chat
+  // to a model the other hides. Compared as text: the set is rebuilt often.
+  const hiddenModelList = useMemo(() => JSON.stringify([...hiddenModels].sort()), [hiddenModels])
+  useEffect(() => {
+    if (!modelsLoaded) return
+    const timer = window.setTimeout(() => {
+      void transport
+        .request('models.setHidden', { keys: JSON.parse(hiddenModelList) as string[] })
+        .catch(() => undefined)
+    }, 500)
+    return () => window.clearTimeout(timer)
+  }, [hiddenModelList, modelsLoaded, transport])
+  // The phone offers only the providers added here, so it never shows one
+  // this app removed. Nothing is shared before the roster is first saved.
+  // Shared again on every connection: one closed before the request left
+  // drops it, and the server keeps only what last arrived.
+  useEffect(() => {
+    if (providerRoster === undefined) return
+    const share = () =>
+      void transport
+        .request('providers.setRoster', { keys: [...providerRoster] })
+        .catch(() => undefined)
+    if (transport.state === 'open') share()
+    return transport.onState((state) => {
+      if (state === 'open') share()
+    })
+  }, [providerRoster, transport])
+  const visibleModelsRef = useRef(visibleModels)
+  visibleModelsRef.current = visibleModels
+  // Memoised for identity: while the catalog is empty this is the selected
+  // choice, and a fresh object per render would give every consumer downstream
+  // (including effects that write settings) a new dependency each frame.
+  const implicitChoice = useMemo(
+    () =>
+      provider !== 'api' && (provider !== 'pi' || sourceAgent)
+        ? choicesFor(
+            {
+              provider,
+              sourceName: providerName(provider, sourceAgentName),
+              mark:
+                provider === 'acp' && sourceAgent ? agentMark(sourceAgent) : providerMark(provider),
+              ...(sourceAgent
+                ? {
+                    agent: { id: sourceAgent, name: sourceAgentName ?? sourceAgent },
+                  }
+                : {}),
+            },
+            [],
+            true,
+          )[0]
+        : undefined,
+    [provider, sourceAgent, sourceAgentName],
+  )
+  const activeSession = useMemo(
+    () => (activeId ? findSession(projects, activeId)?.session : undefined),
+    [activeId, projects],
+  )
+  const activeModelSource = useMemo(() => {
+    return activeSession
+      ? sourceKey({
+          provider: activeSession.provider,
+          connectionId: activeSession.connectionId,
+          agentId: activeSession.agent,
+        })
+      : undefined
+  }, [activeSession])
+  // An open chat runs on its own account. When that is not the account the
+  // catalog lists for its provider, the chat is offered its own account's
+  // models, whose plan may differ; the catalog's stay until they arrive.
+  const chatModelAccount =
+    activeSession &&
+    // A chat still starting runs on the active account, which the catalog lists.
+    !activeSession.id.startsWith('pending:') &&
+    !activeSession.agent &&
+    !activeSession.connectionId &&
+    !sameAccount(
+      activeSession.accountId,
+      modelListAccount(providerAccounts, activeSession.provider),
+    )
+      ? chatAccountKey(activeSession.provider, activeSession.accountId)
+      : undefined
+  const chatModelAccountRef = useRef(chatModelAccount)
+  chatModelAccountRef.current = chatModelAccount
+  const [chatModels, setChatModels] = useState<{ account: string; models: ModelChoice[] }>()
+  const [chatModelsRevision, setChatModelsRevision] = useState(0)
+  useEffect(() => {
+    if (!chatModelAccount) return
+    const [id = '', accountId = DEFAULT_ACCOUNT_ID] = chatModelAccount.split('\u0000')
+    const chatProvider = id as ProviderId
+    let cancelled = false
+    void transport
+      .request('models.list', {
+        provider: chatProvider,
+        ...(accountId === DEFAULT_ACCOUNT_ID ? {} : { accountId }),
+      })
+      .then(
+        (result) => {
+          if (cancelled) return
+          const sourceName = providerName(chatProvider)
+          setChatModels({
+            account: chatModelAccount,
+            models: choicesFor(
+              { provider: chatProvider, sourceName, mark: providerMark(chatProvider) },
+              result.models,
+              false,
+            ),
+          })
+        },
+        // The catalog's list stays offered.
+        () => undefined,
+      )
+    return () => {
+      cancelled = true
+    }
+  }, [chatModelAccount, chatModelsRevision, transport])
+  const selectableModels = useMemo(() => {
+    if (chatModelAccount && chatModels?.account === chatModelAccount && chatModels.models.length) {
+      return chatModels.models.filter((choice) => !hiddenModels.has(choice.key))
+    }
+    return activeModelSource
+      ? visibleModels.filter((choice) => modelSource(choice) === activeModelSource)
+      : visibleModels
+  }, [activeModelSource, visibleModels, chatModelAccount, chatModels, hiddenModels])
+  const storedModelChoice = models.find((choice) => choice.key === modelId)
+  const sourceHasCatalogModels = useMemo(
+    () =>
+      activeModelSource
+        ? models.some((choice) => modelSource(choice) === activeModelSource)
+        : false,
+    [activeModelSource, models],
+  )
+  // An open chat can move to another provider: its next message goes there.
+  const movableChat =
+    activeSession !== undefined &&
+    activeModelSource !== undefined &&
+    !activeSession.id.startsWith('pending:')
+  /**
+   * A provider's other signed-in accounts, each offered as a source of its
+   * own: an open chat moves to the account picked, a new chat starts on it.
+   * The provider's own entry stands for an open chat's account, else for the
+   * account new chats start on.
+   */
+  const otherAccountSources = useMemo(() => {
+    const sources: Array<{ provider: ProviderId; accountId: AccountId; primary: AccountId }> = []
+    if (activeSession && !movableChat) return sources
+    for (const status of providerStatuses) {
+      if (status.capabilities?.multipleAccounts !== true) continue
+      if (!rosterAllows(providerRoster, sourceKey({ provider: status.id }))) continue
+      const primary =
+        activeSession?.provider === status.id && !activeSession.agent && !activeSession.connectionId
+          ? ((activeSession.accountId as AccountId | undefined) ?? DEFAULT_ACCOUNT_ID)
+          : activeAccountOf(providerAccounts, status.id)
+      const signedIn = status.auth === 'authenticated'
+      for (const account of continueAccounts(providerAccounts, status.id, primary, signedIn)) {
+        sources.push({ provider: status.id, accountId: account.id, primary })
+      }
+    }
+    return sources
+  }, [activeSession, movableChat, providerStatuses, providerRoster, providerAccounts])
+  const otherAccountKeys = otherAccountSources
+    .map(({ provider: id, accountId }) => chatAccountKey(id, accountId))
+    .join('\u0001')
+  const otherAccountKeysRef = useRef(otherAccountKeys)
+  otherAccountKeysRef.current = otherAccountKeys
+  const [otherAccountModels, setOtherAccountModels] = useState<ReadonlyMap<string, Model[]>>(
+    () => new Map(),
+  )
+  const [otherAccountModelsRevision, setOtherAccountModelsRevision] = useState(0)
+  useEffect(() => {
+    if (!otherAccountKeys) return
+    let cancelled = false
+    for (const key of otherAccountKeys.split('\u0001')) {
+      const [id = '', accountId = DEFAULT_ACCOUNT_ID] = key.split('\u0000')
+      void transport
+        .request('models.list', {
+          provider: id as ProviderId,
+          ...(accountId === DEFAULT_ACCOUNT_ID ? {} : { accountId }),
+        })
+        .then(
+          (result) => {
+            if (!cancelled)
+              setOtherAccountModels((current) => new Map(current).set(key, result.models))
+          },
+          // The account is offered once its list arrives.
+          () => undefined,
+        )
+    }
+    return () => {
+      cancelled = true
+    }
+  }, [otherAccountKeys, otherAccountModelsRevision, transport])
+  const otherAccountChoices = useMemo(
+    () =>
+      otherAccountSources.flatMap(({ provider: id, accountId }) =>
+        choicesFor(
+          { provider: id, accountId, sourceName: providerName(id), mark: providerMark(id) },
+          otherAccountModels.get(chatAccountKey(id, accountId)) ?? [],
+          false,
+        ).filter((choice) => !hiddenModels.has(modelChoiceKey(id, choice.model.id))),
+      ),
+    [otherAccountSources, otherAccountModels, hiddenModels],
+  )
+  /** "Claude Code (Team)", once a provider offers more than one of its accounts. */
+  const withAccountName = useCallback(
+    (choice: ModelChoice): ModelChoice => {
+      if (choice.agent || choice.connectionId) return choice
+      const offered = otherAccountSources.find((entry) => entry.provider === choice.provider)
+      if (!offered) return choice
+      const account = accountLabelOf(
+        providerAccounts,
+        choice.provider,
+        choice.accountId ?? offered.primary,
+      )
+      return { ...choice, sourceName: `${choice.sourceName} (${account})` }
+    },
+    [otherAccountSources, providerAccounts],
+  )
+  const signInsVersion = useSyncExternalStore(
+    subscribeRememberedSignIns,
+    rememberedSignInsVersion,
+    rememberedSignInsVersion,
+  )
+  /**
+   * Providers whose own models cannot run now: not installed, nothing
+   * declared, or signed out as far as the app knows (provider-availability.ts).
+   * `signedOut` is the part a sign-in elsewhere would change.
+   */
+  const unavailableProviders = useMemo(() => {
+    void signInsVersion // A kept sign-in answer changed.
+    const blocked = new Set<ProviderId>()
+    const signedOut = new Set<ProviderId>()
+    for (const status of providerStatuses) {
+      // A kept read is of the default account; another account may be the one new chats use.
+      const kept =
+        activeAccountOf(providerAccounts, status.id) === DEFAULT_ACCOUNT_ID
+          ? lastSignIn(status.id)
+          : undefined
+      if (providerCanRun(status, kept)) continue
+      blocked.add(status.id)
+      if (status.installed && status.capabilities && knownSignIn(status, kept) === false) {
+        signedOut.add(status.id)
+      }
+    }
+    return { blocked, signedOut }
+  }, [providerStatuses, providerAccounts, signInsVersion])
+  const composerSource = sourceKey({ provider, agentId: sourceAgent })
+  /**
+   * What the picker offers: the chat's own models, then every other provider's,
+   * and every other signed-in account's. Models the user hid from the chat's
+   * own source keep the picker away, as before; a source that lists none at
+   * all still lets the chat move on. A provider that cannot run is left out,
+   * except the source the composer is on, which says itself why it cannot send.
+   * Agents, connections and further accounts answer for their own sign-in.
+   */
+  const pickerModels = useMemo(
+    () =>
+      (movableChat && (selectableModels.length > 0 || !sourceHasCatalogModels)
+        ? [
+            ...selectableModels,
+            ...visibleModels.filter(
+              (choice) => modelSource(choice) !== activeModelSource && choice.provider !== 'api',
+            ),
+            ...otherAccountChoices,
+          ]
+        : [...selectableModels, ...otherAccountChoices]
+      )
+        .filter(
+          (choice) =>
+            !unavailableProviders.blocked.has(choice.provider) ||
+            choice.agent !== undefined ||
+            choice.connectionId !== undefined ||
+            choice.accountId !== undefined ||
+            modelSource(choice) === activeModelSource ||
+            modelSource(choice) === composerSource,
+        )
+        .map(withAccountName),
+    [
+      movableChat,
+      selectableModels,
+      sourceHasCatalogModels,
+      visibleModels,
+      activeModelSource,
+      otherAccountChoices,
+      withAccountName,
+      unavailableProviders,
+      composerSource,
+    ],
+  )
+  // Only the user's own pick moves a chat; a fallback never leaves its provider.
+  const moveChoice = movableChat
+    ? pickerModels.find(
+        (choice) => choice.key === modelId && modelSource(choice) !== activeModelSource,
+      )
+    : undefined
+  const preferredModelSource =
+    activeModelSource ??
+    (storedModelChoice
+      ? modelSource(storedModelChoice)
+      : sourceKey({ provider, agentId: sourceAgent }))
+  const preferredModelKey = useMemo(
+    () => readSourceSelections()[preferredModelSource]?.modelKey,
+    [preferredModelSource, selectableModels],
+  )
+  const preferredSourcePending = pendingModelSources.has(preferredModelSource)
+  // A source left for later is listed as soon as the composer is on it.
+  useEffect(() => {
+    catalogSources.current?.discover(preferredModelSource)
+  }, [preferredModelSource])
+  // Stable identity on purpose: the composer passes it to the picker's menu,
+  // and Settings asks for it while Models or Providers is open.
+  const discoverEveryModelSource = useCallback(() => {
+    everyModelSourceWanted.current = true
+    catalogSources.current?.discover()
+  }, [])
+  const selectableImplicitChoice =
+    implicitChoice &&
+    (activeModelSource
+      ? modelSource(implicitChoice) === activeModelSource
+      : rosterAllows(providerRoster, modelSource(implicitChoice))) &&
+    (models.length === 0 ||
+      preferredSourcePending ||
+      (activeModelSource && !sourceHasCatalogModels))
+      ? implicitChoice
+      : undefined
+  const resolvedModelChoice =
+    moveChoice ??
+    selectableModels.find((choice) => choice.key === modelId) ??
+    selectableModels.find((choice) => choice.key === preferredModelKey) ??
+    selectableModels.find(
+      (choice) => modelSource(choice) === preferredModelSource && choice.model.isDefault,
+    ) ??
+    selectableModels.find((choice) => modelSource(choice) === preferredModelSource)
+  /** The model the chat would use on its own provider, for undoing a pick that moves it. */
+  const chatOwnModel = moveChoice
+    ? (selectableModels.find((choice) => choice.key === preferredModelKey) ??
+      selectableModels.find((choice) => choice.model.isDefault) ??
+      selectableModels[0])
+    : undefined
+  const chatOwnChoice = chatOwnModel && withAccountName(chatOwnModel)
+  // The preferred source has not listed its models yet, so the model a send
+  // would use is not known. The placeholder below keeps that source, but it is
+  // only the provider default: the picker waits and Send stays off instead of
+  // starting a turn the label does not describe.
+  const modelChoicePending = !resolvedModelChoice && preferredSourcePending
+  const selectedModelChoice =
+    resolvedModelChoice ??
+    (preferredSourcePending ? selectableImplicitChoice : undefined) ??
+    selectableModels.find((choice) => choice.model.isDefault) ??
+    selectableModels[0] ??
+    selectableImplicitChoice
+  // A new chat with nothing added has no provider to start on.
+  const noProviderAdded = !activeSession && providerRoster?.length === 0 && models.length === 0
+  const sendAvailability: SendAvailability = noProviderAdded
+    ? 'no-provider'
+    : modelChoicePending
+      ? 'loading'
+      : resolveSendAvailability({
+          catalog: catalogAvailability,
+          serverBoundSession: Boolean(
+            activeSession && activeSession.provider === provider && !implicitChoice,
+          ),
+          // A message that switches the chat goes to the provider it switches to.
+          activeProvider: moveChoice ? undefined : activeSession?.provider,
+          selectedChoice: selectedModelChoice,
+          providerStatuses,
+          accountCheck,
+        })
+  // One effective setup drives both the picker and requests. State can briefly
+  // contain values from storage or the model that was just hidden; resolving
+  // in render prevents that transition from leaking into an immediate send.
+  const selectedEffort = selectedModelChoice
+    ? resolveReasoningEffort({
+        currentEffort: effort,
+        currentModel: storedModelChoice?.model,
+        nextModel: selectedModelChoice.model,
+      })
+    : undefined
+  const selectedServiceTier = selectedModelChoice
+    ? unvalidatedModelKeys.has(selectedModelChoice.key)
+      ? serviceTier
+      : getNextServiceTierForModel({
+          currentServiceTier: serviceTier,
+          currentModel: storedModelChoice?.model,
+          nextModel: selectedModelChoice.model,
+        })
+    : undefined
+  const attachmentsSupported = useMemo(
+    () =>
+      sourceSupportsAttachments(
+        selectedModelChoice
+          ? {
+              provider: selectedModelChoice.provider,
+              connectionId: selectedModelChoice.connectionId,
+              agentId: selectedModelChoice.agent?.id,
+              modelImages: selectedModelChoice.model.images,
+            }
+          : { provider, agentId: sourceAgent },
+        providerStatuses,
+      ),
+    [selectedModelChoice, provider, sourceAgent, providerStatuses],
+  )
+  const autoReviewSupported = useMemo(
+    () =>
+      providerStatuses.find((entry) => entry.id === provider)?.capabilities?.autoReview === true,
+    [provider, providerStatuses],
+  )
+  // An engine that cannot ask before it acts fails in Ask first instead of asking.
+  const askFirstUnsupported = useMemo(
+    () => providerStatuses.find((entry) => entry.id === provider)?.capabilities?.askFirst === false,
+    [provider, providerStatuses],
+  )
+  // A new chat with such a provider runs as one of its accounts.
+  const providerHasAccounts = useMemo(
+    () =>
+      providerStatuses.find((entry) => entry.id === provider)?.capabilities?.multipleAccounts ===
+      true,
+    [provider, providerStatuses],
+  )
+
+  // A new chat starts on the provider's active account, with that account's
+  // own defaults, else its provider's.
+  const newChatAccount = providerHasAccounts
+    ? activeAccountOf(providerAccounts, provider)
+    : undefined
+  const newChatAccountRef = useRef(newChatAccount)
+  newChatAccountRef.current = newChatAccount
+  const storedApproval = scopedDefault(approvalByProvider, provider, newChatAccount)
+  const defaultApproval = storedApproval ?? (autoReviewSupported ? 'auto-review' : 'full')
+  const approval = activeId ? (activeThreadApproval ?? 'ask') : defaultApproval
+  // Auto-review support arrives with the provider list. Until then a saved
+  // auto-review choice, or the default, would show as full access and flip.
+  const approvalWaitsForProvider =
+    catalogAvailability === 'loading' &&
+    !providerStatuses.some((entry) => entry.id === provider) &&
+    (approval === 'auto-review' || (!activeId && storedApproval === undefined))
+  const approvalLoading =
+    Boolean(activeId && activeThreadApproval === undefined) || approvalWaitsForProvider
+  // While waiting, the mode only sizes the placeholder; auto-review is what it
+  // resolves to whenever the provider supports it.
+  const displayedApproval: ApprovalMode = approvalWaitsForProvider
+    ? 'auto-review'
+    : approval === 'auto-review' && !autoReviewSupported
+      ? 'full'
+      : approval
+  // Ask first is never raised to another access level behind the user's back:
+  // the composer says why it cannot send, and Send waits for another choice.
+  // A chat whose own mode is still loading shows Ask first as a placeholder only.
+  const askFirstBlock =
+    askFirstUnsupported && displayedApproval === 'ask' && !approvalLoading
+      ? `${providerName(provider, sourceAgentName)} can't ask before running commands. Choose Auto-approve or Full access.`
+      : undefined
+  const askFirstBlockRef = useRef(askFirstBlock)
+  askFirstBlockRef.current = askFirstBlock
+
+  useEffect(() => {
+    const checkConnection = () => void transport.ensureHealthy()
+    const checkVisibleConnection = () => {
+      if (document.visibilityState === 'visible') checkConnection()
+    }
+    window.addEventListener('focus', checkConnection)
+    window.addEventListener('online', checkConnection)
+    document.addEventListener('visibilitychange', checkVisibleConnection)
+    return () => {
+      window.removeEventListener('focus', checkConnection)
+      window.removeEventListener('online', checkConnection)
+      document.removeEventListener('visibilitychange', checkVisibleConnection)
+    }
+  }, [transport])
+
+  useLayoutEffect(() => {
+    applyTheme(theme)
+    void setDesktopTheme(desktopThemePreference)
+  }, [theme, desktopThemePreference])
+
+  usePersistedSettingChange(THEME_KEY, themePreference)
+
+  useLayoutEffect(() => {
+    applyFontPreference(fontPreference)
+  }, [fontPreference])
+  usePersistedSettingChange(appearanceKey(FONT_KEY, 'light'), appearancePreferences.light.font)
+  usePersistedSettingChange(appearanceKey(FONT_KEY, 'dark'), appearancePreferences.dark.font)
+
+  useLayoutEffect(() => {
+    applyAccentPreference(accentPreference)
+  }, [accentPreference])
+  usePersistedSettingChange(appearanceKey(ACCENT_KEY, 'light'), appearancePreferences.light.accent)
+  usePersistedSettingChange(appearanceKey(ACCENT_KEY, 'dark'), appearancePreferences.dark.accent)
+
+  useLayoutEffect(() => {
+    applyBackdropPreference(backdropPreference)
+  }, [backdropPreference])
+  usePersistedSettingChange(
+    appearanceKey(BACKDROP_KEY, 'light'),
+    appearancePreferences.light.backdrop,
+  )
+  usePersistedSettingChange(
+    appearanceKey(BACKDROP_KEY, 'dark'),
+    appearancePreferences.dark.backdrop,
+  )
+
+  useLayoutEffect(() => {
+    applyGlassPreference(sidebarGlass)
+  }, [sidebarGlass])
+  usePersistedSettingChange(
+    appearanceKey(GLASS_KEY, 'light'),
+    String(appearancePreferences.light.glass),
+  )
+  usePersistedSettingChange(
+    appearanceKey(GLASS_KEY, 'dark'),
+    String(appearancePreferences.dark.glass),
+  )
+  // After the theme, backdrop and glass above have reached the document.
+  useWindowChrome(
+    theme,
+    `${backdropPreference}|${sidebarGlass}|${settingsOpen}|${onboardingMounted}|${providerLoginTerminal !== undefined}`,
+  )
+
+  useEffect(() => {
+    const media = globalThis.matchMedia?.(DARK_THEME_QUERY)
+    if (!media) return
+
+    const updateSystemTheme = () => setSystemTheme(media.matches ? 'dark' : 'light')
+    updateSystemTheme()
+    media.addEventListener('change', updateSystemTheme)
+    return () => media.removeEventListener('change', updateSystemTheme)
+  }, [])
+
+  useLayoutEffect(() => {
+    document.documentElement.classList.toggle(
+      'is-macos-font-smoothing',
+      macOS && macOSFontSmoothing,
+    )
+    return () => document.documentElement.classList.remove('is-macos-font-smoothing')
+  }, [macOS, macOSFontSmoothing])
+
+  usePersistedSettingChange(
+    MACOS_FONT_SMOOTHING_KEY,
+    macOS ? String(macOSFontSmoothing) : undefined,
+  )
+
+  useEffect(() => {
+    const reduceMotion =
+      globalThis.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false
+    if (bottomTerminalPhase === 'opening') {
+      setBottomTerminalPhase('open')
+      return
+    }
+    if (bottomTerminalPhase === 'closing' && reduceMotion) {
+      setBottomTerminalPhase('closed')
+    }
+  }, [bottomTerminalPhase])
+
+  useEffect(() => {
+    if (bottomTerminalPhase !== 'closing') return
+    const timeout = globalThis.setTimeout(() => {
+      setBottomTerminalPhase((phase) => (phase === 'closing' ? 'closed' : phase))
+    }, BOTTOM_TERMINAL_MOTION_MS + 80)
+    return () => globalThis.clearTimeout(timeout)
+  }, [bottomTerminalPhase])
+
+  usePersistedSettingChange(TERMINAL_HEIGHT_KEY, String(terminalHeight))
+
+  const cancelWorkspacePanelWidthPersistence = usePersistedSettingChange(
+    WORKSPACE_PANEL_WIDTH_KEY,
+    String(workspacePanelWidth),
+    120,
+  )
+
+  const activeIdRef = useRef(activeId)
+  useEffect(() => {
+    const preview = activeId ? backgroundDesignPreviews.current.get(activeId) : undefined
+    if (!activeId || !preview) return
+    backgroundDesignPreviews.current.delete(activeId)
+    setWorkspacePanelHasMounted(true)
+    setWorkspaceDesignPreviewRequest(preview)
+  }, [activeId])
+  activeIdRef.current = activeId
+  // The server sends the agent's browser commands only for the chat this window shows.
+  useEffect(() => {
+    // Commands that waited for the panel belong to the chat that was on screen.
+    clearAgentBrowserEvents()
+    if (!isDesktop || !activeId || activeId.startsWith('pending:')) return
+    return showBrowserThread(
+      (capabilities) => transport.request('client.capabilities', capabilities),
+      activeId,
+    )
+  }, [transport, activeId])
+  const activePathRef = useRef(activePath)
+  activePathRef.current = activePath
+  useEffect(() => {
+    const flushDrafts = () => threadController.flushDrafts()
+    window.addEventListener('pagehide', flushDrafts)
+    return () => {
+      window.removeEventListener('pagehide', flushDrafts)
+      flushDrafts()
+    }
+  }, [threadController])
+  const publishComposerDraft = useCallback((draft: ComposerDraft) => {
+    setComposerDraft({
+      text: draft.text,
+      attachments: draft.attachments,
+      resources: draft.resources,
+      request: ++composerDraftRequests.current,
+    })
+  }, [])
+  const stageBrowserAnnotations = useCallback(
+    (annotation: AnnotationDraft) => {
+      const owner = threadController.draftOwner
+      const current = threadController.draft(owner)
+      publishComposerDraft(
+        threadController.editDraft(owner, {
+          text: [current.text, annotation.text].filter(Boolean).join('\n\n'),
+          attachments: [...current.attachments, ...annotation.attachments],
+        }),
+      )
+    },
+    [publishComposerDraft],
+  )
+  const restoreRejectedDraft = useCallback(
+    (threadId: string, rejected: RecoverableDraft) => {
+      const draft = threadController.recoverDraft(threadId, rejected)
+      if (threadId === composerDraftKey(activeIdRef.current)) {
+        threadController.draftOwner = threadId
+        publishComposerDraft(draft)
+      }
+    },
+    [publishComposerDraft],
+  )
+  const restoreComposerDraft = useCallback(
+    (key: string) => {
+      threadController.draftOwner = key
+      composerDraftKeyRef.current = key
+      publishComposerDraft(threadController.draft(key))
+    },
+    [publishComposerDraft],
+  )
+  /** The project the new-chat draft was written for; another project starts without it. */
+  const newChatDraftProject = useRef<string | undefined>(undefined)
+  const enterNewChatDraft = useCallback(
+    (projectPath: string) => {
+      // Until a draft is tied to a project, it is the one on screen's.
+      const owner = newChatDraftProject.current ?? activePathRef.current
+      newChatDraftProject.current = projectPath
+      if (owner === undefined || owner === projectPath) return
+      const next = threadController.editDraft(NEW_CHAT_DRAFT_KEY, {
+        text: '',
+        attachments: [],
+        resources: [],
+      })
+      if (activeIdRef.current === undefined) publishComposerDraft(next)
+    },
+    [publishComposerDraft],
+  )
+  const handleComposerReady = useCallback(() => {
+    restoreComposerDraft(composerDraftKey(activeIdRef.current))
+  }, [restoreComposerDraft])
+  // New chat and every session keep a separate prompt. Restore on destination
+  // change so the previous bar does not travel with the composer.
+  useEffect(() => {
+    const key = composerDraftKey(activeId)
+    if (injectedDraftTransition.current) {
+      injectedDraftTransition.current = false
+      threadController.draftOwner = key
+      composerDraftKeyRef.current = key
+      return
+    }
+    if (composerDraftKeyRef.current === key) {
+      threadController.draftOwner = key
+      return
+    }
+    restoreComposerDraft(key)
+  }, [activeId, restoreComposerDraft])
+  useEffect(() => {
+    if (surface !== 'chat') return
+    const key = composerDraftKey(activeIdRef.current)
+    if (isEmptyComposerDraft(threadController.draft(key))) return
+    restoreComposerDraft(key)
+  }, [surface, restoreComposerDraft])
+  const updateComposerDraftText = useCallback((text: string) => {
+    threadController.editDraft(threadController.draftOwner, { text })
+  }, [])
+  const updateComposerDraftAttachments = useCallback((attachments: string[]) => {
+    threadController.editDraft(threadController.draftOwner, { attachments })
+  }, [])
+  const updateComposerDraftResources = useCallback((resources: ComposerResource[]) => {
+    threadController.editDraft(threadController.draftOwner, { resources })
+  }, [])
+  // A paste can finish saving after the user switched chats. The composer then
+  // no longer shows its draft, so the file joins the draft it was pasted into.
+  const keepPendingAttachment = useCallback(
+    (savedPath: Promise<string | undefined>) => {
+      const owner = threadController.draftOwner
+      void savedPath.then((path) => {
+        if (!path) return
+        const draft = threadController.draft(owner)
+        if (draft.attachments.includes(path)) return
+        const next = threadController.editDraft(owner, {
+          attachments: [...draft.attachments, path],
+        })
+        if (threadController.draftOwner === owner) publishComposerDraft(next)
+      })
+    },
+    [publishComposerDraft],
+  )
+  // Editing a queued prompt removes it before the composer takes it back. If
+  // the user switched chats meanwhile, the prompt returns to its own chat.
+  const keepQueuedEdit = useCallback(
+    (removed: Promise<RecoverableDraft | undefined>) => {
+      const owner = threadController.draftOwner
+      void removed.then((prompt) => {
+        if (prompt) restoreRejectedDraft(owner, prompt)
+      })
+    },
+    [restoreRejectedDraft],
+  )
+  const projectsRef = useRef(projects)
+  projectsRef.current = projects
+  // What the sidebar shows. Navigation picks from this list so it never
+  // selects, and thereby silently cancels, a chat queued for deletion.
+  const visibleProjectsRef = useRef(archiveProjects)
+  visibleProjectsRef.current = archiveProjects
+  const workspaceIdleProbe = useRef<WorkspaceIdleProbe>({
+    inFlight: undefined,
+    pendingPath: undefined,
+    idlePath: undefined,
+    blockedPath: undefined,
+    pendingStarts: new Map(),
+    submissionStarts: new ThreadOwnedMap(),
+    queuedStarts: new ThreadOwnedMap(),
+    claimedStarts: new Set(),
+    queueActions: new ThreadOwnedMap(),
+    unknownQueues: new Set(),
+    nextStart: 0,
+    revision: 0,
+    transportRevision: 0,
+    refreshedRevision: -1,
+    refreshedPath: undefined,
+  })
+  const isThreadCacheProtected = useCallback(
+    (threadId: string) => {
+      const probe = workspaceIdleProbe.current
+      return (
+        threadController.isProtected(threadId) ||
+        (probe.pendingStarts.get(threadId)?.tokens.length ?? 0) > 0 ||
+        probe.submissionStarts.countForThread(threadId) > 0 ||
+        probe.queuedStarts.countForThread(threadId) > 0 ||
+        probe.queueActions.countForThread(threadId) > 0 ||
+        probe.unknownQueues.has(threadId)
+      )
+    },
+    [threadController],
+  )
+  const pruneThreadStateCache = useCallback(
+    () => threadController.prune(isThreadCacheProtected),
+    [threadController, isThreadCacheProtected],
+  )
+  const pruneQueueMetadata = useCallback(
+    () => threadController.pruneQueues(isThreadCacheProtected),
+    [threadController, isThreadCacheProtected],
+  )
+  const beginQueueRead = useCallback(
+    (id: string) => threadController.beginQueueRead(id),
+    [threadController],
+  )
+  const finishQueueRead = useCallback(
+    (id: string) => {
+      if (threadController.finishQueueRead(id)) pruneQueueMetadata()
+    },
+    [threadController, pruneQueueMetadata],
+  )
+  useEffect(pruneThreadStateCache, [activeId, pruneThreadStateCache])
+  useEffect(pruneQueueMetadata, [activeId, pruneQueueMetadata])
+  useEffect(() => {
+    workspaceIdleProbe.current.revision += 1
+  }, [activePath])
+  // prettier-ignore
+  const invalidateWorkspaceIdleProbe = useCallback((projectPath: string | undefined) => { if (!projectPath || projectPath !== activePathRef.current) return; workspaceIdleProbe.current.revision += 1; workspaceIdleProbe.current.idlePath = undefined; if (workspaceIdleProbe.current.blockedPath === projectPath) workspaceIdleProbe.current.blockedPath = undefined }, [])
+  // prettier-ignore
+  const releaseWorkspaceStart = useCallback((threadId: string, token?: number) => { const probe = workspaceIdleProbe.current, pending = probe.pendingStarts.get(threadId); if (!pending) return; const index = token === undefined ? 0 : pending.tokens.indexOf(token); if (index < 0) return; pending.tokens.splice(index, 1); if (pending.tokens.length > 0) return; probe.pendingStarts.delete(threadId); if (probe.blockedPath !== pending.path || hasWorkspaceStartForPath(probe.pendingStarts.values(), pending.path)) return; probe.blockedPath = undefined; return pending.path }, [])
+  // prettier-ignore
+  const holdWorkspaceStart = useCallback((threadId: string, path: string) => { const probe = workspaceIdleProbe.current, current = probe.pendingStarts.get(threadId), token = ++probe.nextStart; probe.idlePath = probe.refreshedPath = undefined; probe.pendingStarts.set(threadId, { path, tokens: [...(current?.tokens ?? []), token] }); return token }, [])
+  const refreshWorkspaceAfterCompletion = useCallback(
+    (projectPath: string | undefined) => {
+      if (!projectPath || projectPath !== activePathRef.current) return
+      const probe = workspaceIdleProbe.current
+      if (probe.refreshedPath === projectPath && probe.refreshedRevision === probe.revision) return
+      probe.pendingPath = projectPath
+      if (probe.inFlight) return
+
+      const drain = async () => {
+        const transportRevision = probe.transportRevision
+        let retryPath: string | undefined
+        let retryAvailable = true
+        while (probe.pendingPath && transportRevision === probe.transportRevision) {
+          const path = probe.pendingPath
+          if (path !== retryPath) {
+            retryPath = path
+            retryAvailable = true
+          }
+          const revision = probe.revision
+          probe.pendingPath = undefined
+          let retry = false
+          try {
+            const { projects } = await transport.request('projects.list', {})
+            if (revision !== probe.revision || transportRevision !== probe.transportRevision)
+              continue
+            if (activePathRef.current !== path) continue
+            const project = projects.find((candidate) => candidate.path === path)
+            if (!project) {
+              retry = probe.idlePath !== path
+            } else {
+              const pending = hasWorkspaceStartForPath(probe.pendingStarts.values(), path)
+              const activity = workspaceProjectActivity(
+                project.sessions,
+                threadController.queues,
+                probe.unknownQueues,
+                probe.queueActions.values(),
+              )
+              if (activity.needsResync) resync.current()
+              const blocked = activity.running || pending || activity.queued || activity.unknown
+              if (blocked) probe.blockedPath = path
+              else if (probe.blockedPath === path) probe.blockedPath = undefined
+              probe.idlePath = blocked ? undefined : path
+            }
+          } catch {
+            retry =
+              transportRevision === probe.transportRevision &&
+              revision === probe.revision &&
+              probe.idlePath !== path
+          }
+          if (!retry || !retryAvailable || probe.pendingPath) continue
+          retryAvailable = false
+          probe.pendingPath = path
+        }
+
+        const path = probe.idlePath
+        const blocked = hasWorkspaceStartForPath(probe.pendingStarts.values(), path)
+        if (path === activePathRef.current && blocked) probe.blockedPath = path
+        probe.idlePath = undefined
+        if (path === activePathRef.current && !blocked) {
+          probe.refreshedPath = path
+          probe.refreshedRevision = probe.revision
+          setWorkspaceRefreshRevision((revision) => revision + 1)
+        }
+      }
+      const inFlight = drain()
+      probe.inFlight = inFlight
+      void inFlight.finally(() => {
+        if (probe.inFlight === inFlight) probe.inFlight = undefined
+      })
+    },
+    [transport],
+  )
+  // prettier-ignore
+  const releaseQueuedStart = useCallback((queuedTurnId: string) => { const probe = workspaceIdleProbe.current, owner = probe.queuedStarts.get(queuedTurnId); if (!owner) return; probe.queuedStarts.delete(queuedTurnId); probe.claimedStarts.delete(queuedTurnId); for (const [id, start] of probe.submissionStarts.entriesForThread(owner.threadId)) if (start.token === owner.token) probe.submissionStarts.delete(id); const path = releaseWorkspaceStart(owner.threadId, owner.token); if (path) refreshWorkspaceAfterCompletion(path) }, [releaseWorkspaceStart, refreshWorkspaceAfterCompletion])
+  // prettier-ignore
+  const holdQueueAction = useCallback((id: string, threadId: string, kind: 'delete' | 'steer') => { const probe = workspaceIdleProbe.current, action = probe.queueActions.get(id) ?? { threadId, count: 0, pending: 0, steers: 0 }; action.count += 1; action.pending += 1; if (kind === 'steer') action.steers += 1; probe.queueActions.set(id, action) }, [])
+  // prettier-ignore
+  const settleQueueAction = useCallback((id: string, kind: 'delete' | 'steer', indeterminate = false) => { const action = workspaceIdleProbe.current.queueActions.get(id); if (!action) return; action.pending -= 1; if (!indeterminate) { action.count -= 1; if (kind === 'steer') action.steers -= 1 }; if (action.count === 0) workspaceIdleProbe.current.queueActions.delete(id) }, [])
+  // prettier-ignore
+  const releaseDirectStart = useCallback((threadId: string) => { const probe = workspaceIdleProbe.current, queued = new Set([...probe.queuedStarts.entriesForThread(threadId)].map(([, owner]) => owner.token)), token = probe.pendingStarts.get(threadId)?.tokens.find((candidate) => !queued.has(candidate)); if (token === undefined) return; for (const [id, start] of probe.submissionStarts.entriesForThread(threadId)) if (start.token === token) probe.submissionStarts.delete(id); releaseWorkspaceStart(threadId, token) }, [releaseWorkspaceStart])
+  // prettier-ignore
+  const clearWorkspaceThread = useCallback((threadId: string) => { pendingProviderHistoryIds.current.delete(threadId); providerHistoryReads.current.delete(threadId); const probe = workspaceIdleProbe.current, path = probe.pendingStarts.get(threadId)?.path ?? findSession(projectsRef.current, threadId)?.project.path; probe.pendingStarts.delete(threadId); probe.unknownQueues.delete(threadId); threadController.forget(threadId); for (const [id] of probe.submissionStarts.entriesForThread(threadId)) probe.submissionStarts.delete(id); for (const [id] of probe.queuedStarts.entriesForThread(threadId)) { probe.queuedStarts.delete(id); probe.claimedStarts.delete(id) }; for (const [id] of probe.queueActions.entriesForThread(threadId)) probe.queueActions.delete(id); if (!splitRemovals.current.chats([threadId]) && activeIdRef.current === threadId) { activeIdRef.current = undefined; setActiveId(undefined); setThread(emptyThread) }; return path }, [])
+  /** Refetch after an outage. Held in a ref because the transport effect is
+   *  set up before the fetchers it needs are declared. */
+  const resync = useRef<(retry?: boolean) => void>(() => {})
+  const refreshProviderThreadHistory = useCallback(
+    function replay(threadId: string) {
+      if (
+        threadController.snapshot(threadId)?.running ||
+        providerHistoryReads.current.has(threadId)
+      ) {
+        pendingProviderHistoryIds.current.add(threadId)
+        return
+      }
+      pendingProviderHistoryIds.current.delete(threadId)
+      threadController.invalidateHistory(threadId)
+      if (!threadController.isVisible(threadId)) {
+        threadController.discardSnapshot(threadId)
+        return
+      }
+      const owner = {}
+      providerHistoryReads.current.set(threadId, owner)
+      let failed = false
+      void threadController
+        .loadHistory(threadId)
+        .then((loaded) => {
+          if (providerHistoryReads.current.get(threadId) !== owner) return
+          // A queued turn can start before the server reads the native history.
+          if (loaded?.authority.running) pendingProviderHistoryIds.current.add(threadId)
+        })
+        .catch(() => {
+          if (providerHistoryReads.current.get(threadId) !== owner) return
+          failed = true
+          pendingProviderHistoryIds.current.add(threadId)
+        })
+        .finally(() => {
+          if (providerHistoryReads.current.get(threadId) !== owner) return
+          providerHistoryReads.current.delete(threadId)
+          if (
+            !failed &&
+            pendingProviderHistoryIds.current.has(threadId) &&
+            !threadController.snapshot(threadId)?.running
+          ) {
+            replay(threadId)
+          }
+        })
+    },
+    [threadController],
+  )
+  const flushPendingLifecyclePushes = useRef<(() => void) | undefined>(undefined)
+  const sidebarSettingsRef = useRef(sidebarSettings)
+  sidebarSettingsRef.current = sidebarSettings
+  const reconcileSidebarSettings = useCallback(() => {
+    let next = confirmedSidebarSettings.current
+    for (const updates of sidebarSettingsUpdates.current.values()) {
+      next = { ...next, ...updates }
+    }
+    sidebarSettingsRef.current = next
+    setSidebarSettings(next)
+  }, [])
+  const settleQueuedSubmissions = useCallback(
+    (threadId: string, items: QueuedTurn[], snapshot?: ThreadState) => {
+      const rejected = threadController.settleSubmissions(threadId, items, snapshot)
+      publishThread(threadId, threadController.snapshot(threadId) ?? emptyThread)
+      for (const submission of rejected) restoreRejectedDraft(threadId, submission)
+    },
+    [restoreRejectedDraft, publishThread],
+  )
+  const acceptSidebarSettings = useCallback(
+    (settings: SidebarSettings) => {
+      sidebarSettingsSourceRevision.current += 1
+      confirmedSidebarSettings.current = settings
+      reconcileSidebarSettings()
+    },
+    [reconcileSidebarSettings],
+  )
+
+  useEffect(() => {
+    // Deltas arrive far faster than frames are drawn. Fold and render one batch
+    // per animation frame so a provider burst copies the item list once, not
+    // once per token. A non-delta first flushes its thread synchronously, which
+    // preserves event order and keeps approvals, boundaries, and completions
+    // immediate.
+    let lifecycleFlush: number | undefined
+    let lifecycleFallback: number | undefined
+    const pendingLifecycles = new Map<string, Project['sessions'][number]['lifecycle']>()
+    const flushLifecyclePushes = () => {
+      if (lifecycleFlush !== undefined) cancelAnimationFrame(lifecycleFlush)
+      if (lifecycleFallback !== undefined) window.clearTimeout(lifecycleFallback)
+      lifecycleFlush = undefined
+      lifecycleFallback = undefined
+      if (pendingLifecycles.size === 0) return
+      const lifecycles = new Map(pendingLifecycles)
+      pendingLifecycles.clear()
+      setProjects((current) =>
+        updateSessions(current, lifecycles, (session, nextLifecycle) => ({
+          ...session,
+          lifecycle: nextLifecycle,
+        })),
+      )
+    }
+    flushPendingLifecyclePushes.current = flushLifecyclePushes
+    const offEvents = transport.on('thread.event', (data) => {
+      const { threadId, event } = data
+      if (endsDesignBriefing(event)) setThreadDesignMode(threadId, false)
+      const next = threadController.receive(data, isThreadCacheProtected)
+      if (!next) return
+      // Every window that hears of a move shows the chat on its new provider.
+      if (event.type === 'item.completed' && event.item.notice?.kind === 'provider') {
+        const { provider, agent, accountId } = event.item.notice
+        setProjects((current) =>
+          updateSession(current, threadId, (session) =>
+            sessionOnProvider(session, { provider, agent, accountId }),
+          ),
+        )
+      }
+      if (
+        event.type === 'turn.started' ||
+        event.type === 'turn.completed' ||
+        event.type === 'thread.error'
+      ) {
+        // prettier-ignore
+        const projectPath = findSession(projectsRef.current, threadId)?.project.path ?? (threadId === activeIdRef.current ? activePathRef.current : undefined)
+        if (event.type === 'turn.started') {
+          if (providerHistoryReads.current.has(threadId))
+            pendingProviderHistoryIds.current.add(threadId)
+          threadController.resetBackground(threadId)
+          if (threadId !== activeIdRef.current) {
+            threadController.compact(threadId, isThreadCacheProtected(threadId))
+          }
+          const probe = workspaceIdleProbe.current
+          probe.unknownQueues.delete(threadId)
+          // prettier-ignore
+          const queued = [...probe.queuedStarts.entriesForThread(threadId)].find(([id]) => probe.claimedStarts.has(id) || !threadController.queue(threadId)?.items.some((item) => item.id === id))?.[0]
+          if (queued) releaseQueuedStart(queued)
+          else releaseDirectStart(threadId)
+          invalidateWorkspaceIdleProbe(projectPath)
+        } else {
+          refreshWorkspaceAfterCompletion(projectPath)
+        }
+      }
+
+      if (affectsSessionStatus(event)) {
+        // A status change never moves the chat in the sidebar; only a new chat,
+        // a pin or a drag does.
+        setProjects((current) =>
+          updateSession(current, threadId, (session) => {
+            // A chat in either split pane is in view, so it never turns unread.
+            const shown = threadController.isVisible(threadId)
+            const status = statusFor(next, event, !shown)
+            return {
+              ...session,
+              status,
+              statusSince: status === session.status ? session.statusSince : Date.now(),
+              ...(event.type === 'turn.completed'
+                ? {
+                    unread: !shown,
+                  }
+                : {}),
+            }
+          }),
+        )
+        if (event.type === 'turn.completed' && threadController.isVisible(threadId)) {
+          // Only here for the server's mark-as-read side effect — the live event
+          // stream already delivered the turn. afterSeq skips serializing,
+          // shipping, and parsing the full log just to throw it away.
+          if (!pendingProviderHistoryIds.current.has(threadId)) {
+            void transport
+              .request('thread.history', { threadId, afterSeq: Number.MAX_SAFE_INTEGER })
+              .catch(() => undefined)
+          }
+          refreshUsage(providerRef.current)
+        }
+      }
+      if (event.type === 'turn.completed' || event.type === 'thread.error') {
+        threadController.resetBackground(threadId)
+        // The turn has ended, so the row shows the server's status again.
+        setStoppingRows((rows) => withoutStoppingRow(rows, threadId))
+        if (pendingProviderHistoryIds.current.has(threadId)) {
+          refreshProviderThreadHistory(threadId)
+        }
+        pruneThreadStateCache()
+      }
+    })
+    const offQueue = transport.on('thread.queue', ({ threadId, items, canSteer }) => {
+      const previousItems = threadController.queue(threadId)?.items ?? []
+      const probe = workspaceIdleProbe.current
+      const ownedChecks =
+        probe.queuedStarts.countForThread(threadId) + probe.queueActions.countForThread(threadId)
+      const currentIds = indexQueueItemIdsForChecks(items, previousItems.length + ownedChecks)
+      const previousIds = indexQueueItemIdsForChecks(previousItems, ownedChecks)
+      const currentHas = (id: string) => currentIds?.has(id) ?? items.some((item) => item.id === id)
+      const previousHas = (id: string) =>
+        previousIds?.has(id) ?? previousItems.some((item) => item.id === id)
+      if (previousItems.some((item) => !currentHas(item.id))) probe.unknownQueues.add(threadId)
+      else probe.unknownQueues.delete(threadId)
+      // prettier-ignore
+      { for (const [id] of probe.queuedStarts.entriesForThread(threadId)) { if (currentHas(id)) probe.claimedStarts.delete(id); else if (previousHas(id) && !probe.queueActions.has(id)) probe.claimedStarts.add(id) }; for (const [id, action] of probe.queueActions.entriesForThread(threadId)) if (action.pending === 0 && currentHas(id) && !previousHas(id)) probe.queueActions.delete(id) }
+      threadController.setQueue(threadId, { items, canSteer }, 'server')
+      settleQueuedSubmissions(threadId, items)
+      const projectPath = findSession(projectsRef.current, threadId)?.project.path
+      if (items.length === 0 && probe.blockedPath === projectPath)
+        refreshWorkspaceAfterCompletion(projectPath)
+      if (threadId !== activeIdRef.current) {
+        if (threadId === splitBesideId(splitRef.current)) setBesideQueue({ items, canSteer })
+        else if (items.length === 0) pruneQueueMetadata()
+        return
+      }
+      setQueuedTurns(items)
+      setCanSteerQueue(canSteer)
+    })
+    const offSettings = transport.on('thread.settings', ({ threadId, settings }) =>
+      adoptThreadSettingsRef.current(threadId, settings),
+    )
+    const offLifecycle = transport.on('thread.lifecycle', ({ threadId, lifecycle }) => {
+      pendingLifecycles.set(threadId, lifecycle)
+      if (lifecycleFlush !== undefined) return
+      lifecycleFlush = requestAnimationFrame(flushLifecyclePushes)
+      // Browsers can pause animation frames for hidden windows. This bounded
+      // fallback keeps background lifecycle state from waiting indefinitely.
+      lifecycleFallback = window.setTimeout(flushLifecyclePushes, 100)
+    })
+    const offPreviewCapture = transport.on('preview.captureRequested', (request) => {
+      const preview = { requestId: request.requestId, url: request.url }
+      // The panel belongs to the chat on screen: another chat's preview waits for that chat.
+      if (request.threadId && request.threadId !== activeIdRef.current) {
+        backgroundDesignPreviews.current.set(request.threadId, preview)
+        return
+      }
+      setWorkspacePanelHasMounted(true)
+      setWorkspaceDesignPreviewRequest(preview)
+    })
+    // The agent's browser runs in the shown chat's workspace panel, which loads on first use.
+    const offBrowserCommand = transport.on('browser.command', (command) => {
+      if (command.threadId !== activeIdRef.current) {
+        void transport
+          .request('browser.result', {
+            commandId: command.commandId,
+            ok: false,
+            error: 'TasteCode no longer shows this chat.',
+          })
+          .catch(() => undefined)
+        return
+      }
+      setWorkspacePanelHasMounted(true)
+      deliverAgentBrowserEvent({ kind: 'command', command })
+    })
+    const offBrowserCancel = transport.on('browser.commandCancelled', ({ commandId }) =>
+      deliverAgentBrowserEvent({ kind: 'cancel', commandId }),
+    )
+    const offSidebarSettings = transport.on('sidebar.settings', acceptSidebarSettings)
+    const offUsageChanged = transport.on('usage.changed', ({ provider, accountId }) => {
+      usageController.changed(provider, accountId)
+    })
+    // Live windows reach the bars as the server folds them in, not only after
+    // the spaced usage.changed signal and a new request.
+    const offUsageLimits = transport.on('usage.limits', ({ source }) => {
+      usageController.applySource(source)
+    })
+    const offSequenceGap = transport.onSequenceGap(() => {
+      threadController.markHistoriesForRecovery()
+      resync.current()
+    })
+    // Held back briefly: a clean reconnect takes ~500ms, and a banner that
+    // appears and vanishes in that time is noise, not information.
+    let announce: number | undefined
+    let missedPushes = false
+    const offState = transport.onState((state) => {
+      window.clearTimeout(announce)
+      if (state === 'reconnecting') {
+        threadController.markHistoriesForRecovery()
+        missedPushes = true
+        announce = window.setTimeout(() => setOffline(true), 1200)
+      } else {
+        setOffline(false)
+        if (state === 'open' && missedPushes) {
+          setCatalogRequest((current) => current + 1)
+          accountRequestRevision.current += 1
+          setAuthStatusRequest((current) => current + 1)
+        }
+        if (
+          state === 'open' &&
+          usageController.snapshot().some((entry) => entry.status === 'error')
+        ) {
+          refreshUsage()
+        }
+        // Pushes sent while the socket was down are in the durable log but
+        // were never delivered, and sequence numbers restart per connection
+        // so the gap detector cannot see it. Without this the thread stays
+        // silently truncated — an answer cut mid-sentence, an approval that
+        // was already resolved still asking — until the user switches
+        // sessions and back.
+        if (
+          state === 'open' &&
+          (missedPushes ||
+            workspaceIdleProbe.current.pendingStarts.size > 0 ||
+            threadController.queues.size > 0 ||
+            workspaceIdleProbe.current.unknownQueues.size > 0)
+        ) {
+          missedPushes = false
+          resync.current()
+        }
+      }
+    })
+    transport.connect()
+    return () => {
+      if (lifecycleFlush !== undefined) cancelAnimationFrame(lifecycleFlush)
+      if (lifecycleFallback !== undefined) window.clearTimeout(lifecycleFallback)
+      if (flushPendingLifecyclePushes.current === flushLifecyclePushes) {
+        flushPendingLifecyclePushes.current = undefined
+      }
+      pendingLifecycles.clear()
+      threadController.suspend()
+      window.clearTimeout(announce)
+      const probe = workspaceIdleProbe.current
+      probe.revision += 1
+      probe.transportRevision += 1
+      threadController.beginRecovery()
+      probe.inFlight = probe.pendingPath = probe.idlePath = probe.blockedPath = undefined
+      offEvents()
+      offQueue()
+      offSettings()
+      offLifecycle()
+      offPreviewCapture()
+      offBrowserCommand()
+      offBrowserCancel()
+      offSidebarSettings()
+      offUsageChanged()
+      offUsageLimits()
+      offSequenceGap()
+      offState()
+      transport.close()
+    }
+  }, [
+    transport,
+    acceptSidebarSettings,
+    settleQueuedSubmissions,
+    invalidateWorkspaceIdleProbe,
+    releaseWorkspaceStart,
+    releaseQueuedStart,
+    releaseDirectStart,
+    clearWorkspaceThread,
+    refreshWorkspaceAfterCompletion,
+    refreshUsage,
+    usageController,
+    pruneThreadStateCache,
+    pruneQueueMetadata,
+    isThreadCacheProtected,
+    refreshProviderThreadHistory,
+    setThreadDesignMode,
+    // The controller, not a column's frame store: a store that changed identity
+    // here would close the transport in this effect's cleanup.
+    threadController,
+  ])
+
+  useEffect(() => {
+    let cancelled = false
+    const sourceRevision = sidebarSettingsSourceRevision.current
+    void transport
+      .request('sidebar.settings', {})
+      .then((settings) => {
+        if (!cancelled && sidebarSettingsSourceRevision.current === sourceRevision) {
+          acceptSidebarSettings(settings)
+        }
+      })
+      .catch(() => undefined)
+    return () => {
+      cancelled = true
+    }
+  }, [transport, acceptSidebarSettings])
+
+  // Build one catalog from every connected source. Model ids are not globally
+  // unique, so each choice keeps the provider/connection that will pay for it.
+  useEffect(() => {
+    let cancelled = false
+    catalogRequestedAt.current = Date.now()
+    let runSources: CatalogSourceControls | undefined
+    const controls: CatalogSourceControls = {
+      relist: (source) => runSources?.relist(source),
+      discover: (source) => runSources?.discover(source),
+    }
+    catalogSources.current = controls
+    // Sources settle one by one, and a large catalog costs a full serialize
+    // per write, so their snapshots are coalesced into one trailing write
+    // that the final catalog write replaces.
+    let pendingCacheWrite: { timer: number; write: () => void } | undefined
+    const takePendingCacheWrite = () => {
+      const pending = pendingCacheWrite
+      if (pending) window.clearTimeout(pending.timer)
+      pendingCacheWrite = undefined
+      return pending?.write
+    }
+    setCatalogError(undefined)
+    const discoveryErrors: Record<string, ComposerError> = {}
+    setCatalogAvailability((current) => (current === 'ready' ? current : 'loading'))
+    void (async () => {
+      const agentsCatalog = transport.request('acp.agents', {}).catch(() => ({ agents: [] }))
+      const harnessesCatalog = transport
+        .request('harnesses.list', {})
+        .catch(() => ({ harnesses: [] }))
+      const providersResult = await transport.request('providers.list', {})
+      const providers = providersResult?.providers ?? []
+      if (cancelled) return
+      setProviderStatuses(providers)
+      setCatalogAvailability('ready')
+      // ACP agents belong to the ACP entry; a build without it lists none.
+      // Setup shows its list once these are in as well, so they are settled
+      // here, before anything below can cut the run short. A run that fails
+      // before this point leaves them as they were for the next run to settle:
+      // an empty stand-in would let a retry show the list without them first.
+      // A run replaced before they answer still settles them while no other
+      // run has, so a replacement that fails does not leave setup waiting.
+      const offeredAgents = agentsCatalog.then((result) => {
+        const agents = providers.some((status) => status.id === 'acp') ? (result?.agents ?? []) : []
+        setAcpAgents((current) => (cancelled && current !== undefined ? current : agents))
+        return agents
+      })
+      // Only the first answer may move an unchosen launch; later refreshes
+      // must not override what the user picked since.
+      const unchosen = providerUnchosenAtLaunch.current
+      providerUnchosenAtLaunch.current = false
+      let launchSource = sourceKey({
+        provider: providerRef.current,
+        agentId: sourceAgentRef.current,
+      })
+      if (!activeIdRef.current && unchosen) {
+        const fallback = providers.find(
+          (status) =>
+            status.installed &&
+            status.capabilities &&
+            !status.problem &&
+            status.auth !== 'unauthenticated' &&
+            rosterAllows(providerRosterRef.current, status.id),
+        )
+        if (fallback) {
+          setProvider(fallback.id)
+          launchSource = sourceKey({ provider: fallback.id })
+        }
+      }
+      // Until the picker or Settings first needs the others, a source the
+      // composer cannot use right now shows its cached rows instead of being
+      // listed, so its CLI (cursor-agent, agy, opencode serve) does not start
+      // with the app.
+      const launchSession = activeIdRef.current
+        ? findSession(projectsRef.current, activeIdRef.current)?.session
+        : undefined
+      const launchSetup = readStoredModelChoice(customModelsRef.current)
+      const launchSources = new Set([
+        launchSource,
+        ...(launchSession
+          ? [
+              sourceKey({
+                provider: launchSession.provider,
+                connectionId: launchSession.connectionId,
+                agentId: launchSession.agent,
+              }),
+            ]
+          : []),
+        ...(launchSetup ? [modelSource(launchSetup)] : []),
+      ])
+      const installedProviders = new Set(
+        providers
+          .filter((entry) => entry.installed)
+          .map((entry) => sourceKey({ provider: entry.id })),
+      )
+      // A provider's own source (a key without an agent or connection part)
+      // that is not installed cannot list anything, and a new chat then falls
+      // back to whatever else is listed, so everything is listed at once.
+      const launchListable = [...launchSources].some(
+        (source) => source.includes(':') || installedProviders.has(source),
+      )
+      // A profile with nothing cached yet lists every source once, so the
+      // picker does not open on providers without rows.
+      const listEverySource = !launchListable || catalogModelsRef.current.length === 0
+      setProviderCatalogSource({ transport, request: catalogRequest })
+      setPendingModelSources(
+        new Set([
+          ...providers
+            .filter((entry) => entry.installed && rosterAllows(providerRosterRef.current, entry.id))
+            .map((entry) => sourceKey({ provider: entry.id })),
+          ...(sourceAgentRef.current
+            ? [sourceKey({ provider: providerRef.current, agentId: sourceAgentRef.current })]
+            : []),
+        ]),
+      )
+      const cached = parseModelCatalogCache(readSetting(MODEL_CATALOG_KEY))
+      const unknownKeys = new Set(unvalidatedModelKeys)
+      const validatedSources = new Map<string, number>()
+      let publishedCatalog = catalogModelsRef.current
+      /** Each source's rows as last settled, in this run. */
+      const settledRows = new Map<string, ModelChoice[]>()
+      /** Every source of this run in catalog order, once all of them have answered. */
+      let catalogOrder: readonly string[] | undefined
+      const settleSource = <T extends { discovered: boolean; models: ModelChoice[] }>(
+        source: string,
+        result: T,
+      ): T => {
+        if (cancelled) return result
+        setPendingModelSources((current) => {
+          const next = new Set(current)
+          next.delete(source)
+          return next
+        })
+        for (const choice of publishedCatalog) {
+          if (modelSource(choice) === source) unknownKeys.delete(choice.key)
+        }
+        if (result.discovered) validatedSources.set(source, Date.now())
+        else if (!isModelCatalogSourceFresh(cached, source)) {
+          for (const choice of result.models) unknownKeys.add(choice.key)
+        }
+        settledRows.set(source, result.models)
+        // A source first listed after the run (one left for the picker with
+        // nothing cached) goes where the run would have put it, not last.
+        publishedCatalog = catalogOrder
+          ? catalogOrder.flatMap((key) => settledRows.get(key) ?? [])
+          : replaceSourceRows(publishedCatalog, source, result.models)
+        setModelCatalog({
+          models: publishedCatalog,
+          loaded: true,
+          unvalidatedModelKeys: new Set(unknownKeys),
+        })
+        setModelErrors({ ...discoveryErrors })
+        // Per source, so a source that fails never holds back the others.
+        if (result.discovered) {
+          updateModelVisibility((record) =>
+            settleModelVisibilitySource(record, source, result.models, Date.now()),
+          )
+        }
+        if (result.discovered && !pendingCacheWrite) {
+          // Reads the catalog and source ages as they are when it runs.
+          const write = () => writeModelCatalogCache(publishedCatalog, validatedSources)
+          const timer = window.setTimeout(() => {
+            pendingCacheWrite = undefined
+            write()
+          }, MODEL_CATALOG_CACHE_WRITE_DELAY_MS)
+          pendingCacheWrite = { timer, write }
+        }
+        return result
+      }
+      // One run per source at a time: a change announced while that source is
+      // still listing lists it once more afterwards.
+      type SourceRun = {
+        discover: () => Promise<unknown>
+        running: boolean
+        again: boolean
+        /** Left for later: shows its cached rows until something needs it. */
+        deferred: boolean
+      }
+      const sourceRuns = new Map<string, SourceRun>()
+      const finishRun = (source: string, run: SourceRun, done: Promise<unknown>) => {
+        void done
+          .catch(() => undefined)
+          .then(() => {
+            run.running = false
+            if (!run.again) return
+            run.again = false
+            runSources?.relist(source)
+          })
+      }
+      const trackSource = (
+        source: string,
+        discover: () => Promise<unknown>,
+      ): Promise<{ source: string }> => {
+        // Read when each source registers: the picker may open while the run
+        // is still waiting for agents or harnesses.
+        if (!listEverySource && !everyModelSourceWanted.current && !launchSources.has(source)) {
+          sourceRuns.set(source, { discover, running: false, again: false, deferred: true })
+          settleSource(source, {
+            discovered: false,
+            models: catalogModelsRef.current.filter(
+              (choice) => !isCustomModelChoice(choice) && modelSource(choice) === source,
+            ),
+          })
+          return Promise.resolve({ source })
+        }
+        const run: SourceRun = { discover, running: true, again: false, deferred: false }
+        sourceRuns.set(source, run)
+        const done = discover()
+        finishRun(source, run, done)
+        return done.then(
+          () => ({ source }),
+          () => ({ source }),
+        )
+      }
+      const startRun = (source: string, run: SourceRun) => {
+        run.running = true
+        delete discoveryErrors[source]
+        finishRun(source, run, run.discover())
+      }
+      const startDeferred = (source: string, run: SourceRun) => {
+        if (!run.deferred) return
+        run.deferred = false
+        setPendingModelSources((current) => new Set([...current, source]))
+        startRun(source, run)
+      }
+      runSources = {
+        relist: (source) => {
+          const run = sourceRuns.get(source)
+          // A source left for later lists its newest models when it is needed.
+          if (cancelled || !run || run.deferred) return
+          if (run.running) {
+            run.again = true
+            return
+          }
+          startRun(source, run)
+        },
+        discover: (source) => {
+          if (cancelled) return
+          if (source === undefined) {
+            for (const [key, run] of sourceRuns) startDeferred(key, run)
+            return
+          }
+          const run = sourceRuns.get(source)
+          if (run) startDeferred(source, run)
+        },
+      }
+      const discoverProvider = async (entry: ProviderStatus) => {
+        const preserveCatalog = () => {
+          const source = sourceKey({ provider: entry.id })
+          const preserved = catalogModelsRef.current.filter(
+            (choice) => !isCustomModelChoice(choice) && modelSource(choice) === source,
+          )
+          return settleSource(source, {
+            provider: entry.id,
+            discovered: false,
+            models: preserved,
+          })
+        }
+        try {
+          const accountId = modelListAccount(providerAccountsRef.current, entry.id)
+          const result = await transport.request('models.list', {
+            provider: entry.id,
+            ...(accountId ? { accountId } : {}),
+          })
+          const models = choicesFor(
+            {
+              provider: entry.id,
+              sourceName: entry.displayName,
+              mark: providerMark(entry.id),
+            },
+            result.models,
+            false,
+          )
+          if (models.length === 0) return preserveCatalog()
+          return settleSource(sourceKey({ provider: entry.id }), {
+            provider: entry.id,
+            discovered: true,
+            models,
+          })
+        } catch (cause) {
+          discoveryErrors[sourceKey({ provider: entry.id })] = {
+            id: `models:${entry.id}:${catalogRequest}`,
+            message: `Could not load ${entry.displayName} models. ${cause instanceof Error ? cause.message : String(cause)}`,
+          }
+          return preserveCatalog()
+        }
+      }
+      const directPromise = Promise.all(
+        providers
+          .filter(
+            (entry) =>
+              entry.installed &&
+              entry.id !== 'acp' &&
+              entry.id !== 'api' &&
+              // Only added providers start for their models.
+              rosterAllows(providerRosterRef.current, entry.id),
+          )
+          .map((entry) =>
+            trackSource(sourceKey({ provider: entry.id }), () => discoverProvider(entry)),
+          ),
+      )
+      const discoverAgent = async (agent: ResultOf<'acp.agents'>['agents'][number]) => {
+        const source = sourceKey({ provider: 'acp', agentId: agent.id })
+        const preserveCatalog = () =>
+          settleSource(source, {
+            source,
+            discovered: false,
+            models: catalogModelsRef.current.filter(
+              (choice) => !isCustomModelChoice(choice) && modelSource(choice) === source,
+            ),
+          })
+        try {
+          const result = await transport.request('models.list', {
+            provider: 'acp',
+            agent: agent.id,
+          })
+          const models = choicesFor(
+            {
+              provider: 'acp',
+              sourceName: agent.name,
+              mark: agentMark(agent.id),
+              agent: { id: agent.id, name: agent.name },
+            },
+            result.models,
+            false,
+          )
+          return models.length
+            ? settleSource(source, { source, discovered: true, models })
+            : preserveCatalog()
+        } catch (cause) {
+          discoveryErrors[source] = {
+            id: 'models:' + source + ':' + catalogRequest,
+            message:
+              'Could not load ' +
+              agent.name +
+              ' models. ' +
+              (cause instanceof Error ? cause.message : String(cause)),
+          }
+          return preserveCatalog()
+        }
+      }
+      const acpPromise = offeredAgents.then(async (agents) => {
+        if (cancelled) return []
+        // Only agents added under Settings › Providers start for their models.
+        const listed = agents.filter(
+          (agent) =>
+            agent.installed && rosterAllows(providerRosterRef.current, agentRosterKey(agent.id)),
+        )
+        setPendingModelSources(
+          (current) =>
+            new Set([
+              ...current,
+              ...listed.map((agent) => sourceKey({ provider: 'acp', agentId: agent.id })),
+            ]),
+        )
+        return Promise.all(
+          listed.map((agent) =>
+            trackSource(sourceKey({ provider: 'acp', agentId: agent.id }), () =>
+              discoverAgent(agent),
+            ),
+          ),
+        )
+      })
+      const harnessesResult = await harnessesCatalog
+      if (cancelled) return
+      // A harness runs through its provider, so it is offered only with it.
+      const harnesses = (harnessesResult?.harnesses ?? []).filter((harness) =>
+        providers.some((status) => status.id === harness.provider),
+      )
+      setPendingModelSources(
+        (current) =>
+          new Set([
+            ...current,
+            ...harnesses.map((harness) =>
+              sourceKey({ provider: harness.provider, agentId: harness.id }),
+            ),
+          ]),
+      )
+      const discoverHarness = async (harness: ResultOf<'harnesses.list'>['harnesses'][number]) => {
+        const source = sourceKey({ provider: harness.provider, agentId: harness.id })
+        const input = {
+          provider: harness.provider,
+          sourceName: harness.displayName,
+          mark: providerMark(harness.provider),
+          agent: { id: harness.id, name: harness.displayName },
+        }
+        try {
+          const result = await transport.request('models.list', {
+            provider: harness.provider,
+            agent: harness.id,
+          })
+          return settleSource(source, {
+            source,
+            discovered: true,
+            models: choicesFor(input, result.models, true),
+          })
+        } catch (cause) {
+          discoveryErrors[source] = {
+            id: `models:${source}:${catalogRequest}`,
+            message: `Could not load ${harness.displayName} models. ${cause instanceof Error ? cause.message : String(cause)}`,
+          }
+          const preserved = catalogModelsRef.current.filter(
+            (choice) => !isCustomModelChoice(choice) && modelSource(choice) === source,
+          )
+          if (preserved.length > 0)
+            return settleSource(source, { source, discovered: false, models: preserved })
+          const fallback = choicesFor(input, [], true)
+          return settleSource(source, { source, discovered: false, models: fallback })
+        }
+      }
+      const customSourcesPromise = Promise.all(
+        harnesses.map((harness) =>
+          trackSource(sourceKey({ provider: harness.provider, agentId: harness.id }), () =>
+            discoverHarness(harness),
+          ),
+        ),
+      )
+      const [direct, acp, customSources] = await Promise.all([
+        directPromise,
+        acpPromise,
+        customSourcesPromise,
+      ])
+      if (cancelled) return
+      setPendingModelSources(new Set())
+      // In source order, with each source's latest rows: one listed again
+      // before this point keeps its newer list.
+      const listedSources = new Set(
+        [...direct, ...acp, ...customSources].map((entry) => entry.source),
+      )
+      catalogOrder = [...listedSources]
+      const catalog = catalogOrder.flatMap((source) => settledRows.get(source) ?? [])
+      publishedCatalog = catalog
+      // The full catalog supersedes whatever snapshot is still pending.
+      takePendingCacheWrite()
+      if (validatedSources.size > 0) writeModelCatalogCache(catalog, validatedSources)
+      setModelCatalog({ models: catalog, loaded: true, unvalidatedModelKeys: unknownKeys })
+      setModelErrors(discoveryErrors)
+      const stored = readSetting(MODEL_KEY)
+      const customPool = customModelsRef.current
+        .filter((entry) => rosterAllows(providerRosterRef.current, entry.provider))
+        .map((entry) =>
+          customModelChoice(
+            entry,
+            providerDisplayName(entry.provider),
+            providerMark(entry.provider),
+          ),
+        )
+      const all = [...catalog, ...customPool]
+      // A hidden model cannot remain the internal selection. Otherwise the
+      // picker shows no such choice while a turn can still silently use it.
+      // Every source has settled its visibility above, so the record is current.
+      const hidden = hiddenModelKeys(
+        all,
+        modelVisibilityDefaults(catalog),
+        modelVisibilityRef.current,
+      )
+      const visible = all.filter((choice) => !hidden.has(choice.key))
+      const currentSession = activeIdRef.current
+        ? findSession(projectsRef.current, activeIdRef.current)?.session
+        : undefined
+      const currentSource = currentSession
+        ? sourceKey({
+            provider: currentSession.provider,
+            connectionId: currentSession.connectionId,
+            agentId: currentSession.agent,
+          })
+        : undefined
+      const storedSetup = readStoredModelChoice(customModelsRef.current)
+      const preferredSource = currentSource ?? (storedSetup ? modelSource(storedSetup) : undefined)
+      const preferredPool = preferredSource
+        ? visible.filter((choice) => modelSource(choice) === preferredSource)
+        : []
+      // Existing sessions never cross sources. New chats prefer their stored
+      // source while it still has a visible choice, but may fall back globally
+      // when that source disappears or is hidden in full.
+      const selectionPool = currentSource
+        ? preferredPool
+        : preferredPool.length > 0
+          ? preferredPool
+          : visible
+      const selections = readSourceSelections()
+      const threadSelection = readThreadModelSelection(activeIdRef.current)
+      const storedSelection =
+        selectionPool.find((choice) => choice.key === threadSelection?.modelKey) ??
+        selectionPool.find((choice) => choice.key === stored) ??
+        selectionPool.find((choice) => choice.model.id === stored)
+      const fallback = selectionPool.find((choice) => choice.model.isDefault) ?? selectionPool[0]
+      const rememberedFallbackKey = fallback
+        ? selections[modelSource(fallback)]?.modelKey
+        : undefined
+      const selected =
+        storedSelection ??
+        selectionPool.find((choice) => choice.key === rememberedFallbackKey) ??
+        fallback
+      if (!selected) {
+        setModelId(undefined)
+        setEffort(undefined)
+        setServiceTier(undefined)
+        return
+      }
+      const previous =
+        modelsRef.current.find((choice) => choice.key === stored) ??
+        modelsRef.current.find((choice) => choice.model.id === stored)
+      const remembered =
+        threadSelection?.modelKey === selected.key
+          ? threadSelection
+          : selections[modelSource(selected)]
+      const remembersSelected = remembered?.modelKey === selected.key
+      setModelId(selected.key)
+      setProvider(selected.provider)
+      setSourceAgent(selected.agent?.id)
+      setSourceAgentName(selected.agent?.name)
+      // Persist the whole selection together, exactly like selectModel does.
+      // Persisting only the model key left provider and agent to come from
+      // stale storage on the next launch — a boot where the model belongs to
+      // one provider and the session goes to another.
+      writeSetting(SETUP_KEY, selected.provider)
+      if (selected.agent) {
+        writeSetting(AGENT_KEY, selected.agent.id)
+        writeSetting(AGENT_NAME_KEY, selected.agent.name)
+      } else {
+        // A stale agent id under a non-ACP provider is the same boot split
+        // this block exists to prevent.
+        removeSetting(AGENT_KEY)
+        removeSetting(AGENT_NAME_KEY)
+      }
+      setEffort((current) => {
+        if (remembersSelected) {
+          return remembered.effort && selected.model.reasoningEfforts.includes(remembered.effort)
+            ? remembered.effort
+            : resolveReasoningEffort({ currentEffort: undefined, nextModel: selected.model })
+        }
+        return resolveReasoningEffort({
+          currentEffort: current,
+          currentModel: previous?.model,
+          nextModel: selected.model,
+        })
+      })
+      setServiceTier((current) => {
+        if (unknownKeys.has(selected.key)) {
+          return remembersSelected ? remembered.serviceTier : current
+        }
+        if (remembersSelected) {
+          return remembered.serviceTier &&
+            selected.model.serviceTiers.some((tier) => tier.id === remembered.serviceTier)
+            ? remembered.serviceTier
+            : getFastModeOffValue(selected.model)
+        }
+        return getNextServiceTierForModel({
+          currentServiceTier: current,
+          currentModel: previous?.model,
+          nextModel: selected.model,
+        })
+      })
+    })().catch((cause) => {
+      if (!cancelled) {
+        setCatalogError({
+          id: `catalog:${catalogRequest}`,
+          message: `Could not load providers. ${cause instanceof Error ? cause.message : String(cause)}`,
+        })
+        setProviderCatalogSource((current) =>
+          current?.transport === transport && current.request === catalogRequest
+            ? current
+            : { transport, request: catalogRequest },
+        )
+        setModelCatalog((current) => ({ ...current, loaded: true }))
+        setCatalogAvailability((current) => (current === 'ready' ? current : 'failed'))
+      }
+    })
+    return () => {
+      cancelled = true
+      if (catalogSources.current === controls) catalogSources.current = undefined
+      // Sources this run validated stay cached for the next run to start from.
+      takePendingCacheWrite()?.()
+    }
+  }, [transport, catalogRequest])
+
+  // The server answers model lists from what it knew and reads them again in
+  // the background; a list that changed is announced so it appears without a
+  // restart.
+  useEffect(
+    () =>
+      transport.on('models.changed', ({ provider, agent, accountId }) => {
+        // An open chat on another account lists that account's models itself.
+        if (
+          agent === undefined &&
+          chatModelAccountRef.current === chatAccountKey(provider, accountId)
+        ) {
+          setChatModelsRevision((revision) => revision + 1)
+        }
+        // So does every other account the picker offers.
+        if (
+          agent === undefined &&
+          otherAccountKeysRef.current.split('\u0001').includes(chatAccountKey(provider, accountId))
+        ) {
+          setOtherAccountModelsRevision((revision) => revision + 1)
+        }
+        // A provider's own list is its active account's; a custom harness keeps its own sign-in.
+        const listed =
+          agent === undefined ? modelListAccount(providerAccountsRef.current, provider) : undefined
+        if (!sameAccount(accountId, listed)) return
+        catalogSources.current?.relist(sourceKey({ provider, agentId: agent }))
+      }),
+    [transport],
+  )
+
+  // A provider whose active account changed lists that account's models, so
+  // a new chat is offered what its plan has.
+  const modelListAccounts = useMemo(
+    () =>
+      [...new Set(providerAccounts.accounts.map((account) => account.provider))]
+        .sort()
+        .map((id) => `${id}=${activeAccountOf(providerAccounts, id)}`)
+        .join(','),
+    [providerAccounts],
+  )
+  const listedModelAccounts = useRef(new Map<string, string>())
+  useEffect(() => {
+    for (const entry of modelListAccounts ? modelListAccounts.split(',') : []) {
+      const [id = '', accountId = DEFAULT_ACCOUNT_ID] = entry.split('=')
+      const before = listedModelAccounts.current.get(id) ?? DEFAULT_ACCOUNT_ID
+      listedModelAccounts.current.set(id, accountId)
+      // A provider's own source key is its id.
+      if (before !== accountId) catalogSources.current?.relist(id)
+    }
+  }, [modelListAccounts])
+
+  // A window left open for hours lists its models again when it comes back,
+  // so a CLI updated outside the app brings its new releases (and retires the
+  // generations they replace) without a restart. An update the app ran
+  // refreshes through the update notice already.
+  useEffect(() => {
+    const revalidate = () => {
+      if (document.visibilityState === 'hidden' || transport.state !== 'open') return
+      const now = Date.now()
+      if (now - catalogRequestedAt.current < MODEL_CATALOG_REVALIDATE_MS) return
+      catalogRequestedAt.current = now
+      setCatalogRequest((request) => request + 1)
+    }
+    window.addEventListener('focus', revalidate)
+    document.addEventListener('visibilitychange', revalidate)
+    return () => {
+      window.removeEventListener('focus', revalidate)
+      document.removeEventListener('visibilitychange', revalidate)
+    }
+  }, [transport])
+
+  useEffect(() => {
+    if (!isDesktop || !canCaptureVoice() || selectedModelChoice?.agent) {
+      setVoiceAvailable(false)
+      setVoiceStatusLoading(false)
+      return
+    }
+    // Until this provider's status answers, its last answer stands in, so the
+    // composer is not held on that read (`codex login status`, 5-9 s on a busy
+    // machine); the answer corrects it.
+    const remembered = rememberedVoice(provider)
+    if (remembered !== undefined) {
+      setVoiceAvailable(remembered)
+      setVoiceStatusLoading(false)
+    }
+    // Wait until the same catalog revision has resolved the provider fallback,
+    // so either startup order produces one status request.
+    if (
+      providerCatalogSource?.transport !== transport ||
+      providerCatalogSource.request !== catalogRequest
+    ) {
+      return
+    }
+    let cancelled = false
+    void transport
+      .request('voice.status', { provider })
+      .then((status) => {
+        writeSetting(`${VOICE_AVAILABLE_KEY}:${provider}`, String(status.available))
+        if (!cancelled) setVoiceAvailable(status.available)
+      })
+      .catch(() => {
+        if (!cancelled) setVoiceAvailable(false)
+      })
+      .finally(() => {
+        if (!cancelled) setVoiceStatusLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [transport, provider, catalogRequest, providerCatalogSource, selectedModelChoice?.agent])
+
+  // Turn start takes a git checkpoint, so refresh the shelf only after project idle.
+  useEffect(() => {
+    if (!activePath) {
+      setWorkspace(undefined)
+      return
+    }
+    let cancelled = false
+    void transport
+      .request('workspace.info', { path: activePath })
+      .catch(() => undefined)
+      .then((info) => {
+        recordCheckout(activePath, info)
+        if (!cancelled) setWorkspace(info)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [transport, activePath, workspaceRefreshRevision, recordCheckout])
+
+  // Listing branches runs git twice, and only a new chat's shelf offers them, so
+  // an open chat never asks. A list stays good for 30 s; opening the menu after
+  // that, or a finished turn, lists them again.
+  const branchShelfPath = activeId ? undefined : activePath
+  // A list loaded for another project must not name this one's branch.
+  const pathBranches = branchesPath === activePath ? branches : NO_BRANCHES
+  useEffect(() => {
+    if (!activePath) {
+      setBranches([])
+      return
+    }
+    if (!branchShelfPath) return
+    const path = branchShelfPath
+    const known = branchLists.current.get(path)
+    if (
+      known &&
+      known.revision === workspaceRefreshRevision &&
+      Date.now() - known.at < BRANCH_LIST_TTL_MS
+    ) {
+      setBranches(known.branches)
+      setBranchesPath(path)
+      return
+    }
+    let cancelled = false
+    void transport
+      .request('workspace.branches', { path })
+      .catch(() => undefined)
+      .then((result) => {
+        if (cancelled) return
+        const checkedOut = checkedOutBranches.current.get(path)
+        const available = result?.branches ?? (checkedOut ? [checkedOut] : [])
+        if (result) {
+          branchLists.current.set(path, {
+            at: Date.now(),
+            revision: workspaceRefreshRevision,
+            branches: available,
+          })
+        }
+        setBranches(available)
+        setBranchesPath(path)
+        const remembered =
+          projectBranches.current.get(path) ?? readSetting(`harness.branch:${path}`)
+        // Without a remembered branch or main, the chat starts on the checkout.
+        const branch =
+          remembered && available.includes(remembered)
+            ? remembered
+            : available.includes('main')
+              ? 'main'
+              : checkedOut
+        if (branch) projectBranches.current.set(path, branch)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [transport, activePath, branchShelfPath, workspaceRefreshRevision, branchMenuOpened])
+
+  // The account the model picker's provider runs on: another account picked
+  // there, else an open chat's own, else the one new chats start on.
+  const composerAccount: AccountId =
+    selectedModelChoice?.accountId ??
+    (activeSession?.provider === provider && !activeSession.agent && !activeSession.connectionId
+      ? ((activeSession.accountId as AccountId | undefined) ?? DEFAULT_ACCOUNT_ID)
+      : activeAccountOf(providerAccounts, provider))
+  // The composer's sign-in check asks a further account itself: the default
+  // account being signed in or out says nothing about the account the next
+  // message runs on. A custom harness keeps its own sign-in.
+  const checkedAccount: AccountId | undefined =
+    composerAccount !== DEFAULT_ACCOUNT_ID && !selectedModelChoice?.agent && !sourceAgent
+      ? composerAccount
+      : undefined
+  const checkedAccountRef = useRef(checkedAccount)
+  checkedAccountRef.current = checkedAccount
+
+  useEffect(() => {
+    let cancelled = false
+    const revision = ++accountRequestRevision.current
+    setAccount(undefined)
+    if (selectedModelChoice?.connectionId || (selectedModelChoice?.agent && provider !== 'acp')) {
+      setAccountCheck({ provider, state: 'ready', account: { signedIn: true } })
+      return () => {
+        cancelled = true
+      }
+    }
+    const accountId = checkedAccount
+    const forAccount = accountId === undefined ? {} : { accountId }
+    // Retrying a check that could not answer keeps Send available until the
+    // new answer arrives; it would otherwise lock the composer for the read.
+    // So does a provider whose last read said signed in. ACP reads are per
+    // agent, and further accounts are per account, so neither is remembered
+    // per provider.
+    const remembers = provider !== 'acp' && accountId === undefined
+    const remembered = remembers && rememberedSignIn(provider)
+    setAccountCheck((current) =>
+      current.provider === provider && current.accountId === accountId && current.state === 'failed'
+        ? current
+        : {
+            provider,
+            ...forAccount,
+            state: 'loading',
+            ...(remembered ? { remembered: true as const } : {}),
+          },
+    )
+    const grace = setTimeout(() => {
+      if (cancelled || revision !== accountRequestRevision.current) return
+      setAccountCheck((current) =>
+        current.provider === provider && current.state === 'loading'
+          ? { ...current, slow: true }
+          : current,
+      )
+    }, ACCOUNT_CHECK_SEND_GRACE_MS)
+    void transport
+      .request('auth.status', {
+        provider,
+        ...(provider === 'acp' && (selectedModelChoice?.agent?.id ?? sourceAgent)
+          ? { agent: selectedModelChoice?.agent?.id ?? sourceAgent }
+          : {}),
+        ...forAccount,
+      })
+      .finally(() => clearTimeout(grace))
+      .then((nextAccount) => {
+        if (remembers) rememberSignIn(provider, nextAccount.signedIn)
+        if (cancelled || revision !== accountRequestRevision.current) return
+        setAccount(nextAccount)
+        setAccountCheck({ provider, ...forAccount, state: 'ready', account: nextAccount })
+      })
+      .catch((cause) => {
+        if (cancelled || revision !== accountRequestRevision.current) return
+        setAccount(undefined)
+        setAccountCheck({
+          provider,
+          ...forAccount,
+          state: 'failed',
+          // Send stays available, so this informs rather than interrupts.
+          error: {
+            id: `account:${provider}:${revision}`,
+            role: 'status',
+            message: `Could not confirm this account, but you can still send. ${cause instanceof Error ? cause.message : String(cause)}`,
+          },
+        })
+      })
+    return () => {
+      cancelled = true
+      clearTimeout(grace)
+    }
+  }, [
+    transport,
+    provider,
+    sourceAgent,
+    selectedModelChoice?.agent,
+    selectedModelChoice?.connectionId,
+    checkedAccount,
+    authStatusRequest,
+  ])
+
+  // Once per window: chats set up before the server kept setups share theirs.
+  const savedSetupsShared = useRef(false)
+  // Chats this window deleted; a list read before the delete must not bring one back.
+  const deletedThreadIds = useRef(new Set<string>())
+  const refreshProjects = useCallback(async () => {
+    if (!startupMilestones.current.projectsRequested) {
+      startupMilestones.current.projectsRequested = true
+      reportStartupMilestone('projects-requested')
+    }
+    const result = await transport.request('projects.list', {})
+    const list = withoutDeletedSessions(result.projects, deletedThreadIds.current).filter(
+      (project) => !removedProjectPaths.current.has(project.path),
+    )
+    if (!savedSetupsShared.current) {
+      savedSetupsShared.current = true
+      void shareSavedSetups(
+        list.flatMap((project) => project.sessions),
+        readThreadModelSelection,
+        (threadId, setup) => transport.request('thread.setSettings', { threadId, ...setup }),
+      )
+    }
+    if (!startupMilestones.current.projectsReceived) {
+      startupMilestones.current.projectsReceived = true
+      reportStartupMilestone('projects-received')
+    }
+    const savedOrder = loadSessionOrder()
+    const projectOrder = loadProjectOrder()
+    const firstProjectPath = applyProjectOrder(list, projectOrder)[0]?.path
+    // A full snapshot received after queued pushes is authoritative. Flush the
+    // older batch first so its state update cannot replay over this snapshot.
+    flushPendingLifecyclePushes.current?.()
+    setProjects((current) => {
+      const reconciled = reconcileProjectList(current, list, projectOrder, savedOrder)
+      if (!startupMilestones.current.projectsReconciled) {
+        startupMilestones.current.projectsReconciled = true
+        reportStartupMilestone('projects-reconciled')
+      }
+      return reconciled
+    })
+    setActivePath((current) => current ?? firstProjectPath)
+    return list
+  }, [transport])
+
+  const refreshCheckpoints = useCallback(
+    async (threadId: string) => {
+      const result = await transport.request('thread.checkpoints', { threadId })
+      if (activeIdRef.current === threadId) setCheckpoints(result.checkpoints)
+    },
+    [transport],
+  )
+
+  useEffect(
+    () =>
+      transport.on('providerHistory.changed', ({ threadIds }) => {
+        for (const id of threadIds) {
+          refreshProviderThreadHistory(id)
+        }
+        void refreshProjects().catch(() => undefined)
+      }),
+    [transport, refreshProviderThreadHistory, refreshProjects],
+  )
+
+  // Another client (a paired phone, a second window) started, renamed or moved
+  // a chat. A burst of changes reloads the list once.
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const off = transport.on('projects.changed', () => {
+      clearTimeout(timer)
+      timer = setTimeout(() => void refreshProjects().catch(() => undefined), 150)
+    })
+    return () => {
+      off()
+      clearTimeout(timer)
+    }
+  }, [transport, refreshProjects])
+
+  const loadHistory = useCallback(
+    async (threadId: string, afterSeq?: number) => {
+      try {
+        const loaded = await threadController.loadHistory(threadId, afterSeq)
+        if (loaded && activeIdRef.current !== threadId && threadController.isVisible(threadId))
+          setProjects((current) => updateSession(current, threadId, markSessionRead))
+        if (loaded && activeIdRef.current === threadId) {
+          setActiveThreadApproval(loaded.approval ?? 'ask')
+          setHistoryFailure((current) => (current?.threadId === threadId ? undefined : current))
+          setProjects((current) => updateSession(current, threadId, markSessionRead))
+        }
+        return loaded?.authority
+      } finally {
+        pruneThreadStateCache()
+      }
+    },
+    [threadController, pruneThreadStateCache],
+  )
+
+  /** Read an opened chat's transcript. An empty failed read is shown in the thread. */
+  const readOpenedHistory = useCallback(
+    async (id: string, afterSeq: number | undefined) => {
+      setHistoryFailure((current) => (current?.threadId === id ? undefined : current))
+      setLoadingThreadId(id)
+      try {
+        await loadHistory(id, afterSeq)
+      } catch (error) {
+        if (activeIdRef.current !== id) return
+        const message = error instanceof Error ? error.message : String(error)
+        // Without its history the mode is unknown; the server's default is Ask.
+        setActiveThreadApproval((current) => current ?? 'ask')
+        if (threadController.snapshot(id)?.items.length) reportError(message)
+        else setHistoryFailure({ threadId: id, message })
+      } finally {
+        setLoadingThreadId((current) => (current === id ? undefined : current))
+      }
+    },
+    [loadHistory, reportError, threadController],
+  )
+
+  resync.current = (retry = true) => {
+    const revision = threadController.beginRecovery()
+    workspaceIdleProbe.current.revision += 1
+    const activeId = activeIdRef.current
+    const path = activePathRef.current
+    const threadIds = new Set(threadController.pendingThreadIds())
+    for (const id of threadController.historyRecoveryIds()) threadIds.add(id)
+    // prettier-ignore
+    const ownerPaths = new Map([...workspaceIdleProbe.current.pendingStarts].filter(([id]) => !id.startsWith('pending:')).map(([id, owner]) => [id, { path: owner.path, tokens: [...owner.tokens] }]))
+    for (const id of ownerPaths.keys()) threadIds.add(id)
+    for (const action of workspaceIdleProbe.current.queueActions.values())
+      threadIds.add(action.threadId)
+    for (const session of projectsRef.current.find((project) => project.path === path)?.sessions ??
+      [])
+      if (
+        !['failed', 'ready', 'idle'].includes(session.status) ||
+        (threadController.queue(session.id)?.items.length ?? 0) > 0 ||
+        workspaceIdleProbe.current.unknownQueues.has(session.id)
+      )
+        threadIds.add(session.id)
+    if (activeId && !activeId.startsWith('pending:')) threadIds.add(activeId)
+    const besideId = splitBesideId(splitRef.current)
+    if (besideId && !besideId.startsWith('pending:')) threadIds.add(besideId)
+    const resyncThread = async (
+      id: string,
+    ): Promise<{ id: string; thread: ThreadState; queue: QueuedTurn[] } | undefined> => {
+      const recovered = await threadController.recoverThread(id, revision, isThreadCacheProtected)
+      if (!recovered) {
+        if (threadController.isCurrentRecovery(revision))
+          workspaceIdleProbe.current.unknownQueues.add(id)
+        return
+      }
+      const { history: loaded, state, previousItems } = recovered
+      const probe = workspaceIdleProbe.current
+      const queuedStarts = [...probe.queuedStarts.entriesForThread(id)]
+      const recoveredIds = indexQueueItemIdsForChecks(state.items, queuedStarts.length)
+      const previousIds = indexQueueItemIdsForChecks(previousItems, queuedStarts.length)
+      for (const [queuedId] of queuedStarts) {
+        const recovered =
+          recoveredIds?.has(queuedId) ?? state.items.some((item) => item.id === queuedId)
+        if (recovered) {
+          probe.claimedStarts.delete(queuedId)
+          continue
+        }
+        const previous =
+          previousIds?.has(queuedId) ?? previousItems.some((item) => item.id === queuedId)
+        if (previous) probe.claimedStarts.add(queuedId)
+      }
+      for (const item of state.items) {
+        const start = probe.submissionStarts.get(item.id)
+        if (start?.threadId === id) probe.queuedStarts.set(item.id, start)
+      }
+      if (id === splitBesideId(splitRef.current)) setBesideQueue(state)
+      if (activeIdRef.current === id) {
+        setQueuedTurns(state.items)
+        setCanSteerQueue(state.canSteer)
+        if (loaded) {
+          setActiveThreadApproval(recovered.approval ?? 'ask')
+          setHistoryFailure((current) => (current?.threadId === id ? undefined : current))
+        }
+      }
+      if (!loaded) {
+        workspaceIdleProbe.current.unknownQueues.add(id)
+        return
+      }
+      workspaceIdleProbe.current.unknownQueues.delete(id)
+      settleQueuedSubmissions(id, state.items, loaded)
+      return { id, thread: loaded, queue: state.items }
+    }
+    void Promise.all([
+      refreshProjects().catch(() => undefined),
+      ...[...threadIds].map((id) => resyncThread(id)),
+    ]).then(([projects, ...threads]) => {
+      if (!threadController.isCurrentRecovery(revision)) return
+      const states = threads.filter((state) => state !== undefined)
+      const probe = workspaceIdleProbe.current
+      const project = projects?.find((candidate) => candidate.path === path)
+      if (!projects) {
+        for (const id of ownerPaths.keys()) probe.unknownQueues.add(id)
+        if (retry) resync.current(false)
+        return
+      }
+      setProjectsStatus('ready')
+      const sessionLocations = indexWorkspaceSessions(projects)
+      for (const id of ownerPaths.keys()) {
+        if (!sessionLocations.has(id)) clearWorkspaceThread(id)
+      }
+      for (const state of states) {
+        const session = sessionLocations.get(state.id)?.session
+        const captured = ownerPaths.get(state.id)
+        const current = probe.pendingStarts.get(state.id)
+        // prettier-ignore
+        const durable = new Set(state.thread.items.filter((item) => item.turnId !== '').map((item) => item.id))
+        for (const [id, start] of probe.submissionStarts.entriesForThread(state.id))
+          if (durable.has(id)) {
+            probe.submissionStarts.delete(id)
+            probe.queuedStarts.delete(id)
+            probe.claimedStarts.delete(id)
+            releaseWorkspaceStart(state.id, start.token)
+          }
+        for (const [id] of probe.queuedStarts.entriesForThread(state.id))
+          if (durable.has(id)) releaseQueuedStart(id)
+        const actions = [...probe.queueActions.entriesForThread(state.id)]
+        const recoveredQueueIds = indexQueueItemIdsForChecks(state.queue, actions.length)
+        for (const [id, action] of actions) {
+          if (action.pending !== 0) continue
+          const recovered = recoveredQueueIds?.has(id) ?? state.queue.some((item) => item.id === id)
+          if (recovered) continue
+          if (action.steers > 0 && state.thread.running && !durable.has(id)) continue
+          probe.queueActions.delete(id)
+          releaseQueuedStart(id)
+        }
+        if (
+          !session ||
+          session.running ||
+          session.status === 'queued' ||
+          state.thread.running ||
+          state.queue.length
+        )
+          continue
+        if (captured && current) {
+          const tokens = new Set(captured.tokens)
+          const protectedTokens = new Set(
+            [...probe.queuedStarts.entriesForThread(state.id)]
+              .filter(
+                ([id]) =>
+                  (probe.claimedStarts.has(id) || probe.queueActions.has(id)) && !durable.has(id),
+              )
+              .map(([, owner]) => owner.token),
+          )
+          const remainingTokens = current.tokens.filter(
+            (token) => !tokens.has(token) || protectedTokens.has(token),
+          )
+          current.tokens = remainingTokens
+          for (const [id, start] of probe.submissionStarts.entriesForThread(state.id))
+            if (tokens.has(start.token) && !remainingTokens.includes(start.token))
+              probe.submissionStarts.delete(id)
+          if (current.tokens.length === 0) probe.pendingStarts.delete(state.id)
+          for (const [queuedId, owner] of probe.queuedStarts.entriesForThread(state.id))
+            if (tokens.has(owner.token) && !protectedTokens.has(owner.token)) {
+              probe.queuedStarts.delete(queuedId)
+              probe.claimedStarts.delete(queuedId)
+            }
+        }
+      }
+      const previousSessionLocations = indexWorkspaceSessions(projectsRef.current)
+      const activeIds = new Set(
+        [...threadIds].filter(
+          (id) =>
+            sessionLocations.get(id)?.path === path &&
+            (ownerPaths.get(id)?.path === path || previousSessionLocations.get(id)?.path === path),
+        ),
+      )
+      const activeStates = states.filter((state) => activeIds.has(state.id))
+      const activity = project
+        ? workspaceProjectActivity(
+            project.sessions,
+            threadController.queues,
+            probe.unknownQueues,
+            probe.queueActions.values(),
+          )
+        : undefined
+      const idle =
+        path &&
+        project &&
+        activity &&
+        activeStates.length === activeIds.size &&
+        !activity.running &&
+        !activity.queued &&
+        !activity.unknown &&
+        !activeStates.some((state) => state.thread.running || state.queue.length > 0)
+      if (!idle) {
+        if (retry && activeStates.length < activeIds.size) resync.current(false)
+        return
+      }
+      refreshWorkspaceAfterCompletion(path)
+    })
+    refreshUsage()
+    const sourceRevision = sidebarSettingsSourceRevision.current
+    void transport
+      .request('sidebar.settings', {})
+      .then((settings) => {
+        if (sidebarSettingsSourceRevision.current === sourceRevision) {
+          acceptSidebarSettings(settings)
+        }
+      })
+      .catch(() => undefined)
+  }
+
+  useEffect(() => {
+    if (!activeId) {
+      setQueuedTurns([])
+      setCanSteerQueue(false)
+      return
+    }
+
+    const cached = threadController.queue(activeId)
+    setQueuedTurns(cached?.items ?? [])
+    setCanSteerQueue(cached?.canSteer ?? false)
+    let cancelled = false
+    const localRevision = threadController.queueRevision(activeId, 'local')
+    const serverRevision = threadController.queueRevision(activeId, 'server')
+    beginQueueRead(activeId)
+    void transport
+      .request('thread.queue', { threadId: activeId })
+      .then((state) => {
+        if (
+          cancelled ||
+          threadController.queueRevision(activeId, 'local') !== localRevision ||
+          threadController.queueRevision(activeId, 'server') !== serverRevision
+        )
+          return
+        threadController.setQueue(activeId, state)
+        settleQueuedSubmissions(activeId, state.items)
+        if (activeIdRef.current !== activeId) return
+        setQueuedTurns(state.items)
+        setCanSteerQueue(state.canSteer)
+      })
+      .catch(() => undefined)
+      .finally(() => finishQueueRead(activeId))
+    return () => {
+      cancelled = true
+    }
+  }, [transport, activeId, settleQueuedSubmissions, beginQueueRead, finishQueueRead])
+
+  // Restore points belong to one chat. A running chat skips the read below,
+  // so the previous chat's list must not survive the switch.
+  useEffect(() => {
+    setCheckpoints([])
+  }, [activeId])
+
+  useEffect(() => {
+    if (!activeId || thread.running) return
+    void refreshCheckpoints(activeId).catch(() => {
+      if (activeIdRef.current === activeId) setCheckpoints([])
+    })
+  }, [activeId, thread.running, refreshCheckpoints])
+
+  // Plan limits belong to the account, so a chat switch neither asks again nor
+  // resets them; the thread token totals the request could carry are unused.
+  // Other installed providers are read when the account popup shows them,
+  // not at launch, where each would start its own vendor process.
+  const otherUsageProviders = useMemo(
+    () =>
+      providerStatuses
+        .filter((status) => status.installed && status.id !== provider)
+        .map((status) => status.id),
+    [provider, providerStatuses],
+  )
+  // Each provider account is a limit source of its own. The account the
+  // composer is on is read for the current provider; its other accounts join
+  // the other providers, read when a view shows them.
+  const limitTargets = useMemo(() => {
+    const targetsOf = (id: ProviderId, first?: AccountId): LimitTarget[] => {
+      const listed = accountsOf(providerAccounts, id)
+      if (listed.length < 2) return [{ provider: id }]
+      const active =
+        first !== undefined && listed.some((account) => account.id === first)
+          ? first
+          : activeAccountOf(providerAccounts, id)
+      // A further account is read once it has named who it is: before its
+      // first sign-in every read fails, and the views would offer a Retry.
+      const others = listed
+        .filter(
+          (account) =>
+            account.id !== active &&
+            (account.id === DEFAULT_ACCOUNT_ID ||
+              account.email !== undefined ||
+              account.plan !== undefined),
+        )
+        .map((account) => account.id)
+      return [active, ...others].map((accountId) =>
+        accountId === DEFAULT_ACCOUNT_ID ? { provider: id } : { provider: id, accountId },
+      )
+    }
+    const [main = { provider }, ...rest] = targetsOf(provider, composerAccount)
+    return {
+      main,
+      onDemand: [...rest, ...otherUsageProviders.flatMap((id) => targetsOf(id))],
+    }
+  }, [provider, composerAccount, otherUsageProviders, providerAccounts])
+
+  useLayoutEffect(() => {
+    usageController.select([limitTargets.main], limitTargets.onDemand)
+  }, [usageController, limitTargets])
+  // Every source is read again every 15 minutes, so the popup opens on recent values.
+  useEffect(() => pollUsageLimits(usageController), [usageController])
+
+  // The account card's one figure is about where the next message runs: the
+  // provider and account the model picker is on. The popup lists every account.
+  const cardUsageState = useMemo(
+    () =>
+      usageState.filter(
+        (state) =>
+          state.provider === limitTargets.main.provider &&
+          sameAccount(state.accountId, limitTargets.main.accountId),
+      ),
+    [usageState, limitTargets],
+  )
+  const accountLabel = useCallback<AccountLabel>(
+    (requestedProvider, accountId) =>
+      accountLabelOf(providerAccounts, requestedProvider, accountId),
+    [providerAccounts],
+  )
+  const modelName = useCallback<ModelName>(
+    (requestedProvider, model) =>
+      catalogModels.find(
+        (choice) => choice.provider === requestedProvider && choice.model.id === model,
+      )?.model.displayName,
+    [catalogModels],
+  )
+  const activeAccount = useCallback(
+    (requestedProvider: ProviderId) => activeAccountOf(providerAccounts, requestedProvider),
+    [providerAccounts],
+  )
+
+  // First load, plus the one-time handover from localStorage. Anything found
+  // there stays recoverable until the server acknowledges that project.
+  useEffect(() => {
+    let cancelled = false
+    void (async () => {
+      removeSetting(LEGACY_SESSION_ORDER_KEY)
+      const legacy = takeLegacyProjects()
+      for (const project of legacy) {
+        if (cancelled) return
+        try {
+          await transport.request('projects.add', project)
+          if (cancelled) return
+          const remaining = takeLegacyProjects().filter(
+            (entry) => entry.path !== project.path || entry.name !== project.name,
+          )
+          if (remaining.length) writeSetting(PROJECTS_KEY, JSON.stringify(remaining))
+          else removeSetting(PROJECTS_KEY)
+        } catch {
+          // Unacknowledged entries must survive transport timeouts and relaunches.
+        }
+      }
+      if (!cancelled) {
+        setProjectsStatus('loading')
+        await refreshProjects()
+          .then(() => {
+            if (!cancelled) setProjectsStatus('ready')
+          })
+          .catch(() => {
+            if (!cancelled) setProjectsStatus('failed')
+          })
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [transport, refreshProjects])
+
+  const retryProjects = useCallback(() => {
+    setProjectsStatus('loading')
+    void refreshProjects()
+      .then(() => setProjectsStatus('ready'))
+      .catch(() => setProjectsStatus('failed'))
+  }, [refreshProjects])
+
+  useEffect(() => {
+    if (projects.length > 0) {
+      saveProjectOrder(projects)
+      saveSessionOrder(projects, draggedSessionOrder)
+    }
+  }, [projects, draggedSessionOrder])
+
+  usePersistedSettingChange(MODEL_KEY, modelId || undefined)
+
+  // Note each newer generation as soon as the catalog lists it, from the
+  // cache or from discovery: an older one shown before that gives way once.
+  useEffect(() => {
+    updateModelVisibility((record) => recordModelSuccessors(record, modelDefaults, Date.now()))
+  }, [modelDefaults, updateModelVisibility])
+
+  useEffect(() => {
+    writeSetting(MODEL_VISIBILITY_KEY, serializeModelVisibility(modelVisibility))
+  }, [modelVisibility])
+
+  // Declared after the write above, so it runs once the record is saved.
+  useEffect(() => {
+    if (readSetting(MODEL_VISIBILITY_KEY) === null) return
+    for (const key of LEGACY_MODEL_VISIBILITY_KEYS) removeSetting(key)
+  }, [])
+
+  usePersistedSettingChange(EFFORT_KEY, effort)
+
+  usePersistedSettingChange(SERVICE_TIER_KEY, serviceTier)
+
+  // Save deliberate edits and the first setup of an existing chat. Catalog
+  // fallbacks must not replace a saved choice while its source is unavailable.
+  useEffect(() => {
+    if (
+      !activeId ||
+      pendingThreadModelSave.current !== activeId ||
+      !selectedModelChoice?.model.id ||
+      selectedModelChoice.key !== modelId
+    )
+      return
+    const selection = {
+      modelKey: selectedModelChoice.key,
+      designMode,
+      ...(selectedEffort ? { effort: selectedEffort } : {}),
+      ...(selectedServiceTier ? { serviceTier: selectedServiceTier } : {}),
+    }
+    // A chat opened here for the first time saves this window's fallback; the
+    // server's setup, read on opening, replaces it. Only a change to a setup
+    // this window already had is one the other clients should follow.
+    const firstSetup = readThreadModelSelection(activeId) === undefined
+    writeThreadModelSelection(activeId, selection)
+    pendingThreadModelSave.current = undefined
+    if (firstSetup) return
+    void transport
+      .request('thread.setSettings', { threadId: activeId, ...sharedSetup(selection) })
+      .catch(() => undefined)
+  }, [
+    activeId,
+    modelId,
+    selectedModelChoice,
+    selectedEffort,
+    selectedServiceTier,
+    designMode,
+    transport,
+  ])
+
+  // Remember the active source's exact setup, so returning to a provider
+  // restores what was last used there instead of a best-guess translation.
+  useEffect(() => {
+    // A visibility change derives its fallback before the persisted model key
+    // catches up. Let commitModelChoice finish that transition before this
+    // source is remembered, or it would remember a half-translated setup.
+    if (
+      !selectedModelChoice ||
+      selectedModelChoice.key !== modelId ||
+      // Provider-default fallbacks are synthetic, just like cache-miss
+      // choices. They may drive a catalogless session without replacing the
+      // exact model remembered for when that source's catalog returns.
+      selectedModelChoice.model.id.length === 0 ||
+      unvalidatedModelKeys.has(selectedModelChoice.key)
+    ) {
+      return
+    }
+    const source = sourceKey({
+      provider: selectedModelChoice.provider,
+      connectionId: selectedModelChoice.connectionId,
+      agentId: selectedModelChoice.agent?.id,
+    })
+    if (selectedEffort) {
+      const efforts = readModelEfforts()
+      const key = modelChoiceKey(source, selectedModelChoice.model.id)
+      if (efforts[key] !== selectedEffort) {
+        efforts[key] = selectedEffort
+        writeSetting(EFFORT_BY_MODEL_KEY, JSON.stringify(efforts))
+      }
+    }
+    const selections = readSourceSelections()
+    const entry: SourceSelection = {
+      modelKey: selectedModelChoice.key,
+      ...(selectedEffort ? { effort: selectedEffort } : {}),
+      ...(selectedServiceTier ? { serviceTier: selectedServiceTier } : {}),
+    }
+    const current = selections[source]
+    if (
+      current?.modelKey === entry.modelKey &&
+      current.effort === entry.effort &&
+      current.serviceTier === entry.serviceTier
+    ) {
+      return
+    }
+    selections[source] = entry
+    writeSetting(MODEL_BY_SOURCE_KEY, JSON.stringify(selections))
+  }, [selectedModelChoice, modelId, selectedEffort, selectedServiceTier, unvalidatedModelKeys])
+
+  usePersistedSettingChange(APPROVAL_KEY, approvalByProvider[provider])
+
+  usePersistedSettingChange(APPROVAL_BY_PROVIDER_KEY, JSON.stringify(approvalByProvider))
+
+  // Shared tail of every model switch: persist the whole selection together,
+  // then restore the effort/tier that source was last used with — or translate
+  // the current setup onto the new model's ladder.
+  const commitModelChoice = useCallback(
+    (selected: ModelChoice, threadSelection?: SourceSelection) => {
+      setModelId(selected.key)
+      setProvider(selected.provider)
+      setSourceAgent(selected.agent?.id)
+      setSourceAgentName(selected.agent?.name)
+      writeSetting(SETUP_KEY, selected.provider)
+      if (selected.agent) {
+        writeSetting(AGENT_KEY, selected.agent.id)
+        writeSetting(AGENT_NAME_KEY, selected.agent.name)
+      } else {
+        // A stale agent id under a non-ACP provider is the same boot split
+        // this block exists to prevent.
+        removeSetting(AGENT_KEY)
+        removeSetting(AGENT_NAME_KEY)
+      }
+      // Picking the model this source was last used with restores the exact
+      // effort and tier that were active then. Any other pick translates the
+      // current effort onto the new model's ladder, as before.
+      const remembered =
+        threadSelection ??
+        readSourceSelections()[
+          sourceKey({
+            provider: selected.provider,
+            connectionId: selected.connectionId,
+            agentId: selected.agent?.id,
+          })
+        ]
+      if (remembered?.modelKey === selected.key) {
+        setEffort(
+          remembered.effort && selected.model.reasoningEfforts.includes(remembered.effort)
+            ? remembered.effort
+            : resolveReasoningEffort({ currentEffort: undefined, nextModel: selected.model }),
+        )
+        setServiceTier(
+          unvalidatedModelKeys.has(selected.key)
+            ? remembered.serviceTier
+            : remembered.serviceTier &&
+                selected.model.serviceTiers.some((tier) => tier.id === remembered.serviceTier)
+              ? remembered.serviceTier
+              : getFastModeOffValue(selected.model),
+        )
+        return
+      }
+      // A model on another provider comes back at the effort it was last
+      // used with. Another model or account of the same provider carries the
+      // current effort over.
+      const leaving = storedModelChoice ?? selectedModelChoice
+      const lastEffort =
+        leaving && providerSource(leaving) !== providerSource(selected)
+          ? readModelEfforts()[modelChoiceKey(providerSource(selected), selected.model.id)]
+          : undefined
+      setEffort((current) =>
+        lastEffort && selected.model.reasoningEfforts.includes(lastEffort)
+          ? lastEffort
+          : resolveReasoningEffort({
+              currentEffort: current,
+              currentModel: storedModelChoice?.model ?? selectedModelChoice?.model,
+              nextModel: selected.model,
+            }),
+      )
+      // Not a bare id check: fast tiers are named differently per provider
+      // (Codex 'priority', Cursor 'fast'), and fast intent must survive the
+      // switch even though the id cannot.
+      setServiceTier((current) =>
+        unvalidatedModelKeys.has(selected.key)
+          ? current
+          : getNextServiceTierForModel({
+              nextModel: selected.model,
+              currentModel: storedModelChoice?.model ?? selectedModelChoice?.model,
+              currentServiceTier: current,
+            }),
+      )
+    },
+    [selectedModelChoice, storedModelChoice, unvalidatedModelKeys],
+  )
+  const commitModelChoiceRef = useRef(commitModelChoice)
+  commitModelChoiceRef.current = commitModelChoice
+
+  // A chat's setup as the server keeps it: chosen on another client, or read
+  // on opening the chat. Mirrored here, and applied at once to the open chat.
+  const adoptThreadSettingsRef = useRef((_threadId: string, _settings: ThreadSettings) => {})
+  adoptThreadSettingsRef.current = (threadId, settings) => {
+    const open = threadId === activeIdRef.current
+    if (settings.approval) {
+      threadApprovals.current.set(threadId, settings.approval)
+      if (open) setActiveThreadApproval(settings.approval)
+    }
+    const session = findSession(projectsRef.current, threadId)?.session
+    if (open && settings.model !== undefined && session && modelsLoaded && selectedModelChoice) {
+      const source = sourceKey({
+        provider: session.provider,
+        connectionId: session.connectionId,
+        agentId: session.agent,
+      })
+      if (hiddenModels.has(modelChoiceKey(source, settings.model))) {
+        // This picker hides that model and never runs a chat on one it hides,
+        // so the chat stays on the model shown here, for every client.
+        void transport
+          .request('thread.setSettings', {
+            threadId,
+            ...sharedSetup({
+              modelKey: selectedModelChoice.key,
+              ...(selectedEffort ? { effort: selectedEffort } : {}),
+              ...(selectedServiceTier ? { serviceTier: selectedServiceTier } : {}),
+            }),
+          })
+          .catch(() => undefined)
+        return
+      }
+    }
+    const next = adoptedSelection(
+      settings,
+      readThreadModelSelection(threadId),
+      session,
+      visibleModelsRef.current,
+    )
+    if (!next) return
+    writeThreadModelSelection(threadId, next)
+    const choice = open
+      ? visibleModelsRef.current.find((candidate) => candidate.key === next.modelKey)
+      : undefined
+    if (choice) commitModelChoiceRef.current(choice, next)
+  }
+  const readSharedSettings = useCallback(
+    (threadId: string, local: ReturnType<typeof readThreadModelSelection>) => {
+      void transport
+        .request('thread.settings', { threadId })
+        .then((settings) => {
+          // A chat set up before the server kept setups shares this window's choice.
+          if (settings.model === undefined && local) {
+            return transport.request('thread.setSettings', { threadId, ...sharedSetup(local) })
+          }
+          adoptThreadSettingsRef.current(threadId, settings)
+          return undefined
+        })
+        .catch(() => undefined)
+    },
+    [transport],
+  )
+
+  useEffect(() => writeProviderDefaults(providerDefaults), [providerDefaults])
+
+  /**
+   * A pinned model replaces whatever the last chat on its provider used. A
+   * pin the picker no longer offers is skipped, so the chat keeps the last
+   * model instead of starting on one the user hid or the provider dropped.
+   */
+  const applyProviderDefault = useCallback(
+    (target: ProviderId, pin: ProviderDefault | undefined) => {
+      const choice = pinnedModelChoice(visibleModelsRef.current, target, pin)
+      if (!choice) return
+      const remembered = readSourceSelections()[sourceKey({ provider: target })]
+      const serviceTier = remembered?.modelKey === choice.key ? remembered.serviceTier : undefined
+      commitModelChoiceRef.current(choice, {
+        modelKey: choice.key,
+        ...(pin?.effort ? { effort: pin.effort } : {}),
+        ...(serviceTier ? { serviceTier } : {}),
+      })
+    },
+    [],
+  )
+
+  const changeProviderDefault = useCallback(
+    (target: DefaultsScope, pin: ProviderDefault | undefined) => {
+      const next = { ...providerDefaultsRef.current }
+      if (pin) next[target] = pin
+      else delete next[target]
+      providerDefaultsRef.current = next
+      setProviderDefaults(next)
+      // A new chat that has not started yet is exactly what the pin
+      // describes, so it should not wait for the next one to show it.
+      const current = providerRef.current
+      if (!activeIdRef.current && !sourceAgentRef.current && target.split('@')[0] === current) {
+        applyProviderDefault(current, scopedDefault(next, current, newChatAccountRef.current))
+      }
+    },
+    [applyProviderDefault],
+  )
+
+  // Switching the account a new chat starts on brings that account's pin.
+  const newChatScope = defaultsScope(provider, newChatAccount)
+  const appliedScope = useRef(newChatScope)
+  useEffect(() => {
+    if (appliedScope.current === newChatScope) return
+    appliedScope.current = newChatScope
+    if (activeIdRef.current || sourceAgentRef.current) return
+    applyProviderDefault(
+      providerRef.current,
+      scopedDefault(providerDefaultsRef.current, providerRef.current, newChatAccountRef.current),
+    )
+  }, [newChatScope, applyProviderDefault])
+
+  const changeApprovalDefault = useCallback((target: DefaultsScope, mode: ApprovalMode) => {
+    setApprovalByProvider((current) =>
+      current[target] === mode ? current : { ...current, [target]: mode },
+    )
+  }, [])
+
+  const providerDefaultsControls = useMemo(
+    () => ({
+      pins: providerDefaults,
+      onPinChange: changeProviderDefault,
+      access: approvalByProvider,
+      onAccessChange: changeApprovalDefault,
+    }),
+    [providerDefaults, changeProviderDefault, approvalByProvider, changeApprovalDefault],
+  )
+
+  // Keep persisted selection state coherent after a visibility or cache
+  // transition. Requests already use the effective values above, so even an
+  // interaction before this effect runs cannot observe the stale setup.
+  useEffect(() => {
+    // The provider-default placeholder must not replace a stored model that
+    // its source is still about to list.
+    if (modelChoicePending) return
+    if (!selectedModelChoice) {
+      setModelId(undefined)
+      setEffort(undefined)
+      setServiceTier(undefined)
+      return
+    }
+    if (
+      modelId !== selectedModelChoice.key ||
+      provider !== selectedModelChoice.provider ||
+      sourceAgent !== selectedModelChoice.agent?.id ||
+      sourceAgentName !== selectedModelChoice.agent?.name
+    ) {
+      commitModelChoice(selectedModelChoice)
+      return
+    }
+    if (effort !== selectedEffort) setEffort(selectedEffort)
+    if (serviceTier !== selectedServiceTier) setServiceTier(selectedServiceTier)
+  }, [
+    selectedModelChoice,
+    modelId,
+    provider,
+    sourceAgent,
+    sourceAgentName,
+    effort,
+    serviceTier,
+    selectedEffort,
+    selectedServiceTier,
+    commitModelChoice,
+    modelChoicePending,
+  ])
+
+  const selectModel = useCallback(
+    (id: string) => {
+      const selected =
+        models.find((model) => model.key === id) ??
+        otherAccountChoices.find((choice) => choice.key === id)
+      if (!selected) return
+      pendingThreadModelSave.current = activeIdRef.current
+      if (selected.accountId !== undefined && !activeIdRef.current) {
+        // A new chat starts on its provider's active account, so another
+        // account's model makes that account the active one.
+        const own = modelChoiceKey(selected.provider, selected.model.id)
+        void providerAccountsStore
+          .setActive(selected.provider, selected.accountId)
+          .catch((error: unknown) =>
+            setActionError({
+              id: crypto.randomUUID(),
+              message: error instanceof Error ? error.message : String(error),
+            }),
+          )
+        commitModelChoice(
+          models.find((model) => model.key === own) ?? {
+            ...selected,
+            accountId: undefined,
+            key: own,
+          },
+        )
+        return
+      }
+      commitModelChoice(selected)
+    },
+    [models, otherAccountChoices, commitModelChoice, providerAccountsStore],
+  )
+
+  const changeEffort = useCallback((value: string | undefined) => {
+    pendingThreadModelSave.current = activeIdRef.current
+    setEffort(value)
+  }, [])
+  const changeServiceTier = useCallback((value: string | undefined) => {
+    pendingThreadModelSave.current = activeIdRef.current
+    setServiceTier(value)
+  }, [])
+
+  const addProjects = useCallback(
+    async (paths: readonly string[]) => {
+      const uniquePaths = [...new Set(paths)]
+      if (uniquePaths.length === 0) return
+      // Every request is already in flight, so one failed folder must not skip
+      // the cleanup and refresh that the folders which were added still need.
+      const results = await Promise.allSettled(
+        uniquePaths.map((path) => transport.request('projects.add', { path })),
+      )
+      const added = uniquePaths.filter((_, index) => results[index]?.status === 'fulfilled')
+      const failed = uniquePaths.filter((_, index) => results[index]?.status === 'rejected')
+      const failure = results.find((result) => result.status === 'rejected')
+      const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error))
+      for (const path of added) removedProjectPaths.current.delete(path)
+      let refreshed = true
+      try {
+        await refreshProjects()
+      } catch (error) {
+        refreshed = false
+        if (!failure) reportError(errorText(error))
+      }
+      if (failure) {
+        const message = errorText(failure.reason)
+        // A dropped batch has to say which folders did not make it.
+        reportError(
+          uniquePaths.length === 1 ? message : `Could not add ${failed.join(', ')}. ${message}`,
+        )
+      }
+      const activePath = added.at(-1)
+      if (!refreshed || !activePath) return
+      setActivePath(activePath)
+      activeIdRef.current = undefined
+      setActiveId(undefined)
+      setThread(emptyThread)
+    },
+    [transport, refreshProjects, reportError],
+  )
+
+  const addProject = useCallback(async () => {
+    // Every caller fires this with `void`, so a failing picker must be
+    // reported here rather than escape as an unhandled rejection.
+    let path: string | undefined
+    try {
+      path = await pickFolder()
+    } catch (error) {
+      reportError(error instanceof Error ? error.message : String(error))
+      return
+    }
+    if (path) await addProjects([path])
+  }, [addProjects, reportError])
+
+  const generateSessionTitle = useCallback(
+    async (threadId: string, prompt: string, expectedTitle: string) => {
+      try {
+        const generated = await transport.request('backgroundModel.generateTitle', {
+          threadId,
+          prompt,
+          expectedTitle,
+        })
+        if (!generated.applied) return
+        setProjects((current) => renameSession(current, threadId, generated.title))
+      } catch {
+        // The immediate prompt-derived title remains useful when a background
+        // provider is unavailable or the short generation fails.
+      }
+    },
+    [transport],
+  )
+
+  const createSession = useCallback(
+    async (
+      projectPath: string,
+      provisionalId: string,
+      title: string,
+      titlePrompt: string,
+    ): Promise<string | undefined> => {
+      const choice = selectedModelChoice
+      if (!choice) return undefined
+      const projectRevision = projectStartRevisions.current.get(projectPath) ?? 0
+      const projectRemoved = () =>
+        removedProjectPaths.current.has(projectPath) ||
+        (projectStartRevisions.current.get(projectPath) ?? 0) !== projectRevision
+      setNotice(undefined)
+      setActionError(undefined)
+      setUndoRestore(undefined)
+      setRollbackOpen(false)
+      setActivePath(projectPath)
+      try {
+        // The shelf names the branch a new chat starts on. Only one other than
+        // the checked-out branch needs the server to check and switch; asking
+        // every time ran git before the agent started, and waiting here for a
+        // branch list held the chat for seconds on a busy machine.
+        // A folder that is not a Git repository has nothing to isolate from: it starts Local.
+        const isolate = isolateSession && !unbranchedProjects.current.has(projectPath)
+        const shown = newChatBranch(projectPath, isolate)
+        const branch =
+          shown !== undefined && shown !== checkedOutBranches.current.get(projectPath)
+            ? shown
+            : undefined
+        if (projectRemoved())
+          throw new Error('The project was removed before the chat could start.')
+        let sessionApproval = approval === 'auto-review' && !autoReviewSupported ? 'full' : approval
+        // A chat that names no account starts on the server's recommended one,
+        // else its active one. The account this app shows for new chats is
+        // named, so the user's pick, or the recommendation shown, is what runs.
+        const namedAccount =
+          choice.agent || choice.connectionId
+            ? undefined
+            : namedNewChatAccount(providerAccountsRef.current, choice.provider)
+        const { threadId } = await transport.request('thread.start', {
+          provider: choice.provider,
+          ...(namedAccount ? { accountId: namedAccount } : {}),
+          workspacePath: projectPath,
+          ...(branch ? { baseRef: branch } : {}),
+          approval: sessionApproval,
+          ...(choice.agent ? { agent: choice.agent.id } : {}),
+          ...(choice.connectionId
+            ? {
+                connectionId: choice.connectionId,
+              }
+            : {}),
+          ...(choice.model.id ? { model: choice.model.id } : {}),
+          ...(selectedServiceTier
+            ? {
+                serviceTier: selectedServiceTier,
+              }
+            : {}),
+          ...(selectedEffort ? { effort: selectedEffort } : {}),
+          ...(isolate ? { isolate: true } : {}),
+        })
+        let pendingApproval = pendingThreadApprovals.current.get(provisionalId)
+        while (pendingApproval && pendingApproval !== sessionApproval && !projectRemoved()) {
+          try {
+            await transport.request('thread.setApproval', { threadId, approval: pendingApproval })
+            sessionApproval = pendingApproval
+          } catch (error) {
+            reportError(error instanceof Error ? error.message : String(error))
+            break
+          }
+          pendingApproval = pendingThreadApprovals.current.get(provisionalId)
+        }
+        if (projectRemoved()) {
+          await transport.request('thread.close', { threadId }).catch(() => undefined)
+          throw new Error('The project was removed before the chat could start.')
+        }
+        pendingThreadApprovals.current.delete(provisionalId)
+        const savedSelection = readThreadModelSelection(provisionalId)
+        if (savedSelection) writeThreadModelSelection(threadId, savedSelection)
+        removeSetting(`${MODEL_BY_THREAD_PREFIX}${provisionalId}`)
+        if (pendingThreadModelSave.current === provisionalId)
+          pendingThreadModelSave.current = threadId
+        const provisional = threadController.snapshot(provisionalId) ?? emptyThread
+        threadController.discardSnapshot(provisionalId)
+        threadController.update(threadId, provisional)
+        threadController.setCursor(threadId, 0)
+        const pendingStart = workspaceIdleProbe.current.pendingStarts.get(provisionalId)
+        // prettier-ignore
+        if (pendingStart) { workspaceIdleProbe.current.pendingStarts.delete(provisionalId); workspaceIdleProbe.current.pendingStarts.set(threadId, pendingStart) }
+        const pending =
+          pendingSession.current?.id === provisionalId ? pendingSession.current : undefined
+        if (pending) pending.threadId = threadId
+        const canonicalTitle = pending?.title ?? title
+        setProjects((current) =>
+          current.map((project) =>
+            project.path !== projectPath
+              ? project
+              : {
+                  ...project,
+                  // A refresh during the start may already list the real row;
+                  // the local one carries the user's title and wins.
+                  sessions: project.sessions.some((session) => session.id === provisionalId)
+                    ? project.sessions.flatMap((session) =>
+                        session.id === provisionalId
+                          ? [{ ...session, id: threadId }]
+                          : session.id === threadId
+                            ? []
+                            : [session],
+                      )
+                    : project.sessions.some((session) => session.id === threadId)
+                      ? project.sessions
+                      : [
+                          {
+                            id: threadId,
+                            title: canonicalTitle,
+                            provider: choice.provider,
+                            ...(namedAccount && namedAccount !== DEFAULT_ACCOUNT_ID
+                              ? { accountId: namedAccount }
+                              : {}),
+                            ...(choice.connectionId ? { connectionId: choice.connectionId } : {}),
+                            ...(choice.agent
+                              ? {
+                                  agent: choice.agent.id,
+                                }
+                              : {}),
+                            createdAt: Date.now(),
+                            statusSince: Date.now(),
+                            status: 'starting',
+                            lifecycle: { state: 'active', keepActive: false },
+                            unread: false,
+                          },
+                          ...project.sessions,
+                        ],
+                },
+          ),
+        )
+        threadController.moveDraft(provisionalId, threadId)
+        if (activeIdRef.current === provisionalId) {
+          if (threadController.draftOwner === provisionalId) threadController.draftOwner = threadId
+          if (composerDraftKeyRef.current === provisionalId) composerDraftKeyRef.current = threadId
+          activeIdRef.current = threadId
+          setActiveId(threadId)
+          setActiveThreadApproval(sessionApproval)
+          setThread(provisional)
+        } else if (splitBesideId(splitRef.current) === provisionalId) {
+          // The chat lost focus to the other split pane before its id arrived.
+          threadController.show(otherSlot(focusedSlotRef.current), threadId)
+          setSplit({ ...splitRef.current!, beside: { kind: 'chat', id: threadId } })
+        }
+        // A pin made while the chat was starting has only been shown locally.
+        // Send it ahead of the rename so the refresh below already includes it.
+        if (pending?.pinned !== undefined) {
+          void transport
+            .request('thread.pin', { threadId, pinned: pending.pinned })
+            .catch((error) => reportError(error instanceof Error ? error.message : String(error)))
+        }
+        // A title the user typed while the chat was starting is final; only a
+        // prompt-derived one is worth replacing with a generated title.
+        void transport
+          .request('thread.rename', { threadId, title: canonicalTitle })
+          .then(() =>
+            canonicalTitle === title
+              ? generateSessionTitle(threadId, titlePrompt, canonicalTitle)
+              : undefined,
+          )
+          .catch(() => undefined)
+          .then(() => refreshProjects())
+          .catch(() => undefined)
+        return threadId
+      } catch (error) {
+        pendingThreadApprovals.current.delete(provisionalId)
+        const path = releaseWorkspaceStart(provisionalId)
+        removeSetting(`${MODEL_BY_THREAD_PREFIX}${provisionalId}`)
+        if (path) refreshWorkspaceAfterCompletion(path)
+        threadController.discardSnapshot(provisionalId)
+        const laterDraft = threadController.draft(provisionalId)
+        threadController.forgetDraft(provisionalId)
+        if (!isEmptyComposerDraft(laterDraft)) {
+          newChatDraftProject.current = projectPath
+          const recovered = threadController.recoverDraft(NEW_CHAT_DRAFT_KEY, laterDraft)
+          threadController.editDraft(NEW_CHAT_DRAFT_KEY, {
+            resources: [...recovered.resources, ...laterDraft.resources],
+          })
+        }
+        setProjects((current) =>
+          current.map((project) => ({
+            ...project,
+            sessions: project.sessions.filter((session) => session.id !== provisionalId),
+          })),
+        )
+        if (activeIdRef.current === provisionalId) {
+          activeIdRef.current = undefined
+          setActiveId(undefined)
+          setThread(emptyThread)
+        }
+        reportError(error instanceof Error ? error.message : String(error))
+        return undefined
+      }
+    },
+    [
+      transport,
+      selectedModelChoice,
+      selectedServiceTier,
+      selectedEffort,
+      approval,
+      autoReviewSupported,
+      isolateSession,
+      newChatBranch,
+      refreshProjects,
+      generateSessionTitle,
+      releaseWorkspaceStart,
+      refreshWorkspaceAfterCompletion,
+    ],
+  )
+
+  const beginSession = useCallback(
+    (projectPath: string, draft?: string) => {
+      setSurface('chat')
+      if (draft !== undefined) {
+        const next = threadController.editDraft(NEW_CHAT_DRAFT_KEY, {
+          text: draft,
+          attachments: [],
+          resources: [],
+        })
+        threadController.draftOwner = NEW_CHAT_DRAFT_KEY
+        composerDraftKeyRef.current = NEW_CHAT_DRAFT_KEY
+        injectedDraftTransition.current = activeIdRef.current !== undefined
+        publishComposerDraft(next)
+        newChatDraftProject.current = projectPath
+      } else enterNewChatDraft(projectPath)
+      // Design is a choice for one chat; the next new chat starts without it.
+      setThreadDesignMode(undefined, false)
+      setNotice(undefined)
+      setActionError(undefined)
+      setActivePath(projectPath)
+      activeIdRef.current = undefined
+      setActiveId(undefined)
+      setThread(emptyThread)
+      // A custom harness is a source of its own; the provider's pin is not its to follow.
+      if (!sourceAgentRef.current) {
+        applyProviderDefault(
+          providerRef.current,
+          scopedDefault(
+            providerDefaultsRef.current,
+            providerRef.current,
+            newChatAccountRef.current,
+          ),
+        )
+      }
+      setComposerFocusRequest((request) => request + 1)
+    },
+    [publishComposerDraft, applyProviderDefault, setThreadDesignMode, enterNewChatDraft],
+  )
+
+  const updateQueue = useCallback(
+    (threadId: string, update: (items: QueuedTurn[]) => QueuedTurn[]) => {
+      const current = threadController.queue(threadId) ?? { items: [], canSteer: false }
+      const next = { ...current, items: update(current.items) }
+      threadController.setQueue(threadId, next, 'local')
+      if (activeIdRef.current === threadId) setQueuedTurns(next.items)
+      else if (threadId === splitBesideId(splitRef.current)) setBesideQueue(next)
+    },
+    [],
+  )
+
+  const requestInterrupt = useCallback(
+    (threadId: string) => {
+      stoppedTurnStarts.current.add(threadId)
+      setStoppingThreadId(threadId)
+      setStoppingRows((rows) => withStoppingRow(rows, threadId, Date.now()))
+      // A row still starting may have no turn yet for the Stop to end, so no
+      // event will settle it: the server answers at once and drops the prompt
+      // only when the chat's resume has wound down.
+      setProjects((current) =>
+        updateSession(current, threadId, (session) =>
+          session.status === 'starting'
+            ? { ...session, status: 'idle', statusSince: Date.now() }
+            : session,
+        ),
+      )
+      void transport
+        .request('thread.interrupt', { threadId })
+        .catch((error) => {
+          setStoppingThreadId((current) => (current === threadId ? undefined : current))
+          reportError(error instanceof Error ? error.message : String(error))
+        })
+        // A Stop that reached a running turn has ended it by the time the server answers.
+        // A turn that still runs after the answer, as when the Stop failed, spins again.
+        .finally(() => setStoppingRows((rows) => withoutStoppingRow(rows, threadId)))
+    },
+    [transport],
+  )
+
+  const send = useCallback(
+    async (text: string, attachments: string[] = [], submission: 'queue' | 'steer' = 'queue') => {
+      // A title reads the comment, not the page context sent along with it.
+      const titlePrompt =
+        browserCommentsAsPlainText(text.trim()) || attachments.map(basename).join(', ')
+      // The composer clears itself the moment it hands the text over. Every
+      // early bail below must put the words back — a toast is no substitute
+      // for the paragraph someone just typed. A chat that is still starting
+      // keeps its own draft: startup moves it to the real chat, or to New chat
+      // if it fails. Only a send that waited on that failed startup goes there.
+      const restoreDraft = () =>
+        restoreRejectedDraft(composerDraftKey(activeId), { text, attachments })
+      const restoreDraftAfterFailedStart = () => {
+        if (activePath) newChatDraftProject.current = activePath
+        restoreRejectedDraft(NEW_CHAT_DRAFT_KEY, { text, attachments })
+      }
+      if (activeId) pendingDeletionChecks.current.delete(activeId)
+      if (askFirstBlockRef.current) {
+        restoreDraft()
+        return
+      }
+      if (activeId && !cancelArchive(activeId)) {
+        restoreDraft()
+        reportError('This chat is being deleted.')
+        return
+      }
+      // Clear only the submitted draft, before startup can yield to later edits.
+      threadController.forgetDraft(composerDraftKey(activeId))
+      const sideChatCommand = parseSideChatCommand(text)
+      if (sideChatCommand) {
+        if (!activeId || activeId.startsWith('pending:')) {
+          restoreDraft()
+          reportError('Start the main chat before opening a side chat.')
+          return
+        }
+        const parent = threadController.snapshot(activeId)
+        if (!parent?.items.some((item) => item.type === 'message' && item.role === 'user')) {
+          restoreDraft()
+          reportError('Send a message in the main chat before opening a side chat.')
+          return
+        }
+        setNotice(undefined)
+        setActionError(undefined)
+        setWorkspacePanelHasMounted(true)
+        setWorkspacePanelOpen(true)
+        setSideChatPromptRequest((current) => ({
+          parentThreadId: activeId,
+          text: sideChatCommand.prompt,
+          attachments,
+          request: (current?.request ?? 0) + 1,
+        }))
+        return
+      }
+      if (sendAvailability !== 'ready') {
+        restoreDraft()
+        return
+      }
+      // A model of another provider moves the chat there before this message.
+      const moving = activeId && !activeId.startsWith('pending:') ? moveChoice : undefined
+      if (moving && activeId && threadController.snapshot(activeId)?.running) {
+        restoreDraft()
+        reportError(
+          `Wait for the current turn to finish, or stop it, before this chat switches to ${moving.sourceName}.`,
+        )
+        return
+      }
+      // Design briefing questions are TasteCode-owned and answered by the server,
+      // so they work for every provider that can complete a text turn — no
+      // structured-input capability gate here (that gates provider-originated
+      // input only).
+      const briefing = designMode
+      const turnAttachments = briefing ? addDesignBriefing(attachments) : attachments
+      let workspaceStartId = activeId
+      let workspaceStartToken: number | undefined
+      if (activePath && workspaceStartId) {
+        workspaceStartToken = holdWorkspaceStart(workspaceStartId, activePath)
+      }
+      const releasePendingStart = () => {
+        workspaceIdleProbe.current.submissionStarts.delete(optimisticItemId)
+        if (workspaceStartId) {
+          const path = releaseWorkspaceStart(workspaceStartId, workspaceStartToken)
+          if (path) refreshWorkspaceAfterCompletion(path)
+        }
+      }
+      // Typing first and having the session appear is the natural order. Making
+      // the user press "new session" before they are allowed to type is the
+      // app's bookkeeping leaking into their way of working.
+      let threadId = activeId
+      let optimisticAdded = false
+      let optimisticTurnId: string | undefined
+      let rowBeforeStart: Pick<Session, 'status' | 'statusSince'> | undefined
+      const optimisticItemId = createOptimisticMessageId()
+      const optimisticCreatedAt = Date.now()
+      let titledOnCreate = false
+      let interruptRequested = false
+      if (!threadId) {
+        if (!activePath) {
+          restoreDraft()
+          return
+        }
+        const provisionalId = `pending:${crypto.randomUUID()}`
+        const provisional = beginOptimisticTurn(
+          emptyThread,
+          text,
+          optimisticItemId,
+          optimisticCreatedAt,
+          attachments,
+        )
+        const choice = selectedModelChoice
+        if (!choice) {
+          restoreDraft()
+          return
+        }
+        writeThreadModelSelection(provisionalId, {
+          modelKey: choice.key,
+          designMode,
+          ...(selectedEffort ? { effort: selectedEffort } : {}),
+          ...(selectedServiceTier ? { serviceTier: selectedServiceTier } : {}),
+        })
+        // The chat keeps Design; the next new chat starts without it.
+        setThreadDesignMode(undefined, false)
+        workspaceStartId = provisionalId
+        workspaceStartToken = holdWorkspaceStart(provisionalId, activePath)
+        optimisticTurnId = provisional.activeTurn?.id
+        threadController.update(provisionalId, provisional)
+        setProjects((current) =>
+          current.map((project) =>
+            project.path === activePath
+              ? {
+                  ...project,
+                  sessions: [
+                    {
+                      id: provisionalId,
+                      title: titleFrom(titlePrompt),
+                      provider: choice.provider,
+                      ...(choice.connectionId ? { connectionId: choice.connectionId } : {}),
+                      ...(choice.agent
+                        ? {
+                            agent: choice.agent.id,
+                          }
+                        : {}),
+                      createdAt: Date.now(),
+                      statusSince: Date.now(),
+                      status: 'starting',
+                      lifecycle: { state: 'active', keepActive: false },
+                      unread: false,
+                    },
+                    ...project.sessions,
+                  ],
+                }
+              : project,
+          ),
+        )
+        activeIdRef.current = provisionalId
+        setActiveThreadApproval(
+          approval === 'auto-review' && !autoReviewSupported ? 'full' : approval,
+        )
+        setActiveId(provisionalId)
+        setThread(provisional)
+        setThreadRevealRequest((request) => request + 1)
+        const promise = createSession(
+          activePath,
+          provisionalId,
+          titleFrom(titlePrompt),
+          titlePrompt,
+        )
+        pendingSession.current = { id: provisionalId, promise, title: titleFrom(titlePrompt) }
+        threadId = await promise
+        interruptRequested = pendingInterruptThreadIds.current.delete(provisionalId)
+        // The row has its real id now, or is gone. A Stop goes on below under that id.
+        setStoppingRows((rows) => withoutStoppingRow(rows, provisionalId))
+        if (pendingSession.current?.id === provisionalId) pendingSession.current = undefined
+        if (!threadId) {
+          setStoppingThreadId((current) => (current === provisionalId ? undefined : current))
+          const current = threadController.snapshot(provisionalId)
+          if (current !== undefined && current.activeTurn?.id === optimisticTurnId) {
+            const next: ThreadState = { ...current, running: false, activeTurn: undefined }
+            threadController.update(provisionalId, next)
+            publishThread(provisionalId, next)
+          }
+          releasePendingStart()
+          restoreDraftAfterFailedStart()
+          // The words return to the new chat's composer, and with them the Design choice.
+          setThreadDesignMode(undefined, designMode)
+          return
+        }
+        workspaceStartId = threadId
+        if (interruptRequested) setStoppingThreadId(threadId)
+        optimisticAdded = true
+        titledOnCreate = true
+      } else if (pendingSession.current?.id === threadId) {
+        const pending = pendingSession.current
+        const targetId = pending.threadId ?? pending.id
+        const provisional = appendUserMessage(
+          threadController.snapshot(targetId) ?? emptyThread,
+          text,
+          optimisticItemId,
+          optimisticCreatedAt,
+          attachments,
+        )
+        threadController.update(targetId, provisional)
+        publishThread(targetId, provisional)
+        setThreadRevealRequest((request) => request + 1)
+        threadId = await pending.promise
+        if (!threadId) {
+          releasePendingStart()
+          restoreDraftAfterFailedStart()
+          return
+        }
+        workspaceStartId = threadId
+        optimisticAdded = true
+      }
+
+      setNotice(undefined)
+      setActionError(undefined)
+      setUndoRestore(undefined)
+
+      const before = threadController.snapshot(threadId) ?? emptyThread
+      const wasRunning = before.running && !optimisticAdded
+      const steering = submission === 'steer'
+      const optimisticQueueId = wasRunning && !steering ? optimisticItemId : undefined
+      if (!wasRunning && !optimisticAdded) {
+        const next = beginOptimisticTurn(
+          before,
+          text,
+          optimisticItemId,
+          optimisticCreatedAt,
+          attachments,
+        )
+        optimisticTurnId = next.activeTurn?.id
+        threadController.update(threadId, next)
+        publishThread(threadId, next)
+        if (threadId === activeIdRef.current) setThreadRevealRequest((request) => request + 1)
+        // The row starts with the chat. Its first event can be many seconds
+        // away: a chat whose provider session must resume first sends none.
+        const startingId = threadId
+        setProjects((current) =>
+          updateSession(current, startingId, (session) => {
+            if (runsTurn(session.status)) return session
+            rowBeforeStart = { status: session.status, statusSince: session.statusSince }
+            return { ...session, status: 'starting', statusSince: Date.now() }
+          }),
+        )
+      } else if (wasRunning && steering) {
+        const next = appendUserMessage(
+          before,
+          text,
+          optimisticItemId,
+          optimisticCreatedAt,
+          attachments,
+        )
+        threadController.update(threadId, next)
+        publishThread(threadId, next)
+      }
+      if (optimisticQueueId) {
+        updateQueue(threadId, (items) => [
+          ...items,
+          { id: optimisticQueueId, text, attachments, createdAt: Date.now() },
+        ])
+      }
+      const optimisticState = threadController.snapshot(threadId) ?? emptyThread
+      const pendingOptimisticTurn = optimisticState.activeTurn
+      const precedingTurn = wasRunning ? before.activeTurn : undefined
+      const pendingSubmission: PendingSubmission = {
+        id: optimisticItemId,
+        text,
+        attachments,
+        createdAt: optimisticCreatedAt,
+        kind: wasRunning ? (steering ? 'steer' : 'queue') : 'turn',
+        accepted: false,
+        indeterminate: false,
+        ...(precedingTurn
+          ? {
+              precedingTurnId: precedingTurn.id,
+            }
+          : {}),
+      }
+      if (pendingOptimisticTurn && pendingOptimisticTurn.id === optimisticTurnId) {
+        pendingSubmission.optimisticTurn = pendingOptimisticTurn
+      }
+      threadController.submit(threadId, pendingSubmission)
+      if (workspaceStartToken !== undefined)
+        workspaceIdleProbe.current.submissionStarts.set(optimisticItemId, {
+          threadId,
+          token: workspaceStartToken,
+        })
+
+      // A session named after what was asked of it is findable a week later;
+      // "New session" is not. Named from the first message only.
+      //
+      // A session created a moment ago is untitled by definition — `projects`
+      // here is still the value from this render and cannot know about it yet,
+      // so asking it would answer no every time and nothing would be named.
+      const existingSession = findSession(projects, threadId)?.session
+      const untitled = !titledOnCreate && existingSession?.title === 'New session'
+      if (untitled) {
+        const title = titleFrom(titlePrompt)
+        setProjects((current) => promoteSession(renameSession(current, threadId, title), threadId))
+        void transport
+          .request('thread.rename', { threadId, title })
+          .then(() => generateSessionTitle(threadId, titlePrompt, title))
+          .catch(() => undefined)
+      }
+      const turnChoice =
+        moving ||
+        !existingSession ||
+        (selectedModelChoice &&
+          sourceKey({
+            provider: selectedModelChoice.provider,
+            connectionId: selectedModelChoice.connectionId,
+            agentId: selectedModelChoice.agent?.id,
+          }) ===
+            sourceKey({
+              provider: existingSession.provider,
+              connectionId: existingSession.connectionId,
+              agentId: existingSession.agent,
+            }))
+          ? selectedModelChoice
+          : undefined
+      let turnAccepted = false
+      let queuedActionId: string | undefined
+      try {
+        if (moving) {
+          const movingThreadId = threadId
+          try {
+            await transport.request('thread.changeProvider', {
+              threadId: movingThreadId,
+              provider: moving.provider,
+              ...(moving.agent ? { agent: moving.agent.id } : {}),
+              ...(moving.accountId ? { accountId: moving.accountId } : {}),
+              ...(moving.model.id ? { model: moving.model.id } : {}),
+              ...(selectedEffort ? { effort: selectedEffort } : {}),
+              ...(selectedServiceTier ? { serviceTier: selectedServiceTier } : {}),
+              approval: displayedApproval,
+            })
+          } catch (error) {
+            // Whether the chat moved is unknown: the sidebar asks the server again.
+            void refreshProjects().catch(() => undefined)
+            throw error instanceof IndeterminateRequestError
+              ? new Error(
+                  `The connection dropped while this chat switched to ${moving.sourceName}. Check which provider the chat shows, then send again.`,
+                )
+              : error
+          }
+          setProjects((current) =>
+            updateSession(current, movingThreadId, (session) =>
+              sessionOnProvider(session, {
+                provider: moving.provider,
+                agent: moving.agent?.id,
+                ...(moving.accountId && moving.accountId !== DEFAULT_ACCOUNT_ID
+                  ? { accountId: moving.accountId }
+                  : {}),
+              }),
+            ),
+          )
+          // The account it moved to is the chat's own now, which the
+          // provider's own entry stands for.
+          if (moving.accountId !== undefined) {
+            commitModelChoiceRef.current({
+              ...moving,
+              accountId: undefined,
+              key: modelChoiceKey(moving.provider, moving.model.id),
+            })
+          }
+          void refreshProjects().catch(() => undefined)
+        }
+        // Only a Stop from here on can have cancelled this prompt.
+        stoppedTurnStarts.current.delete(threadId)
+        const turnRequest = transport.request('thread.sendTurn', {
+          threadId,
+          text,
+          clientSubmissionId: optimisticItemId,
+          ...(turnAttachments.length > 0 ? { attachments: turnAttachments } : {}),
+          ...(turnChoice?.model.id ? { model: turnChoice?.model.id } : {}),
+          ...(turnChoice && selectedEffort ? { effort: selectedEffort } : {}),
+          ...(turnChoice && selectedServiceTier
+            ? {
+                serviceTier: selectedServiceTier,
+              }
+            : {}),
+        })
+        // A new chat can be stopped while thread.start is still resolving.
+        // Preserve that intent, put sendTurn on the wire first, then interrupt
+        // the canonical thread; the server latches interrupts during startup.
+        if (interruptRequested) requestInterrupt(threadId)
+        const result = await turnRequest
+        turnAccepted = true
+        const current = threadController.snapshot(threadId) ?? emptyThread
+        const pending = threadController.submission(threadId, optimisticItemId)
+        threadController.updateSubmission(threadId, optimisticItemId, { accepted: true })
+        if (result.queued) {
+          threadController.updateSubmission(threadId, optimisticItemId, {
+            kind: steering ? 'steer' : 'queue',
+          })
+          if (workspaceStartToken !== undefined)
+            workspaceIdleProbe.current.queuedStarts.set(result.queuedTurn.id, {
+              threadId,
+              token: workspaceStartToken,
+            })
+          if (steering) {
+            queuedActionId = result.queuedTurn.id
+            holdQueueAction(queuedActionId, threadId, 'steer')
+            await transport.request('thread.steerQueuedTurn', {
+              threadId,
+              queuedTurnId: result.queuedTurn.id,
+            })
+            settleQueueAction(queuedActionId, 'steer')
+            workspaceIdleProbe.current.unknownQueues.delete(threadId)
+            releaseQueuedStart(queuedActionId)
+          } else {
+            updateQueue(threadId, (items) => {
+              const optimisticIndex = optimisticQueueId
+                ? items.findIndex((item) => item.id === optimisticQueueId)
+                : -1
+              if (optimisticIndex < 0) {
+                return items.some((item) => item.id === result.queuedTurn.id)
+                  ? items
+                  : [...items, result.queuedTurn]
+              }
+              const next = items.slice()
+              const canonicalIndex = next.findIndex((item) => item.id === result.queuedTurn.id)
+              if (canonicalIndex < 0 || canonicalIndex === optimisticIndex)
+                next[optimisticIndex] = result.queuedTurn
+              else next.splice(optimisticIndex, 1)
+              return next
+            })
+            if (!wasRunning) {
+              const reconciled = pending ? removePendingSubmission(current, pending) : current
+              threadController.update(threadId, reconciled)
+              publishThread(threadId, reconciled)
+            }
+            threadController.forgetSubmission(threadId, optimisticItemId)
+          }
+        } else if (!result.queued && wasRunning) {
+          threadController.updateSubmission(threadId, optimisticItemId, { kind: 'turn' })
+          if (optimisticQueueId) {
+            updateQueue(threadId, (items) => items.filter((item) => item.id !== optimisticQueueId))
+          }
+        }
+      } catch (error) {
+        if (error instanceof IndeterminateRequestError) {
+          threadController.updateSubmission(threadId, optimisticItemId, { indeterminate: true })
+          if (queuedActionId) settleQueueAction(queuedActionId, 'steer', true)
+          return
+        }
+        if (queuedActionId) settleQueueAction(queuedActionId, 'steer')
+        // Stopped before its turn started (for one, while the chat resumed):
+        // the prompt goes back into the composer below, and that says enough.
+        const stoppedBeforeStart =
+          !turnAccepted && !wasRunning && stoppedTurnStarts.current.delete(threadId)
+        threadController.forgetSubmission(threadId, optimisticItemId)
+        if (optimisticQueueId) {
+          updateQueue(threadId, (items) => items.filter((item) => item.id !== optimisticQueueId))
+        }
+        if (!turnAccepted) {
+          releasePendingStart()
+          const current = threadController.snapshot(threadId)
+          if (current !== undefined) {
+            // The server did not accept this prompt. Remove only its local
+            // echo; a durable item already bound to a turn remains.
+            let next = removeOptimisticMessage(current, optimisticItemId)
+            if (current.activeTurn?.id === optimisticTurnId) {
+              next = { ...next, running: false, activeTurn: undefined }
+            }
+            threadController.update(threadId, next)
+            publishThread(threadId, next)
+          }
+          const previous = rowBeforeStart
+          if (previous) {
+            const rejectedId = threadId
+            setProjects((current) =>
+              updateSession(current, rejectedId, (session) =>
+                session.status === 'starting' ? { ...session, ...previous } : session,
+              ),
+            )
+          }
+          restoreRejectedDraft(threadId, { text, attachments })
+        } else if (steering) {
+          const current = threadController.snapshot(threadId)
+          if (current) {
+            const next = removeOptimisticMessage(current, optimisticItemId)
+            threadController.update(threadId, next)
+            publishThread(threadId, next)
+          }
+        }
+        if (!stoppedBeforeStart) reportError(error instanceof Error ? error.message : String(error))
+      }
+    },
+    [
+      transport,
+      activeId,
+      activePath,
+      createSession,
+      projects,
+      selectedModelChoice,
+      selectedEffort,
+      selectedServiceTier,
+      updateQueue,
+      requestInterrupt,
+      designMode,
+      setThreadDesignMode,
+      holdWorkspaceStart,
+      releaseWorkspaceStart,
+      refreshWorkspaceAfterCompletion,
+      holdQueueAction,
+      settleQueueAction,
+      restoreRejectedDraft,
+      sendAvailability,
+      publishComposerDraft,
+      cancelArchive,
+      moveChoice,
+      displayedApproval,
+      refreshProjects,
+    ],
+  )
+
+  const interrupt = useCallback(() => {
+    if (!activeId) return
+    if (activeId.startsWith('pending:')) {
+      pendingInterruptThreadIds.current.add(activeId)
+      setStoppingThreadId(activeId)
+      setStoppingRows((rows) => withStoppingRow(rows, activeId, Date.now()))
+      return
+    }
+    requestInterrupt(activeId)
+  }, [activeId, requestInterrupt])
+
+  // The turn ending — however it ended — clears the pending state. Switching
+  // sessions does too: the badge belongs to the thread, not to the composer.
+  const stopping = stoppingThreadId !== undefined && stoppingThreadId === activeId && thread.running
+  const visibleRunning = thread.running && !stopping
+  useEffect(() => {
+    if (stoppingThreadId && !thread.running && stoppingThreadId === activeId) {
+      setStoppingThreadId(undefined)
+    }
+  }, [thread.running, stoppingThreadId, activeId])
+
+  const transcribeVoice = useCallback(
+    async (requestId: string, recording: VoiceRecording): Promise<string> => {
+      const { text } = await transport.request('voice.transcribe', {
+        requestId,
+        provider: 'codex',
+        ...recording,
+      })
+      return text
+    },
+    [transport],
+  )
+
+  const cancelVoice = useCallback(
+    (requestId: string) => {
+      void transport.request('voice.cancel', { requestId }).catch(() => undefined)
+    },
+    [transport],
+  )
+
+  // Stable identity on purpose: this lands in effect dependency lists inside
+  // Settings, where a per-render identity would re-trigger them every render.
+  const refreshCatalog = useCallback(() => {
+    setCatalogRequest((request) => request + 1)
+  }, [])
+
+  const changeProviderRoster = useCallback(
+    (roster: ProviderRoster) => {
+      providerRosterRef.current = roster
+      writeProviderRoster(roster)
+      setProviderRoster(roster)
+      refreshCatalog()
+    },
+    [refreshCatalog],
+  )
+  // The roster is saved the first time the app knows enough to start it: a
+  // first run starts with nothing added and picks in setup, while someone who
+  // used the app before keeps what they saw and every source with a chat.
+  useEffect(() => {
+    if (providerRoster !== undefined || projectsStatus === 'loading') return
+    if (catalogAvailability !== 'ready') return
+    const firstRun = projectsStatus === 'ready' && projects.length === 0 && !onboardingDismissed
+    const roster = firstRun ? [] : seedProviderRoster({ providers: providerStatuses, projects })
+    providerRosterRef.current = roster
+    writeProviderRoster(roster)
+    setProviderRoster(roster)
+    // Until now every installed direct provider was listed and no ACP agent.
+    if (roster.some((key) => rosterAgent(key) !== undefined)) refreshCatalog()
+  }, [
+    providerRoster,
+    projectsStatus,
+    projects,
+    catalogAvailability,
+    onboardingDismissed,
+    providerStatuses,
+    refreshCatalog,
+  ])
+
+  const handleAccountChange = useCallback(
+    (changedProvider: ProviderId, changedAccount: Account) => {
+      if (changedProvider !== 'acp') rememberSignIn(changedProvider, changedAccount.signedIn)
+      // This is the default account's sign-in; a composer on a further
+      // account keeps that account's own check.
+      if (changedProvider === providerRef.current && checkedAccountRef.current === undefined) {
+        accountRequestRevision.current += 1
+        setAccount(changedAccount)
+        setAccountCheck({ provider: changedProvider, state: 'ready', account: changedAccount })
+      }
+    },
+    [],
+  )
+
+  // The picker leaves out providers known to be signed out. One signed in from
+  // its own terminal since comes back once the picker opens and its account is
+  // read again; each is read at most once per recheck interval.
+  const signedOutProviders = useRef(unavailableProviders.signedOut)
+  signedOutProviders.current = unavailableProviders.signedOut
+  const signInRechecks = useRef(new Map<ProviderId, number>())
+  const openModelSelector = useCallback(() => {
+    discoverEveryModelSource()
+    const now = Date.now()
+    for (const id of signedOutProviders.current) {
+      if (!rosterAllows(providerRosterRef.current, id)) continue
+      const last = signInRechecks.current.get(id)
+      if (last !== undefined && now - last < PROVIDER_RECHECK_INTERVAL_MS) continue
+      signInRechecks.current.set(id, now)
+      void transport.request('auth.status', { provider: id }).then(
+        (account) => handleAccountChange(id, account),
+        () => undefined,
+      )
+    }
+  }, [discoverEveryModelSource, handleAccountChange, transport])
+
+  useEffect(() => {
+    if (!providerLoginTerminal || !providerLoginState) return
+    const succeeded = providerLoginState.phase === 'succeeded'
+    const signInEnded =
+      providerLoginTerminal.operation !== 'install' &&
+      (providerLoginState.phase === 'failed' || providerLoginState.phase === 'canceled')
+    if (!succeeded && !signInEnded) return
+    const completed = providerLoginTerminal
+    if (succeeded) clearInstall(completed.installKey)
+    setProviderLoginTerminal(undefined)
+    setWorkspacePanelOpen(completed.restorePanelOpen)
+    setWorkspacePanelExpanded(completed.restorePanelExpanded)
+    if (completed.restoreSettings) {
+      setSettingsSection(requestSettingsSection('providers'))
+      setSettingsReturning(true)
+      setSettingsOpen(true)
+    }
+    if (completed.source === 'pull-requests') {
+      setPullRequestSetupRefreshRevision((revision) => revision + 1)
+      return
+    }
+    if (!succeeded) return
+    if (completed.operation === 'install') {
+      refreshCatalog()
+      return
+    }
+    const completedProvider = completed.provider
+    if (!completedProvider) return
+    if (completed.accountId !== undefined && completed.accountId !== DEFAULT_ACCOUNT_ID) {
+      // A further account: its own check is what the server keeps as who signed
+      // in, and accounts.changed tells every accounts view. The default
+      // account's state is untouched.
+      void transport
+        .request('auth.status', { provider: completedProvider, accountId: completed.accountId })
+        .catch(() => undefined)
+      return
+    }
+    setProviderAuthRefreshRevision((revision) => revision + 1)
+    void transport
+      .request('auth.status', { provider: completedProvider })
+      .then((account) => handleAccountChange(completedProvider, account))
+      .catch(() => undefined)
+  }, [
+    handleAccountChange,
+    providerLoginState?.phase,
+    providerLoginTerminal,
+    refreshCatalog,
+    transport,
+  ])
+
+  // prettier-ignore
+  const deleteQueuedTurn = useCallback((queuedTurnId: string): Promise<boolean> => { if (!activeId) return Promise.resolve(false); holdQueueAction(queuedTurnId, activeId, 'delete'); const projectPath = findSession(projectsRef.current, activeId)?.project.path; return transport.request('thread.deleteQueuedTurn', { threadId: activeId, queuedTurnId }).then(() => { updateQueue(activeId, (items) => items.filter((item) => item.id !== queuedTurnId)); settleQueueAction(queuedTurnId, 'delete'); workspaceIdleProbe.current.unknownQueues.delete(activeId); releaseQueuedStart(queuedTurnId); refreshWorkspaceAfterCompletion(projectPath); return true }, (error: unknown) => { settleQueueAction(queuedTurnId, 'delete', error instanceof IndeterminateRequestError); throw error }) }, [transport, activeId, updateQueue, releaseQueuedStart, refreshWorkspaceAfterCompletion, holdQueueAction, settleQueueAction])
+
+  const moveQueuedTurn = useCallback(
+    (queuedTurnId: string, direction: 'up' | 'down') => {
+      if (!activeId) return Promise.resolve(false)
+      return transport
+        .request('thread.moveQueuedTurn', { threadId: activeId, queuedTurnId, direction })
+        .then(() => true)
+        .catch((error) => {
+          reportError(error instanceof Error ? error.message : String(error))
+          return false
+        })
+    },
+    [transport, activeId],
+  )
+
+  // prettier-ignore
+  const steerQueuedTurn = useCallback((queuedTurnId: string) => { if (!activeId) return; holdQueueAction(queuedTurnId, activeId, 'steer'); const projectPath = findSession(projectsRef.current, activeId)?.project.path; void transport.request('thread.steerQueuedTurn', { threadId: activeId, queuedTurnId }).then(() => { updateQueue(activeId, (items) => items.filter((item) => item.id !== queuedTurnId)); settleQueueAction(queuedTurnId, 'steer'); workspaceIdleProbe.current.unknownQueues.delete(activeId); releaseQueuedStart(queuedTurnId); refreshWorkspaceAfterCompletion(projectPath) }).catch((error) => { settleQueueAction(queuedTurnId, 'steer', error instanceof IndeterminateRequestError); reportError(error instanceof Error ? error.message : String(error)) }) }, [transport, activeId, updateQueue, releaseQueuedStart, refreshWorkspaceAfterCompletion, holdQueueAction, settleQueueAction])
+
+  const selectProject = useCallback(
+    (path: string) => {
+      setSurface('chat')
+      if (path === activePathRef.current) return
+      enterNewChatDraft(path)
+      setActivePath(path)
+      activeIdRef.current = undefined
+      setActiveId(undefined)
+      setActiveThreadApproval(undefined)
+      setThread(emptyThread)
+      setUndoRestore(undefined)
+      setRollbackOpen(false)
+    },
+    [enterNewChatDraft],
+  )
+
+  const selectBranch = useCallback(
+    async (branch: string) => {
+      if (!activePath || activeId) return
+      setNotice(undefined)
+      setActionError(undefined)
+      try {
+        const info = isolateSession
+          ? undefined
+          : await transport.request('workspace.switchBranch', {
+              path: activePath,
+              branch,
+            })
+        projectBranches.current.set(activePath, branch)
+        if (info) recordCheckout(activePath, info)
+        writeSetting(`harness.branch:${activePath}`, branch)
+        const known = branchLists.current.get(activePath)
+        if (known) known.branches = [branch, ...known.branches.filter((item) => item !== branch)]
+        if (activePathRef.current !== activePath || activeIdRef.current) return
+        setWorkspace((current) => info ?? (current ? { ...current, branch } : current))
+        setBranches((current) => [branch, ...current.filter((item) => item !== branch)])
+      } catch (error) {
+        reportError(error instanceof Error ? error.message : String(error))
+      }
+    },
+    [transport, activePath, activeId, isolateSession, recordCheckout],
+  )
+
+  // Stable identities, so the memo around Composer is not defeated by a fresh
+  // arrow on every streamed frame — memo compares props shallowly, and an
+  // inline arrow fails that comparison every single time.
+  const changeBranch = useCallback((branch: string) => void selectBranch(branch), [selectBranch])
+  const requireProject = useCallback(() => reportError('Choose a project before sending.'), [])
+  const sendTurn = useCallback((text: string, files: string[]) => void send(text, files), [send])
+  const steerTurn = useCallback(
+    (text: string, files: string[]) => void send(text, files, 'steer'),
+    [send],
+  )
+
+  /** Set below; selecting the chat shown beside only moves focus to its pane. */
+  const focusPaneRef = useRef<(slot: PaneSlot) => void>(() => {})
+  const selectSession = useCallback(
+    /** keepView: a split pane taking focus. Its transcript stays as it is: no
+     * fresh view, no jump to the end, no composer focus. */
+    async (id: string, options?: { keepView?: boolean }) => {
+      const keepView = options?.keepView === true
+      if (!keepView && splitBesideId(splitRef.current) === id) {
+        setSurface('chat')
+        focusPaneRef.current(otherSlot(focusedSlotRef.current))
+        return
+      }
+      setSurface('chat')
+      pendingDeletionChecks.current.delete(id)
+      if (!cancelArchive(id)) {
+        reportError('This chat is being deleted.')
+        return
+      }
+      const threadSelection = readThreadModelSelection(id)
+      pendingThreadModelSave.current = threadSelection ? undefined : id
+      const found = findSession(projectsRef.current, id)
+      if (found?.session.provider) {
+        const source = sourceKey({
+          provider: found.session.provider,
+          connectionId: found.session.connectionId,
+          agentId: found.session.agent,
+        })
+        const matchesSource = (choice: ModelChoice) =>
+          sourceKey({
+            provider: choice.provider,
+            connectionId: choice.connectionId,
+            agentId: choice.agent?.id,
+          }) === source
+        const rememberedModelKey = readSourceSelections()[source]?.modelKey
+        const matchingChoice =
+          visibleModels.find(
+            (choice) => choice.key === threadSelection?.modelKey && matchesSource(choice),
+          ) ??
+          (selectedModelChoice && matchesSource(selectedModelChoice)
+            ? selectedModelChoice
+            : undefined) ??
+          visibleModels.find(
+            (choice) => choice.key === rememberedModelKey && matchesSource(choice),
+          ) ??
+          visibleModels.find((choice) => matchesSource(choice) && choice.model.isDefault) ??
+          visibleModels.find(matchesSource)
+        if (matchingChoice) {
+          commitModelChoice(
+            matchingChoice,
+            threadSelection?.modelKey === matchingChoice.key ? threadSelection : undefined,
+          )
+        } else {
+          setProvider(found.session.provider)
+          setSourceAgent(found.session.agent)
+          setSourceAgentName(undefined)
+          writeSetting(SETUP_KEY, found.session.provider)
+          if (found.session.agent) {
+            writeSetting(AGENT_KEY, found.session.agent)
+            removeSetting(AGENT_NAME_KEY)
+          } else {
+            removeSetting(AGENT_KEY)
+            removeSetting(AGENT_NAME_KEY)
+          }
+        }
+      }
+      setNotice(undefined)
+      setActionError(undefined)
+      setUndoRestore(undefined)
+      setRollbackOpen(false)
+      activeIdRef.current = id
+      setActiveThreadApproval(threadApprovals.current.get(id))
+      if (!id.startsWith('pending:')) readSharedSettings(id, threadSelection)
+      setHistoryFailure(undefined)
+      setActiveId(id)
+      if (!keepView) {
+        setComposerFocusRequest((request) => request + 1)
+        setThreadRevealRequest((request) => request + 1)
+        setThreadEntryKey(++threadEntryKeys.current)
+      }
+      setActivePath(found?.project.path)
+      threadController.resetBackground(id)
+      threadController.flush(id)
+      const cached = threadController.touch(id)
+      if (cached) {
+        setThread(cached)
+        setProjects((current) => updateSession(current, id, markSessionRead))
+        if (threadController.hasPending(id)) {
+          resync.current()
+          return
+        }
+      } else {
+        setThread(emptyThread)
+      }
+      // A chat that is still starting only has a local id the server does not
+      // know, so asking for its history fails. The start adopts the real id.
+      if (id.startsWith('pending:')) return
+
+      await readOpenedHistory(id, cached ? threadController.cursor(id) : undefined)
+    },
+    [
+      visibleModels,
+      selectedModelChoice,
+      commitModelChoice,
+      readOpenedHistory,
+      transport,
+      cancelArchive,
+    ],
+  )
+
+  const retryOpenedHistory = useCallback(() => {
+    const id = activeIdRef.current
+    if (id && !id.startsWith('pending:')) void readOpenedHistory(id, undefined)
+  }, [readOpenedHistory])
+
+  /** Where a continuation's earlier uncommitted changes went, by new chat, as its start said. */
+  const [earlierChanges, setEarlierChanges] = useState<Record<string, EarlierChanges>>({})
+
+  /**
+   * "Continue on another account": a new chat pinned to that account carries
+   * the open chat on. The server gives its first prompt this chat's
+   * conversation; the composer starts with the request that failed, so
+   * nothing is sent until the user sends it.
+   */
+  const continueOnAccount = useCallback(
+    async (accountId: AccountId) => {
+      const earlierId = activeIdRef.current
+      const found = findSession(projectsRef.current, earlierId)
+      if (!earlierId || !found) return
+      usageResumes.cancel(earlierId)
+      const { project, session: earlier } = found
+      const choice =
+        selectedModelChoice?.provider === earlier.provider &&
+        !selectedModelChoice.agent &&
+        !selectedModelChoice.connectionId
+          ? selectedModelChoice
+          : undefined
+      setActionError(undefined)
+      try {
+        const { threadId, earlierChanges: changes } = await transport.request('thread.start', {
+          provider: earlier.provider,
+          workspacePath: project.path,
+          accountId,
+          continueFrom: earlierId,
+          approval: approval === 'auto-review' && !autoReviewSupported ? 'full' : approval,
+          ...(choice?.model.id ? { model: choice.model.id } : {}),
+          ...(choice && selectedServiceTier ? { serviceTier: selectedServiceTier } : {}),
+          ...(choice && selectedEffort ? { effort: selectedEffort } : {}),
+          // An isolated chat's work is on its branch; the new checkout starts there.
+          ...(earlier.worktreeBranch ? { isolate: true, baseRef: earlier.worktreeBranch } : {}),
+        })
+        if (changes) setEarlierChanges((current) => ({ ...current, [threadId]: changes }))
+        const request = lastRequest(threadController.snapshot(earlierId)?.items ?? [])
+        if (request) threadController.editDraft(threadId, { text: request.text })
+        const now = Date.now()
+        const row: Session = {
+          id: threadId,
+          title: 'New session',
+          provider: earlier.provider,
+          ...(accountId === DEFAULT_ACCOUNT_ID ? {} : { accountId }),
+          continuedFrom: earlierId,
+          createdAt: now,
+          statusSince: now,
+          status: 'idle',
+          lifecycle: { state: 'active', keepActive: false },
+          unread: false,
+        }
+        // Listed at once, so opening it finds its project; the next list reconciles.
+        const next = projectsRef.current.map((entry) =>
+          entry.path !== project.path || entry.sessions.some((each) => each.id === threadId)
+            ? entry
+            : { ...entry, sessions: [row, ...entry.sessions] },
+        )
+        projectsRef.current = next
+        setProjects(next)
+        await selectSession(threadId)
+        void refreshProjects().catch(() => undefined)
+      } catch (error) {
+        reportError(error instanceof Error ? error.message : String(error))
+      }
+    },
+    [
+      transport,
+      selectedModelChoice,
+      selectedServiceTier,
+      selectedEffort,
+      approval,
+      autoReviewSupported,
+      selectSession,
+      refreshProjects,
+      reportError,
+      usageResumes,
+    ],
+  )
+
+  const inspectCheckpoint = useCallback(
+    async (checkpoint: Checkpoint) => {
+      if (!activeId) return
+      const request = {}
+      rollbackInspectionRequest.current = request
+      setRollbackInspection(undefined)
+      setRollbackLoadingId(checkpoint.id)
+      try {
+        const { files } = await transport.request('thread.changedSince', {
+          threadId: activeId,
+          checkpointId: checkpoint.id,
+        })
+        if (rollbackInspectionRequest.current !== request || activeIdRef.current !== activeId)
+          return
+        setRollbackInspection({ checkpoint, files })
+      } catch (error) {
+        if (rollbackInspectionRequest.current === request && activeIdRef.current === activeId)
+          reportError(error instanceof Error ? error.message : String(error))
+      } finally {
+        if (rollbackInspectionRequest.current === request) setRollbackLoadingId(undefined)
+      }
+    },
+    [transport, activeId],
+  )
+
+  const respondToApproval = useCallback(
+    (threadId: string | undefined, approvalId: string, decision: ApprovalDecision) => {
+      if (!threadId) return
+      void transport
+        .request('thread.respondToApproval', { threadId, approvalId, decision })
+        .catch((error) => {
+          setNotice(
+            `Could not send the approval. ${error instanceof Error ? error.message : String(error)}`,
+          )
+        })
+    },
+    [transport],
+  )
+  const decideApproval = useCallback(
+    (approvalId: string, decision: ApprovalDecision) =>
+      respondToApproval(activeIdRef.current, approvalId, decision),
+    [respondToApproval],
+  )
+  /**
+   * The permission chip is the one control for the access level, so it has to
+   * do both jobs at once: it is this provider's default for every new session,
+   * and picking a different mode inside a live chat changes that chat now.
+   */
+  // A chat's access is its own account's default; a new chat's, its starting account's.
+  const approvalScope = defaultsScope(
+    provider,
+    activeId ? (activeSession?.accountId as AccountId | undefined) : newChatAccount,
+  )
+  const changeApproval = useCallback(
+    (mode: ApprovalMode) => {
+      setApprovalByProvider((current) =>
+        current[approvalScope] === mode ? current : { ...current, [approvalScope]: mode },
+      )
+      const threadId = activeIdRef.current
+      if (!threadId) return
+      if (threadId.startsWith('pending:')) {
+        setActiveThreadApproval(mode)
+        pendingThreadApprovals.current.set(threadId, mode)
+        return
+      }
+      const request = () => transport.request('thread.setApproval', { threadId, approval: mode })
+      const previous = approvalChanges.current.get(threadId)
+      const change = (previous ? previous.then(request) : request())
+        .then(() => {
+          if (activeIdRef.current === threadId) setActiveThreadApproval(mode)
+        })
+        .catch((error) => reportError(error instanceof Error ? error.message : String(error)))
+        .finally(() => {
+          if (approvalChanges.current.get(threadId) === change)
+            approvalChanges.current.delete(threadId)
+        })
+      approvalChanges.current.set(threadId, change)
+    },
+    [approvalScope, transport],
+  )
+  const respondToUserInput = useCallback(
+    (threadId: string | undefined, requestId: string, answers: Record<string, string[]>) => {
+      if (!threadId) return Promise.reject(new Error('No active session'))
+      return transport
+        .request('thread.respondToUserInput', { threadId, requestId, answers })
+        .then(() => undefined)
+        .catch((error: unknown) => {
+          if (error instanceof IndeterminateRequestError) {
+            threadController.invalidateHistory(threadId)
+            void loadHistory(threadId).catch(() => undefined)
+          }
+          throw error
+        })
+    },
+    [transport, threadController, loadHistory],
+  )
+  const answerUserInput = useCallback(
+    (requestId: string, answers: Record<string, string[]>) =>
+      respondToUserInput(activeIdRef.current, requestId, answers),
+    [respondToUserInput],
+  )
+  const editMessage = useCallback((text: string, attachments: string[] = []) => {
+    const owner = threadController.draftOwner
+    const draft = threadController.draft(owner).text
+    threadController.editDraft(owner, { text })
+    setComposerDraft({
+      text,
+      undoable: true,
+      // A comment needs its screenshot back. Edit restores no other attachment.
+      commentImages: [...browserCommentImages(text, attachments)],
+      request: ++composerDraftRequests.current,
+    })
+    setComposerFocusRequest((request) => request + 1)
+    // An unsent draft must not vanish without a way back. The saved draft
+    // holds chips where the sent prompt has their tokens, so the two are
+    // compared as the provider receives them.
+    if (draft.trim() && composerWireText(draft) !== composerWireText(text)) {
+      setReplacedDraft({ owner, text: draft })
+      setNotice(DRAFT_REPLACED_NOTICE)
+    }
+  }, [])
+  // Arrow Up in an empty composer takes the same path as the Edit action.
+  const recallLastPrompt = useCallback(() => {
+    if (!activeIdRef.current) return undefined
+    const sent = lastSentPrompt(threadFrameStore.getStructureSnapshot())
+    if (sent) editMessage(sent.text, sent.attachments)
+    return sent?.text
+  }, [editMessage, threadFrameStore])
+  const restoreReplacedDraft = useCallback(() => {
+    const replaced = replacedDraft
+    setNotice(undefined)
+    setReplacedDraft(undefined)
+    if (!replaced || replaced.owner !== threadController.draftOwner) return
+    threadController.editDraft(replaced.owner, { text: replaced.text })
+    setComposerDraft({
+      text: replaced.text,
+      undoable: true,
+      request: ++composerDraftRequests.current,
+    })
+    setComposerFocusRequest((request) => request + 1)
+  }, [replacedDraft])
+  const revertCheckpoint = useCallback(
+    (checkpoint: Checkpoint) => {
+      setRollbackInspection(undefined)
+      setRollbackOpen(true)
+      void inspectCheckpoint(checkpoint)
+    },
+    [inspectCheckpoint],
+  )
+
+  const loadOlderHistory = useCallback(
+    (threadId: string, turnLimit?: number) =>
+      threadController.loadOlderHistory(threadId, turnLimit),
+    [threadController],
+  )
+  const loadCompleteHistory = useCallback(
+    (threadId: string, signal: AbortSignal) =>
+      threadController.loadCompleteHistory(threadId, signal),
+    [threadController],
+  )
+
+  const undoTurnChanges = useCallback(
+    async (threadId: string, turnId: string, expectedDiff: string) => {
+      setNotice(undefined)
+      setActionError(undefined)
+      await transport.request('thread.undoTurnChanges', { threadId, turnId, expectedDiff })
+      if (activeIdRef.current !== threadId) return
+      setNotice('Changes undone.')
+      const projectPath = findSession(projectsRef.current, threadId)?.project.path
+      invalidateWorkspaceIdleProbe(projectPath)
+      refreshWorkspaceAfterCompletion(projectPath)
+    },
+    [transport, invalidateWorkspaceIdleProbe, refreshWorkspaceAfterCompletion],
+  )
+
+  const restoreCheckpoint = useCallback(async () => {
+    if (
+      !activeId ||
+      !rollbackInspection ||
+      rollbackLoadingId !== undefined ||
+      restoreInFlight.current
+    )
+      return
+    restoreInFlight.current = true
+    setRollbackRestoring(true)
+    try {
+      threadController.invalidateHistory(activeId)
+      const { undo } = await transport.request('thread.restore', {
+        threadId: activeId,
+        checkpointId: rollbackInspection.checkpoint.id,
+      })
+      setUndoRestore({ threadId: activeId, token: undo })
+      setRollbackOpen(false)
+      setRollbackInspection(undefined)
+      rollbackInspectionRequest.current = undefined
+      setNotice(`Restored to before “${rollbackInspection.checkpoint.label}”.`)
+      await loadHistory(activeId)
+      await refreshCheckpoints(activeId)
+      if (activePath) {
+        const info = await transport.request('workspace.info', { path: activePath })
+        if (activePathRef.current === activePath && activeIdRef.current === activeId)
+          setWorkspace(info)
+      }
+    } catch (error) {
+      reportError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setRollbackRestoring(false)
+      restoreInFlight.current = false
+    }
+  }, [
+    transport,
+    activeId,
+    activePath,
+    rollbackInspection,
+    rollbackLoadingId,
+    loadHistory,
+    refreshCheckpoints,
+  ])
+
+  const reverseRestore = useCallback(async () => {
+    if (!undoRestore) return
+    try {
+      threadController.invalidateHistory(undoRestore.threadId)
+      await transport.request('thread.undoRestore', {
+        threadId: undoRestore.threadId,
+        undo: undoRestore.token,
+      })
+      await loadHistory(undoRestore.threadId)
+      await refreshCheckpoints(undoRestore.threadId)
+      if (activePath) {
+        const info = await transport.request('workspace.info', { path: activePath })
+        if (activePathRef.current === activePath && activeIdRef.current === undoRestore.threadId)
+          setWorkspace(info)
+      }
+      setUndoRestore(undefined)
+      setNotice('Restore undone.')
+    } catch (error) {
+      reportError(error instanceof Error ? error.message : String(error))
+    }
+  }, [transport, undoRestore, activePath, loadHistory, refreshCheckpoints])
+
+  const deleteSession = useCallback(
+    async (id: string) => {
+      // Recorded before the reply: a list read before the delete can land
+      // while the request is on its way, and must not bring the chat back.
+      deletedThreadIds.current.add(id)
+      try {
+        await transport.request('thread.delete', { threadId: id })
+      } catch (error) {
+        // The chat was not deleted, so the next list shows it again.
+        deletedThreadIds.current.delete(id)
+        throw error
+      }
+      const projectPath = clearWorkspaceThread(id)
+      threadController.discardSnapshot(id)
+      threadController.invalidateHistory(id)
+      // Thread ids are never reused, so a saved setup outlives its chat forever.
+      removeSetting(`${MODEL_BY_THREAD_PREFIX}${id}`)
+      setProjects((current) => removeSession(current, id))
+      if (!splitRemovals.current.chats([id]) && activeIdRef.current === id) {
+        activeIdRef.current = undefined
+        setActiveId(undefined)
+        setThread(emptyThread)
+      }
+      threadController.forgetDraft(id)
+      refreshWorkspaceAfterCompletion(projectPath)
+    },
+    [transport, clearWorkspaceThread, refreshWorkspaceAfterCompletion],
+  )
+
+  const commitChatDelete = useCallback(
+    async ({ threadId, checkout }: PendingChatDelete) => {
+      try {
+        if (checkout !== 'keep') {
+          await transport.request('thread.close', { threadId })
+          await transport.request(
+            'thread.discardWorktree',
+            checkout === 'force-discard' ? { threadId, force: true } : { threadId },
+          )
+        }
+        await deleteSession(threadId)
+        forgetPendingChatDeletes([threadId])
+      } catch (error) {
+        reportError(error instanceof Error ? error.message : String(error))
+        await refreshProjects().catch(() => undefined)
+      }
+    },
+    [transport, deleteSession, reportError, refreshProjects],
+  )
+
+  const queueArchive = useCallback(
+    (pending: PendingChatDelete) => {
+      const id = pending.threadId
+      setArchiveToastDismissed(false)
+      savePendingChatDelete(pending)
+      enqueueArchive(id, () => commitChatDelete(pending))
+      // A deleted chat stops now, not when the Undo window closes: until then its agent
+      // would go on working in the folder for a chat the user has thrown away. Undo brings
+      // the chat back stopped. Should this Stop fail, the delete still ends the agent.
+      if (
+        threadController.snapshot(id)?.running ||
+        runsTurn(findSession(projectsRef.current, id)?.session.status)
+      ) {
+        setStoppingRows((rows) => withStoppingRow(rows, id, Date.now()))
+        void transport
+          .request('thread.interrupt', { threadId: id })
+          .catch(() => undefined)
+          .finally(() => setStoppingRows((rows) => withoutStoppingRow(rows, id)))
+      }
+      if (!splitRemovals.current.chats([id]) && activeIdRef.current === id) {
+        activeIdRef.current = undefined
+        setActiveId(undefined)
+        setThread(emptyThread)
+      }
+    },
+    [enqueueArchive, commitChatDelete, threadController, transport],
+  )
+
+  const undoArchive = useCallback(() => {
+    const ids = undoQueuedArchives()
+    forgetPendingChatDeletes(ids)
+    const id = ids.at(-1)
+    if (id) void selectSession(id)
+  }, [selectSession, undoQueuedArchives])
+
+  const interruptedDeletesRun = useRef(false)
+  useEffect(() => {
+    if (projectsStatus !== 'ready' || interruptedDeletesRun.current) return
+    interruptedDeletesRun.current = true
+    void (async () => {
+      for (const pending of interruptedDeletes) {
+        if (findSession(projectsRef.current, pending.threadId)) await commitChatDelete(pending)
+        forgetPendingChatDeletes([pending.threadId])
+        setInterruptedDeletes((current) => current.filter((entry) => entry !== pending))
+      }
+    })()
+  }, [projectsStatus, interruptedDeletes, commitChatDelete])
+
+  const archiveSession = useCallback(
+    async (id: string): Promise<'queued' | 'confirming' | 'skipped' | 'failed'> => {
+      const found = findSession(projectsRef.current, id)
+      if (!found) return 'skipped'
+      const check = {}
+      pendingDeletionChecks.current.set(id, check)
+      try {
+        const work = await transport.request('thread.unsavedWork', { threadId: id })
+        if (pendingDeletionChecks.current.get(id) !== check) return 'skipped'
+        if (work.isolated && work.uncommitted) {
+          const confirmation = {
+            id,
+            title: found.session.title,
+            branch: found.session.worktreeBranch ?? 'isolated checkout',
+          }
+          setCheckoutDeletes((current) =>
+            current.some((entry) => entry.id === id) ? current : [...current, confirmation],
+          )
+          return 'confirming'
+        }
+        queueArchive({ threadId: id, checkout: work.isolated ? 'discard' : 'keep' })
+        return 'queued'
+      } catch (error) {
+        reportError(error instanceof Error ? error.message : String(error))
+        await refreshProjects().catch(() => undefined)
+        return 'failed'
+      } finally {
+        if (pendingDeletionChecks.current.get(id) === check)
+          pendingDeletionChecks.current.delete(id)
+      }
+    },
+    [transport, refreshProjects, queueArchive],
+  )
+
+  const discardAndArchive = useCallback(async () => {
+    if (!checkoutDelete) return
+    setCheckoutDeleteBusy(true)
+    try {
+      const id = checkoutDelete.id
+      queueArchive({ threadId: id, checkout: 'force-discard' })
+      dropCheckoutDelete(id)
+    } catch (error) {
+      reportError(error instanceof Error ? error.message : String(error))
+      await refreshProjects().catch(() => undefined)
+    } finally {
+      setCheckoutDeleteBusy(false)
+    }
+  }, [checkoutDelete, dropCheckoutDelete, refreshProjects, queueArchive])
+
+  const startNewChat = useCallback(() => {
+    const currentProjects = projectsRef.current
+    const currentPath = activePathRef.current
+    if (sidebarSettings.mode === 'inbox' && currentProjects.length > 1) {
+      setPreferredNewThreadProject(currentPath)
+      setPaletteScope('new-thread')
+      return
+    }
+    const path = currentPath ?? currentProjects[0]?.path
+    if (path) beginSession(path)
+    else void addProject()
+  }, [beginSession, addProject, sidebarSettings.mode])
+
+  const updateSidebarSettings = useCallback(
+    (updates: Partial<SidebarSettings>) => {
+      const revision = ++nextSidebarSettingsRevision.current
+      sidebarSettingsUpdates.current.set(revision, updates)
+      reconcileSidebarSettings()
+      void transport
+        .request('sidebar.updateSettings', updates)
+        .then((settings) => {
+          if (revision < confirmedSidebarSettingsRevision.current) return
+          confirmedSidebarSettingsRevision.current = revision
+          confirmedSidebarSettings.current = settings
+          sidebarSettingsSourceRevision.current += 1
+          for (const pendingRevision of sidebarSettingsUpdates.current.keys()) {
+            if (pendingRevision <= revision) sidebarSettingsUpdates.current.delete(pendingRevision)
+          }
+          reconcileSidebarSettings()
+        })
+        .catch((error) => {
+          sidebarSettingsUpdates.current.delete(revision)
+          reconcileSidebarSettings()
+          reportError(error instanceof Error ? error.message : String(error))
+        })
+    },
+    [transport, reconcileSidebarSettings],
+  )
+
+  const hideSessions = useCallback(
+    async (ids: string[], action: 'settle' | 'snooze', wakeAt?: number) => {
+      const targets = [...new Set(ids)]
+      if (targets.length === 0 || (action === 'snooze' && wakeAt === undefined)) return
+      try {
+        const results = await Promise.all(
+          targets.map(async (id) => {
+            let result
+            if (action === 'settle') {
+              result = await transport.request('thread.settle', { threadId: id })
+            } else {
+              if (wakeAt === undefined) throw new Error('snooze time is required')
+              result = await transport.request('thread.snooze', { threadId: id, wakeAt })
+            }
+            return [id, result.lifecycle] as const
+          }),
+        )
+        const lifecycles = new Map(results)
+        flushPendingLifecyclePushes.current?.()
+        setProjects((current) =>
+          updateSessions(current, lifecycles, (session, lifecycle) => ({
+            ...session,
+            lifecycle,
+          })),
+        )
+        if (splitRemovals.current.chats(targets)) return
+        const activeId = activeIdRef.current
+        if (!activeId || !targets.includes(activeId)) return
+        const current = findSession(projectsRef.current, activeId)
+        const hidden = new Set(targets)
+        const next = visibleProjectsRef.current
+          .flatMap((project) => project.sessions)
+          .filter((session) => !hidden.has(session.id) && session.lifecycle.state === 'active')
+          .sort((a, b) => b.createdAt - a.createdAt)[0]
+        if (next) await selectSession(next.id)
+        else if (current) beginSession(current.project.path)
+      } catch (error) {
+        reportError(error instanceof Error ? error.message : String(error))
+        await refreshProjects().catch(() => undefined)
+      }
+    },
+    [transport, selectSession, beginSession, refreshProjects],
+  )
+
+  const hideSession = useCallback(
+    (id: string, action: 'settle' | 'snooze', wakeAt?: number) =>
+      hideSessions([id], action, wakeAt),
+    [hideSessions],
+  )
+
+  const restoreSessions = useCallback(
+    async (ids: string[], action: 'unsettle' | 'unsnooze') => {
+      const targets = [...new Set(ids)]
+      if (targets.length === 0) return
+      try {
+        const results = await Promise.all(
+          targets.map(async (id) => {
+            const result =
+              action === 'unsettle'
+                ? await transport.request('thread.unsettle', { threadId: id })
+                : await transport.request('thread.unsnooze', { threadId: id })
+            return [id, result.lifecycle] as const
+          }),
+        )
+        const lifecycles = new Map(results)
+        flushPendingLifecyclePushes.current?.()
+        setProjects((current) =>
+          updateSessions(current, lifecycles, (session, lifecycle) => ({
+            ...session,
+            lifecycle,
+          })),
+        )
+      } catch (error) {
+        reportError(error instanceof Error ? error.message : String(error))
+        await refreshProjects().catch(() => undefined)
+      }
+    },
+    [transport, refreshProjects],
+  )
+
+  const restoreSession = useCallback(
+    (id: string, action: 'unsettle' | 'unsnooze') => restoreSessions([id], action),
+    [restoreSessions],
+  )
+
+  const keepSessionActive = useCallback(
+    async (id: string, keepActive: boolean) => {
+      try {
+        const { lifecycle } = await transport.request('thread.setKeepActive', {
+          threadId: id,
+          keepActive,
+        })
+        flushPendingLifecyclePushes.current?.()
+        setProjects((current) =>
+          updateSession(current, id, (session) => ({ ...session, lifecycle })),
+        )
+      } catch (error) {
+        reportError(error instanceof Error ? error.message : String(error))
+      }
+    },
+    [transport],
+  )
+
+  const sidebarInbox = useMemo(
+    () => ({
+      onSettle: (id: string) => void hideSession(id, 'settle'),
+      onSettleMany: (ids: string[]) => void hideSessions(ids, 'settle'),
+      onUnsettle: (id: string) => void restoreSession(id, 'unsettle'),
+      onUnsettleMany: (ids: string[]) => void restoreSessions(ids, 'unsettle'),
+      onSnooze: (id: string, wakeAt: number) => void hideSession(id, 'snooze', wakeAt),
+      onSnoozeMany: (ids: string[], wakeAt: number) => void hideSessions(ids, 'snooze', wakeAt),
+      onUnsnooze: (id: string) => void restoreSession(id, 'unsnooze'),
+      onUnsnoozeMany: (ids: string[]) => void restoreSessions(ids, 'unsnooze'),
+      onKeepActive: (id: string, keepActive: boolean) => void keepSessionActive(id, keepActive),
+    }),
+    [hideSession, hideSessions, restoreSession, restoreSessions, keepSessionActive],
+  )
+  // Archive is the inbox's settle: the chat leaves its project for the
+  // Archived section and comes back when the user sends to it.
+  const archiveSidebarChat = useCallback(
+    (id: string) => void hideSession(id, 'settle'),
+    [hideSession],
+  )
+  const restoreSidebarChat = useCallback(
+    (id: string) => void restoreSession(id, 'unsettle'),
+    [restoreSession],
+  )
+  const closeSidebar = useCallback(() => setCollapsed(true), [])
+  const resizeSidebar = useCallback((width: number) => {
+    setRailWidth(width)
+    writeSetting(RAIL_WIDTH_KEY, String(width))
+  }, [])
+  const addSidebarProject = useCallback(() => {
+    setSurface('chat')
+    void addProject()
+  }, [addProject])
+  const addDroppedSidebarProjects = useCallback(
+    (paths: string[]) => {
+      setSurface('chat')
+      void addProjects(paths)
+    },
+    [addProjects],
+  )
+  const startSidebarSession = useCallback(
+    (path?: string, chooseProject?: boolean) => {
+      setSurface('chat')
+      const currentProjects = projectsRef.current
+      const currentPath = activePathRef.current
+      if (chooseProject && currentProjects.length > 1) {
+        setPreferredNewThreadProject(path ?? currentPath)
+        setPaletteScope('new-thread')
+      } else if (path) beginSession(path)
+      else if (currentProjects.length === 1 && currentProjects[0]) {
+        beginSession(currentProjects[0].path)
+      } else {
+        setPreferredNewThreadProject(currentPath)
+        setPaletteScope('new-thread')
+      }
+    },
+    [beginSession],
+  )
+  const selectSidebarSession = useCallback((id: string) => void selectSession(id), [selectSession])
+
+  /** The focused pane as it is now, to show unchanged while the other pane has focus. */
+  const freezeFocusedPane = useCallback((): SplitView['frozen'] => {
+    const owner = threadController.draftOwner
+    return {
+      composer: {
+        ...liveComposerProps.current!,
+        // It is inert, but a paste that finishes saving later still belongs to its chat.
+        onDraftChange: (text) => void threadController.editDraft(owner, { text }),
+        onAttachmentsChange: (attachments) =>
+          void threadController.editDraft(owner, { attachments }),
+        onResourcesChange: (resources) => void threadController.editDraft(owner, { resources }),
+      },
+      entryKey: threadEntryKeyRef.current,
+      revealRequest: threadRevealRequestRef.current,
+    }
+  }, [threadController])
+  const focusedPaneContent = useCallback(
+    (): BesidePane =>
+      activeIdRef.current
+        ? { kind: 'chat', id: activeIdRef.current }
+        : { kind: 'new', projectPath: activePathRef.current },
+    [],
+  )
+  /**
+   * Move focus to the other split pane. Its chat becomes the active one; the
+   * pane that had focus keeps showing what it showed. The bookkeeping is
+   * synchronous, so the press that moved focus already acts on its own chat.
+   */
+  const focusPane = useCallback(
+    (slot: PaneSlot) => {
+      const current = splitRef.current
+      if (!current || slot === focusedSlotRef.current) return
+      const { beside: target, frozen } = current
+      const leaving = focusedPaneContent()
+      setSplit({ ...current, beside: leaving, frozen: freezeFocusedPane() })
+      setBesideQueue(leaving.kind === 'chat' ? threadController.queue(leaving.id) : undefined)
+      setFocusedSlot(slot)
+      // The pane comes back exactly as it was left: same view, draft and focus.
+      setThreadEntryKey(frozen.entryKey)
+      setThreadRevealRequest(frozen.revealRequest)
+      setComposerDraft(frozen.composer.draftRequest)
+      setComposerFocusRequest(frozen.composer.focusRequest)
+      const key = composerDraftKey(target.kind === 'chat' ? target.id : undefined)
+      threadController.draftOwner = key
+      composerDraftKeyRef.current = key
+      if (target.kind === 'chat') {
+        activeIdRef.current = target.id
+        void selectSession(target.id, { keepView: true })
+      } else {
+        activeIdRef.current = undefined
+        if (target.projectPath) beginSession(target.projectPath)
+        else setActiveId(undefined)
+      }
+    },
+    [
+      threadController,
+      freezeFocusedPane,
+      focusedPaneContent,
+      setSplit,
+      setFocusedSlot,
+      selectSession,
+      beginSession,
+      setActiveId,
+    ],
+  )
+  focusPaneRef.current = focusPane
+  /** Open a chat in split view beside the focused one. The opened pane takes focus. */
+  const openSessionBeside = useCallback(
+    (id: string) => {
+      void loadSplitViewStyles().then(
+        () => {
+          if (id === activeIdRef.current) return
+          const current = splitRef.current
+          const focused = focusedSlotRef.current
+          if (splitBesideId(current) === id) {
+            focusPane(otherSlot(focused))
+            return
+          }
+          const leaving = focusedPaneContent()
+          setSplit({
+            beside: leaving,
+            start: current?.start ?? focused,
+            frozen: freezeFocusedPane(),
+          })
+          setBesideQueue(leaving.kind === 'chat' ? threadController.queue(leaving.id) : undefined)
+          setFocusedSlot(otherSlot(focused))
+          // A new pane's composer also restores this when it is ready.
+          restoreComposerDraft(composerDraftKey(id))
+          void selectSession(id)
+        },
+        (error: unknown) => reportError(error instanceof Error ? error.message : String(error)),
+      )
+    },
+    [
+      threadController,
+      focusPane,
+      focusedPaneContent,
+      freezeFocusedPane,
+      setSplit,
+      setFocusedSlot,
+      restoreComposerDraft,
+      selectSession,
+      reportError,
+    ],
+  )
+  const closeBesidePane = useCallback(() => {
+    if (!splitRef.current) return
+    threadController.show(otherSlot(focusedSlotRef.current), undefined)
+    setSplit(undefined)
+    setBesideQueue(undefined)
+  }, [threadController, setSplit])
+  const closeFocusedPane = useCallback(() => {
+    if (!splitRef.current) return
+    focusPane(otherSlot(focusedSlotRef.current))
+    closeBesidePane()
+  }, [focusPane, closeBesidePane])
+  /** The stage body: a chat dragged from the sidebar is dropped on the panes in it. */
+  const stageBody = useRef<HTMLDivElement>(null)
+  const chatDrop = useChatDrop({
+    host: () => stageBody.current,
+    state: () => ({
+      split: splitRef.current !== undefined,
+      focusedSlot: focusedSlotRef.current,
+      activeId: activeIdRef.current,
+      besideId: splitBesideId(splitRef.current),
+    }),
+    // Each drop takes a path a click, "Open beside" or a pane press already
+    // takes, so drafts and running turns are handled exactly as there. A swap
+    // only trades the panes' sides; nothing inside either pane remounts.
+    apply: (id, action) => {
+      if (action.kind === 'open') return void selectSession(id)
+      if (action.kind === 'beside') return openSessionBeside(id)
+      const current = splitRef.current
+      if (!current) return
+      setSplit({ ...current, start: otherSlot(current.start) })
+      if (action.focusOther) focusPane(otherSlot(focusedSlotRef.current))
+    },
+  })
+  splitRemovals.current = {
+    chats: (ids) => {
+      const current = splitRef.current
+      if (!current) return false
+      const beside = splitBesideId(current)
+      if (beside !== undefined && ids.includes(beside)) {
+        closeBesidePane()
+        return false
+      }
+      const active = activeIdRef.current
+      if (active === undefined || !ids.includes(active)) return false
+      closeFocusedPane()
+      return true
+    },
+    project: (path) => {
+      const current = splitRef.current
+      if (!current) return false
+      const besidePath =
+        current.beside.kind === 'chat'
+          ? findSession(projectsRef.current, current.beside.id)?.project.path
+          : current.beside.projectPath
+      if (besidePath === path) {
+        closeBesidePane()
+        return false
+      }
+      if (activePathRef.current !== path) return false
+      closeFocusedPane()
+      return true
+    },
+  }
+  /** The chat shown beside the focused one acts on its own id, whatever has focus. */
+  const decideBesideApproval = useCallback(
+    (approvalId: string, decision: ApprovalDecision) =>
+      respondToApproval(besideId, approvalId, decision),
+    [besideId, respondToApproval],
+  )
+  const answerBesideUserInput = useCallback(
+    (requestId: string, answers: Record<string, string[]>) =>
+      respondToUserInput(besideId, requestId, answers),
+    [besideId, respondToUserInput],
+  )
+  const editBesideMessage = useCallback(
+    (text: string, attachments?: string[]) => {
+      focusPane(otherSlot(focusedSlotRef.current))
+      editMessage(text, attachments)
+    },
+    [focusPane, editMessage],
+  )
+  const focusPaneFromEvent = useCallback(
+    (slot: PaneSlot, toComposer: boolean) => {
+      focusPane(slot)
+      // A press on the composer means the user wants to type there.
+      if (toComposer) setComposerFocusRequest((request) => request + 1)
+    },
+    [focusPane],
+  )
+  // A chat notification was clicked and the shell brought the window up.
+  const openNotifiedChat = useCallback(
+    (id: string) => {
+      if (!findSession(projectsRef.current, id)) return
+      setSettingsOpen(false)
+      void selectSession(id)
+    },
+    [selectSession],
+  )
+  useChatNotifications(projects, projectsStatus === 'ready', openNotifiedChat)
+  // An app update waits for running chats instead of cutting them off.
+  useAppUpdateInstallGate(transport, projects, projectsStatus === 'ready')
+  // The pull request the header chip asked the surface to open with.
+  const [pullRequestFocus, setPullRequestFocus] = useState<PullRequestTarget>()
+  const openPullRequests = useCallback(() => {
+    setPullRequestFocus(undefined)
+    setSettingsOpen(false)
+    setPaletteScope(null)
+    setSurface('pull-requests')
+  }, [])
+  const openCheckoutPullRequest = useCallback((target: PullRequestTarget) => {
+    setPullRequestFocus(target)
+    setSettingsOpen(false)
+    setPaletteScope(null)
+    setSurface('pull-requests')
+  }, [])
+  const checkoutPullRequest = useCheckoutPullRequest(
+    transport,
+    activePath,
+    activeId,
+    thread.running,
+    surface === 'chat',
+  )
+  const openPullRequestChat = useCallback(
+    (pullRequest: PullRequestListItem) => {
+      if (!pullRequest.localProjectPath) return
+      beginSession(
+        pullRequest.localProjectPath,
+        `I wanted to work on ${pullRequest.url} (${pullRequest.title}).`,
+      )
+      setComposerFocusRequest((request) => request + 1)
+    },
+    [beginSession],
+  )
+  const [sidebarMutations] = useState(() => new OptimisticMutations(reportError))
+  useEffect(
+    () =>
+      transport.onState((state) => {
+        if (state === 'open') sidebarMutations.reconcile()
+      }),
+    [sidebarMutations, transport],
+  )
+  const recoverSidebarProject = useCallback(
+    async (path: string, field: 'name' | 'pinned') => {
+      const { projects: list } = await transport.request('projects.list', {})
+      const saved = list.find((project) => project.path === path)
+      return () =>
+        setProjects((current) =>
+          current.flatMap((project) =>
+            project.path !== path
+              ? [project]
+              : saved
+                ? [{ ...project, [field]: saved[field] }]
+                : [],
+          ),
+        )
+    },
+    [transport],
+  )
+  const recoverSidebarSession = useCallback(
+    async (id: string, field: 'title' | 'pinned') => {
+      const { projects: list } = await transport.request('projects.list', {})
+      const saved = list.flatMap((project) => project.sessions).find((session) => session.id === id)
+      return () =>
+        setProjects((current) =>
+          saved
+            ? updateSession(current, id, (session) => ({ ...session, [field]: saved[field] }))
+            : removeSession(current, id),
+        )
+    },
+    [transport],
+  )
+  const renameSidebarProject = useCallback(
+    (path: string, name: string) => {
+      setProjects((current) =>
+        current.map((project) => (project.path === path ? { ...project, name } : project)),
+      )
+      void sidebarMutations.run(
+        `project:${path}:name`,
+        () => transport.request('projects.rename', { path, name }),
+        () => recoverSidebarProject(path, 'name'),
+      )
+    },
+    [recoverSidebarProject, sidebarMutations, transport],
+  )
+  const removeSidebarProject = useCallback(
+    (path: string) => {
+      const previousActivePath = activePathRef.current
+      removedProjectPaths.current.add(path)
+      projectStartRevisions.current.set(path, (projectStartRevisions.current.get(path) ?? 0) + 1)
+      setProjects((current) => current.filter((project) => project.path !== path))
+      if (!splitRemovals.current.project(path) && previousActivePath === path) {
+        activePathRef.current = undefined
+        setActivePath(undefined)
+        activeIdRef.current = undefined
+        setActiveId(undefined)
+        setThread(emptyThread)
+        setActiveThreadApproval(undefined)
+        setUndoRestore(undefined)
+        setRollbackOpen(false)
+      }
+      void transport
+        .request('projects.remove', { path })
+        .then(refreshProjects)
+        .catch((error) => {
+          removedProjectPaths.current.delete(path)
+          reportError(error instanceof Error ? error.message : String(error))
+          // Put the selection back too, not just the list. Removal can now be
+          // refused, and refreshProjects would otherwise fill the cleared
+          // selection with an arbitrary other project while the open session
+          // still belongs to this one.
+          if (!activePathRef.current && !activeIdRef.current) setActivePath(previousActivePath)
+          void refreshProjects().catch(() => undefined)
+        })
+    },
+    [transport, refreshProjects],
+  )
+  const toggleSidebarProjectPin = useCallback(
+    (path: string) => {
+      const pinned = !projectsRef.current.find((project) => project.path === path)?.pinned
+      setProjects((current) =>
+        current.map((project) => (project.path === path ? { ...project, pinned } : project)),
+      )
+      void sidebarMutations.run(
+        `project:${path}:pinned`,
+        () => transport.request('projects.pin', { path, pinned }),
+        () => recoverSidebarProject(path, 'pinned'),
+      )
+    },
+    [recoverSidebarProject, sidebarMutations, transport],
+  )
+  const renameSidebarSession = useCallback(
+    (id: string, title: string) => {
+      setProjects((current) => renameSession(current, id, title))
+      const pending = pendingSession.current
+      if (pending?.id === id) {
+        pending.title = title
+        if (!pending.threadId) return
+        id = pending.threadId
+      }
+      // A provisional chat whose start failed has no thread to rename.
+      if (id.startsWith('pending:')) return
+      void sidebarMutations.run(
+        `thread:${id}:title`,
+        () => transport.request('thread.rename', { threadId: id, title }),
+        () => recoverSidebarSession(id, 'title'),
+      )
+    },
+    [recoverSidebarSession, sidebarMutations, transport],
+  )
+  const toggleSidebarSessionPin = useCallback(
+    (id: string) => {
+      const pinned = !findSession(projectsRef.current, id)?.session.pinned
+      setProjects((current) => updateSession(current, id, (session) => ({ ...session, pinned })))
+      const pending = pendingSession.current
+      if (pending?.id === id) {
+        pending.pinned = pinned
+        if (!pending.threadId) return
+        id = pending.threadId
+      }
+      // A provisional chat whose start failed has no thread to pin.
+      if (id.startsWith('pending:')) return
+      void sidebarMutations.run(
+        `thread:${id}:pinned`,
+        () => transport.request('thread.pin', { threadId: id, pinned }),
+        () => recoverSidebarSession(id, 'pinned'),
+      )
+    },
+    [recoverSidebarSession, sidebarMutations, transport],
+  )
+  const deleteSidebarSession = useCallback(
+    (id: string) => void archiveSession(id),
+    [archiveSession],
+  )
+  // The server marks a chat read when its history is fetched, as it does for
+  // the open chat after a turn. Asking for nothing past the end keeps that
+  // fetch empty.
+  const markSidebarSessionRead = useCallback(
+    (id: string) => {
+      setProjects((current) => updateSession(current, id, markSessionRead))
+      void transport
+        .request('thread.history', { threadId: id, afterSeq: Number.MAX_SAFE_INTEGER })
+        .catch(() => undefined)
+    },
+    [transport],
+  )
+  const archiveSidebarProject = useCallback(
+    (sessionIds: string[]) => {
+      void (async () => {
+        for (const id of sessionIds) {
+          if ((await archiveSession(id)) === 'failed') break
+        }
+      })()
+    },
+    [archiveSession],
+  )
+  const reorderSidebarSession = useCallback(
+    (projectPath: string, sourceId: string, targetId: string, position: 'before' | 'after') => {
+      draggedSessionOrder.add(projectPath)
+      setProjects((current) =>
+        current.map((project) => {
+          if (project.path !== projectPath) return project
+          const sessions = moveRailSession(project.sessions, sourceId, targetId, position)
+          return sessions === project.sessions ? project : { ...project, sessions }
+        }),
+      )
+    },
+    [draggedSessionOrder],
+  )
+  const reorderSidebarProject = useCallback(
+    (sourcePath: string, targetPath: string, position: 'before' | 'after') => {
+      setProjects((current) => {
+        const sourceIndex = current.findIndex((project) => project.path === sourcePath)
+        if (sourceIndex < 0) return current
+        const next = [...current]
+        const [moved] = next.splice(sourceIndex, 1)
+        const targetIndex = next.findIndex((project) => project.path === targetPath)
+        if (!moved || targetIndex < 0 || moved.pinned !== next[targetIndex]?.pinned) return current
+        next.splice(targetIndex + (position === 'after' ? 1 : 0), 0, moved)
+        return next
+      })
+    },
+    [],
+  )
+  const openSidebarSearch = useCallback((projectPath?: string) => {
+    sessionSearch.current?.open(projectPath)
+  }, [])
+  const cycleChat = useCallback(
+    (direction: -1 | 1) => {
+      const sessions = sidebarSessions(visibleProjectsRef.current, sidebarSettingsRef.current.mode)
+      if (sessions.length === 0) return
+      const activeId = activeIdRef.current
+      const current = activeId ? sessions.findIndex((session) => session.id === activeId) : -1
+      const nextIndex =
+        current < 0
+          ? direction > 0
+            ? 0
+            : sessions.length - 1
+          : (current + direction + sessions.length) % sessions.length
+      const next = sessions[nextIndex]
+      if (next) void selectSession(next.id)
+    },
+    [selectSession],
+  )
+  const selectSessionSearchResult = useCallback(
+    (threadId: string, turnId?: string) => {
+      // Counted outside the state: a used jump is cleared, and a new one must
+      // still never reuse the request number of one a thread already ran.
+      setSearchJump(
+        turnId ? { threadId, turnId, request: ++searchJumpRequests.current } : undefined,
+      )
+      void selectSession(threadId)
+    },
+    [selectSession],
+  )
+  const finishSearchJump = useCallback(
+    (request: number) =>
+      setSearchJump((current) => (current?.request === request ? undefined : current)),
+    [],
+  )
+  // Leaving a chat before its jump lands abandons the jump. Kept, it would run
+  // on the next entry to that chat, which must open at the end instead.
+  useEffect(() => {
+    setSearchJump((current) => (current && current.threadId !== activeId ? undefined : current))
+  }, [activeId])
+  const openSettings = useCallback(
+    (section: SettingsSection = 'workflows', view?: SettingsSectionRequest['view']) => {
+      setSettingsSection(requestSettingsSection(section, view))
+      setSettingsReturning(false)
+      setSettingsOpen(true)
+    },
+    [],
+  )
+  // A CLI's /resume, /config, /mcp, ... screen, as TasteCode's own.
+  const openAppScreen = useCallback(
+    (screen: AppScreen) => {
+      if (screen === 'resume') {
+        setSettingsOpen(false)
+        setPaletteScope('all')
+        return
+      }
+      openSettings(screen === 'settings' ? undefined : screen === 'login' ? 'providers' : screen)
+    },
+    [openSettings],
+  )
+  const changeKeybinding = useCallback((action: KeybindingId, shortcut: Shortcut | null) => {
+    setKeybindings((current) => {
+      const next = { ...current, [action]: shortcut }
+      writeKeybindings(next)
+      return next
+    })
+  }, [])
+  const resetKeybindings = useCallback(() => {
+    const defaults = createDefaultKeybindings()
+    writeKeybindings(defaults)
+    setKeybindings(defaults)
+  }, [])
+  const openProviderSetup = useCallback(() => {
+    refreshCatalog()
+    openSettings('providers')
+  }, [refreshCatalog, openSettings])
+  const openProviderPicker = useCallback(() => {
+    openSettings('providers', 'add-providers')
+  }, [openSettings])
+  // Settings would run the same read that just failed; asking again is the fix.
+  const retryAccountCheck = useCallback(() => setAuthStatusRequest((current) => current + 1), [])
+  // A CLI installed or signed in outside the app shows up when the window gets
+  // focus back. A scan that finds nothing new leaves the model catalog alone.
+  const accountUnconfirmed = accountCheck.provider === provider && accountCheck.state === 'failed'
+  const providerMissing = providerStatuses.some((status) => !status.installed)
+  useRecheckOnFocus(
+    catalogAvailability === 'failed' || providerMissing || accountUnconfirmed,
+    () => {
+      if (accountUnconfirmed) retryAccountCheck()
+      if (catalogAvailability === 'failed') refreshCatalog()
+      if (catalogAvailability !== 'ready' || !providerMissing) return
+      const known = providerStatuses
+      void transport.request('providers.list', {}).then(
+        ({ providers }) => {
+          if (providerScanChanged(known, providers)) refreshCatalog()
+        },
+        () => undefined,
+      )
+    },
+  )
+  const closeSettings = useCallback(() => setSettingsOpen(false), [])
+  const openChatFromSettings = useCallback(
+    (threadId: string) => {
+      setSettingsOpen(false)
+      void selectSession(threadId)
+    },
+    [selectSession],
+  )
+  // Settings covers the window with an opaque page. Once its fade-in has
+  // finished, the app behind it cannot be seen, so the app's endless loops (a
+  // working chat's spinner, the live activity row) pause until it closes
+  // instead of drawing a frame every refresh.
+  const shellBody = useRef<HTMLDivElement>(null)
+  // The chat column follows the rail and the side panel instead of jumping to
+  // its new centre when either changes the pane's width.
+  const stage = useRef<HTMLElement>(null)
+  useStageGlide(
+    stage,
+    `${collapsed ? 'rail-folded' : 'rail-open'} ${workspacePanelOpen ? 'panel-open' : 'panel-hidden'} ${workspacePanelExpanded ? 'panel-expanded' : ''}`,
+  )
+  const coverShell = useCallback((event: ReactAnimationEvent<HTMLDivElement>) => {
+    if (event.target === event.currentTarget) shellBody.current?.setAttribute('data-covered', '')
+  }, [])
+  useLayoutEffect(() => {
+    if (!settingsOpen) shellBody.current?.removeAttribute('data-covered')
+    // Settings back in place of a login terminal has no fade: it covers the
+    // app from its first frame.
+    else if (settingsReturning) shellBody.current?.setAttribute('data-covered', '')
+  }, [settingsOpen, settingsReturning])
+  const forceOnboarding = useCallback(() => {
+    setSettingsOpen(false)
+    setOnboardingPreview(true)
+  }, [])
+  const resetSettings = useCallback(() => {
+    cancelWorkspacePanelWidthPersistence()
+    localStorage.clear()
+    location.reload()
+  }, [cancelWorkspacePanelWidthPersistence])
+  // One update for any number of rows: Settings' All and None on a large
+  // source must not copy the record once per row.
+  const changeModelsVisibility = useCallback(
+    (keys: readonly string[], visible: boolean) => {
+      updateModelVisibility((record) =>
+        chooseModelsVisibility(record, keys, visible, modelDefaultsRef.current, Date.now()),
+      )
+    },
+    [updateModelVisibility],
+  )
+  const changeModelVisibility = useCallback(
+    (key: string, visible: boolean) => changeModelsVisibility([key], visible),
+    [changeModelsVisibility],
+  )
+  const closePalette = useCallback(() => {
+    setPaletteScope(null)
+    setPreferredNewThreadProject(undefined)
+  }, [])
+  const toggleRail = useCallback(() => setCollapsed((current) => !current), [])
+  const openRollback = useCallback(() => {
+    setRollbackInspection(undefined)
+    setRollbackOpen(true)
+  }, [])
+  const prepareBottomTerminal = useCallback(() => {
+    void loadWorkspacePanel().catch(() => undefined)
+  }, [])
+  const openBottomPanel = useCallback(() => {
+    setBottomTerminalHasMounted(true)
+    setBottomTerminalPhase('opening')
+  }, [])
+  const toggleTerminal = useCallback(() => {
+    setBottomTerminalHasMounted(true)
+    setBottomTerminalPhase((phase) =>
+      phase === 'closed' || phase === 'closing' ? 'opening' : 'closing',
+    )
+  }, [])
+  const toggleDefaultTerminal = useCallback(() => {
+    if (terminalPlacement === 'workspace') {
+      if (!activePath) return
+      setWorkspacePanelHasMounted(true)
+      setWorkspaceTerminalToggleRequest((request) => request + 1)
+      return
+    }
+    if (!activePath) return
+    setBottomTerminalHasMounted(true)
+    setBottomTerminalToggleRequest((request) => request + 1)
+  }, [activePath, terminalPlacement])
+  // The bottom panel unmounts while no project is active and forgets which
+  // toggle it last handled. Without this reset it would treat the old count as
+  // a new toggle on remount and open a terminal nobody asked for.
+  useEffect(() => {
+    if (!activePath) setBottomTerminalToggleRequest(0)
+  }, [activePath])
+  const closeTerminal = useCallback(() => {
+    setBottomTerminalPhase((phase) => (phase === 'opening' || phase === 'open' ? 'closing' : phase))
+  }, [])
+  const finishBottomTerminalMotion = useCallback((event: ReactTransitionEvent<HTMLDivElement>) => {
+    if (event.target !== event.currentTarget || event.propertyName !== 'transform') return
+    setBottomTerminalPhase((phase) => (phase === 'closing' ? 'closed' : phase))
+  }, [])
+  const prepareWorkspacePanel = useCallback(() => {
+    void loadWorkspacePanel().catch(() => undefined)
+  }, [])
+  const openWorkspacePanel = useCallback(() => {
+    setWorkspacePanelHasMounted(true)
+    setWorkspacePanelOpen(true)
+  }, [])
+  const closeWorkspacePanel = useCallback(() => {
+    setWorkspacePanelOpen(false)
+    setWorkspacePanelExpanded(false)
+  }, [])
+  const openProviderLoginTerminal = useCallback(
+    (target: ProviderLoginTerminalTarget) => {
+      setWorkspacePanelHasMounted(true)
+      const id = nextProviderLoginTerminalId.current++
+      // Asking again for the terminal that is already open (Show terminal from
+      // Settings opened on top of it) keeps its one tab and where closing it
+      // returns to, instead of attaching a second tab to the same terminal.
+      setProviderLoginTerminal((current) =>
+        current?.visible && current.installKey === target.installKey
+          ? current
+          : {
+              ...target,
+              id,
+              visible: true,
+              restorePanelOpen: workspacePanelOpen,
+              restorePanelExpanded: workspacePanelExpanded,
+              restoreSettings: settingsOpen,
+            },
+      )
+      setSettingsOpen(false)
+      setWorkspacePanelOpen(true)
+      setWorkspacePanelExpanded(true)
+    },
+    [settingsOpen, workspacePanelExpanded, workspacePanelOpen],
+  )
+  const closeProviderLoginTerminal = useCallback(
+    (id: number) => {
+      if (!providerLoginTerminal || providerLoginTerminal.id !== id) return
+      setProviderLoginTerminal(
+        providerLoginState?.phase === 'running'
+          ? { ...providerLoginTerminal, visible: false }
+          : undefined,
+      )
+      setWorkspacePanelOpen(providerLoginTerminal.restorePanelOpen)
+      setWorkspacePanelExpanded(providerLoginTerminal.restorePanelExpanded)
+      if (providerLoginTerminal.restoreSettings) {
+        setSettingsSection(requestSettingsSection('providers'))
+        setSettingsReturning(true)
+        setSettingsOpen(true)
+      }
+    },
+    [providerLoginState?.phase, providerLoginTerminal],
+  )
+  const toggleWorkspacePanel = useCallback(() => {
+    if (workspacePanelOpen) setWorkspacePanelExpanded(false)
+    else setWorkspacePanelHasMounted(true)
+    setWorkspacePanelOpen((open) => !open)
+  }, [workspacePanelOpen])
+  const toggleFastMode = useCallback(() => {
+    const model = selectedModelChoice?.model
+    const fast = getFastServiceTier(model)
+    if (!fast) return
+    // Save it to the open chat like the picker does, or the chat's saved tier
+    // comes back the next time it is opened.
+    pendingThreadModelSave.current = activeIdRef.current
+    setServiceTier((current) => (current === fast.id ? getFastModeOffValue(model) : fast.id))
+  }, [selectedModelChoice])
+  const active = useMemo(() => findSession(projects, activeId), [projects, activeId])
+  const activeProject = useMemo(
+    () => projects.find((project) => project.path === activePath),
+    [projects, activePath],
+  )
+  const keybindingActions = useMemo<Record<KeybindingId, () => void>>(
+    () => ({
+      commandPalette: () => {
+        setSettingsOpen(false)
+        setPaletteScope('all')
+      },
+      settings: () => {
+        setPaletteScope(null)
+        openSettings()
+      },
+      keybindings: () => {
+        setPaletteScope(null)
+        openSettings('keybinds')
+      },
+      toggleSidebar: toggleRail,
+      newChat: startNewChat,
+      searchSessions: () => {
+        setPaletteScope(null)
+        sessionSearch.current?.open()
+      },
+      focusComposer: () => {
+        if (!activePath) return
+        setPaletteScope(null)
+        setComposerFocusRequest((request) => request + 1)
+      },
+      interrupt: () => {
+        if (thread.running) interrupt()
+      },
+      previousChat: () => cycleChat(-1),
+      nextChat: () => cycleChat(1),
+      toggleSessionPin: () => {
+        if (activeId) toggleSidebarSessionPin(activeId)
+      },
+      archiveSession: () => {
+        if (activeId) deleteSidebarSession(activeId)
+      },
+      rollback: () => {
+        if (activeId && checkpoints.length > 0) openRollback()
+      },
+      switchProject: () => {
+        setSettingsOpen(false)
+        setPaletteScope('projects')
+      },
+      newProject: () => void addProject(),
+      openPullRequests,
+      toggleTerminal: toggleDefaultTerminal,
+      toggleWorkspace: () => {
+        if (activePath) toggleWorkspacePanel()
+      },
+      toggleFastMode,
+      toggleDesignMode: () => {
+        if (!thread.running) changeDesignMode(!designMode)
+      },
+      toggleIsolatedSession: () => {
+        if (!activeId) setIsolateSession((enabled) => !enabled)
+      },
+    }),
+    [
+      activeId,
+      activePath,
+      addProject,
+      checkpoints.length,
+      changeDesignMode,
+      designMode,
+      cycleChat,
+      deleteSidebarSession,
+      interrupt,
+      openPullRequests,
+      openRollback,
+      openSettings,
+      startNewChat,
+      thread.running,
+      toggleFastMode,
+      toggleRail,
+      toggleSidebarSessionPin,
+      toggleDefaultTerminal,
+      toggleWorkspacePanel,
+    ],
+  )
+
+  useEffect(() => syncNativeMenuShortcuts(keybindings), [keybindings])
+
+  const modalOwnsKeyboard = Boolean(paletteScope || rollbackOpen || checkoutDelete)
+  const runRoutedShortcut = useCallback(
+    (action: KeybindingId) => {
+      const route = shortcutRoute(action, {
+        settingsOpen,
+        onboardingPreview,
+        modalOpen: modalOwnsKeyboard || Boolean(sessionSearch.current?.isOpen()),
+      })
+      if (route === 'closeSettings') setSettingsOpen(false)
+      else if (route === 'showKeybinds') setSettingsSection(requestSettingsSection('keybinds'))
+      else if (route === 'run') keybindingActions[action]()
+    },
+    [keybindingActions, modalOwnsKeyboard, onboardingPreview, settingsOpen],
+  )
+
+  useEffect(
+    () =>
+      onNativeMenuAction((action, source) => {
+        if (source === 'accelerator') runRoutedShortcut(action)
+        else keybindingActions[action]()
+      }),
+    [keybindingActions, runRoutedShortcut],
+  )
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || event.repeat || event.isComposing) return
+
+      const debugModifier = macOS
+        ? event.metaKey && !event.ctrlKey
+        : event.ctrlKey && !event.metaKey
+      if (debugModifier && matchesShortcut(event, DEBUG_SETTINGS_SHORTCUT)) {
+        event.preventDefault()
+        setDebugSettingsVisible((visible) => !visible)
+        return
+      }
+      if (onboardingPreview && !settingsOpen) return
+
+      // Settings owns all keys while open. Its two app shortcuts can close
+      // the sheet or jump directly to the keybind editor.
+      if (settingsOpen) {
+        const action = (['settings', 'keybindings'] as const).find((id) =>
+          matchesShortcut(event, keybindings[id]),
+        )
+        if (action) {
+          event.preventDefault()
+          runRoutedShortcut(action)
+        }
+        return
+      }
+      if (modalOwnsKeyboard || sessionSearch.current?.isOpen()) return
+
+      // Keybinds come first, so one saved on a number key before the
+      // recorder refused them still runs, as its menu accelerator does.
+      const definition = KEYBINDING_DEFINITIONS.find((candidate) =>
+        matchesShortcut(event, keybindings[candidate.id]),
+      )
+      if (definition) {
+        event.preventDefault()
+        runRoutedShortcut(definition.id)
+        return
+      }
+
+      // Number keys open the newest sessions in the first sidebar project.
+      const primaryOnly = macOS ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey
+      if (primaryOnly && !event.altKey && !event.shiftKey && /^[1-9]$/.test(event.key)) {
+        const currentProjects = visibleProjectsRef.current
+        const project = currentProjects.find((candidate) => candidate.pinned) ?? currentProjects[0]
+        const session = project?.sessions
+          .slice()
+          .sort((left, right) => right.createdAt - left.createdAt)[Number(event.key) - 1]
+        event.preventDefault()
+        if (session) void selectSession(session.id)
+        return
+      }
+
+      const tool = WORKSPACE_TOOL_SHORTCUTS.find(({ shortcut }) => matchesShortcut(event, shortcut))
+      if (!tool) return
+      event.preventDefault()
+      setWorkspacePanelHasMounted(true)
+      setWorkspaceToolRequest({ request: ++nextWorkspaceToolRequest.current, kind: tool.kind })
+    }
+
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [
+    onboardingPreview,
+    keybindings,
+    macOS,
+    modalOwnsKeyboard,
+    runRoutedShortcut,
+    selectSession,
+    settingsOpen,
+  ])
+
+  const sideChatParentStatus: SideChatParentStatus =
+    thread.approvals.length > 0
+      ? 'approval'
+      : thread.userInputs.length > 0
+        ? 'input'
+        : thread.running
+          ? 'working'
+          : thread.items.at(-1)?.type === 'error'
+            ? 'failed'
+            : 'idle'
+  const sideChatStartOptions = useMemo<SideChatStartOptions>(
+    () => ({
+      ...(selectedModelChoice?.model.id
+        ? {
+            model: selectedModelChoice?.model.id,
+          }
+        : {}),
+      ...(selectedEffort ? { effort: selectedEffort } : {}),
+      ...(selectedServiceTier ? { serviceTier: selectedServiceTier } : {}),
+      approval: approval === 'auto-review' && !autoReviewSupported ? 'full' : approval,
+    }),
+    [
+      selectedModelChoice?.model.id,
+      selectedEffort,
+      selectedServiceTier,
+      approval,
+      autoReviewSupported,
+    ],
+  )
+  const paletteChatSearch = useMemo(
+    () =>
+      createPaletteChatSearch(
+        () => visibleProjectsRef.current,
+        displayName,
+        (threadId) => void selectSession(threadId),
+        PALETTE_CHAT_SEARCH_CACHE,
+      ),
+    [selectSession],
+  )
+  const commands = useMemo<PaletteCommand[]>(() => {
+    if (!paletteScope) return EMPTY_PALETTE_COMMANDS
+    const keybind = (id: KeybindingId) => {
+      const shortcut = keybindings[id]
+      return shortcut ? shortcutLabel(shortcut, macOS) : undefined
+    }
+    return [
+      {
+        id: 'search-sessions',
+        title: 'Search all chats',
+        detail: 'Titles, messages, commands, and tool output across projects',
+        group: 'Actions',
+        shortcut: keybind('searchSessions'),
+        run: () => {
+          sessionSearch.current?.open()
+        },
+      },
+      {
+        id: 'new-chat',
+        title: 'New chat',
+        detail: activePath ? `Start in ${basename(activePath)}` : 'Choose a project folder',
+        group: 'Actions',
+        keywords: 'session conversation',
+        shortcut: keybind('newChat'),
+        run: startNewChat,
+      },
+      {
+        id: 'switch-project',
+        title: 'Switch project…',
+        detail: 'Choose another workspace',
+        group: 'Actions',
+        keywords: 'folder workspace',
+        shortcut: keybind('switchProject'),
+        run: () => setPaletteScope('projects'),
+      },
+      {
+        id: 'new-project',
+        title: 'New project',
+        detail: 'Add a folder to the sidebar',
+        group: 'Actions',
+        keywords: 'add open folder workspace',
+        projectCommand: true,
+        shortcut: keybind('newProject'),
+        run: () => void addProject(),
+      },
+      ...(activePath
+        ? [
+            {
+              id: 'focus-composer',
+              title: 'Focus composer',
+              detail: 'Move the cursor to your prompt',
+              group: 'Actions' as const,
+              keywords: 'prompt message type',
+              shortcut: keybind('focusComposer'),
+              run: () => setComposerFocusRequest((request) => request + 1),
+            },
+          ]
+        : []),
+      {
+        id: 'toggle-sidebar',
+        title: collapsed ? 'Show sidebar' : 'Hide sidebar',
+        group: 'Actions',
+        keywords: 'rail navigation',
+        shortcut: keybind('toggleSidebar'),
+        run: () => setCollapsed((current) => !current),
+      },
+      {
+        id: 'open-settings',
+        title: 'Settings',
+        detail: 'General, appearance, keybinds, providers, and data',
+        group: 'Actions',
+        shortcut: keybind('settings'),
+        run: () => openSettings(),
+      },
+      {
+        id: 'keyboard-shortcuts',
+        title: 'Keybinds',
+        detail: 'View and customize every app keybind',
+        group: 'Actions',
+        keywords: 'help keyboard shortcuts hotkeys key bindings',
+        shortcut: keybind('keybindings'),
+        run: () => openSettings('keybinds'),
+      },
+      ...(feedback.status.enabled
+        ? [
+            {
+              id: 'send-feedback',
+              title: 'Send feedback…',
+              detail: 'Report a bug or share an idea with the TasteCode team',
+              group: 'Actions' as const,
+              keywords: 'bug report problem error issue idea feedback',
+              run: () => openFeedback('command_palette'),
+            },
+          ]
+        : []),
+      {
+        id: 'open-pull-requests',
+        title: 'Pull requests',
+        detail: 'Open the pull request inbox',
+        group: 'Actions',
+        keywords: 'github prs review',
+        shortcut: keybind('openPullRequests'),
+        run: openPullRequests,
+      },
+      ...(activeId || activePath
+        ? [
+            {
+              id: 'toggle-terminal',
+              title:
+                terminalPlacement === 'workspace'
+                  ? 'Toggle right sidebar terminal'
+                  : terminalOpen
+                    ? 'Hide terminal'
+                    : 'Show terminal',
+              detail: terminalPlacement === 'workspace' ? 'Right sidebar' : 'Bottom panel',
+              group: 'Actions' as const,
+              keywords: 'console shell',
+              shortcut: keybind('toggleTerminal'),
+              run: toggleDefaultTerminal,
+            },
+          ]
+        : []),
+      ...(activeId
+        ? [
+            {
+              id: 'toggle-chat-pin',
+              title: active?.session.pinned ? 'Unpin current chat' : 'Pin current chat',
+              group: 'Actions' as const,
+              shortcut: keybind('toggleSessionPin'),
+              run: () => toggleSidebarSessionPin(activeId),
+            },
+            ...(thread.running
+              ? [
+                  {
+                    id: 'stop-response',
+                    title: 'Stop response',
+                    group: 'Actions' as const,
+                    shortcut: keybind('interrupt'),
+                    run: interrupt,
+                  },
+                ]
+              : []),
+            ...(checkpoints.length > 0
+              ? [
+                  {
+                    id: 'open-restore-points',
+                    title: 'Restore points',
+                    detail: 'Review chat checkpoints',
+                    group: 'Actions' as const,
+                    shortcut: keybind('rollback'),
+                    run: openRollback,
+                  },
+                ]
+              : []),
+          ]
+        : []),
+      ...(activePath
+        ? [
+            {
+              id: 'toggle-workspace',
+              title: workspacePanelOpen ? 'Hide workspace tools' : 'Show workspace tools',
+              detail: 'Files, review, browser, and side chat',
+              group: 'Actions' as const,
+              shortcut: keybind('toggleWorkspace'),
+              run: toggleWorkspacePanel,
+            },
+          ]
+        : []),
+      ...projectChoices.map((project): PaletteCommand => ({
+        id: `project-${encodeURIComponent(project.path)}`,
+        title: displayName(project),
+        detail: project.path,
+        group: 'Projects',
+        keywords: 'switch folder workspace',
+        projectCommand: true,
+        run: () => selectProject(project.path),
+      })),
+      ...projectChoices.map((project): PaletteCommand => ({
+        id: `new-chat-${encodeURIComponent(project.path)}`,
+        title: `New thread in ${displayName(project)}`,
+        detail: project.path,
+        group: 'Projects',
+        keywords: 'session conversation',
+        newThreadProject: true,
+        run: () => beginSession(project.path),
+      })),
+    ]
+  }, [
+    paletteScope,
+    activePath,
+    startNewChat,
+    addProject,
+    openSettings,
+    openPullRequests,
+    feedback.status.enabled,
+    openFeedback,
+    active?.session.pinned,
+    activeId,
+    collapsed,
+    checkpoints.length,
+    interrupt,
+    keybindings,
+    macOS,
+    projectChoices,
+    selectProject,
+    beginSession,
+    terminalOpen,
+    terminalPlacement,
+    thread.running,
+    toggleSidebarSessionPin,
+    toggleDefaultTerminal,
+    toggleWorkspacePanel,
+    workspacePanelOpen,
+  ])
+
+  // A lazy wrapper and the component it loads are different element types, so
+  // swapping one for the other on a later render remounts the panel and closes
+  // its tabs. Each panel keeps the type it first rendered with: the loaded
+  // component when it was preloaded, otherwise the lazy wrapper.
+  const rightPanelType = useRef<WorkspacePanelComponent | typeof WorkspacePanel>(undefined)
+  const bottomPanelType = useRef<WorkspacePanelComponent | typeof WorkspacePanel>(undefined)
+  if (workspacePanelHasMounted) rightPanelType.current ??= resolvedWorkspacePanel ?? WorkspacePanel
+  if (activePath && bottomTerminalMounted) {
+    bottomPanelType.current ??= resolvedWorkspacePanel ?? WorkspacePanel
+  }
+  const RightWorkspacePanel = rightPanelType.current ?? WorkspacePanel
+  const BottomWorkspacePanel = bottomPanelType.current ?? WorkspacePanel
+  // The same for Settings, per opening: once its chunk is loaded it renders
+  // without a Suspense pass, and a load that lands while it is open does not
+  // swap the type under it.
+  const settingsType = useRef<SettingsComponent | typeof LazySettings>(undefined)
+  if (!settingsOpen) settingsType.current = undefined
+  const SettingsView = settingsOpen
+    ? (settingsType.current ??= resolvedSettings ?? LazySettings)
+    : undefined
+
+  // "Continue on another account" is offered on a failed turn while the chat's
+  // own account is at a plan limit and its provider has another signed-in
+  // account. It never starts on its own.
+  const continuedChat = useMemo(
+    () => (activeId ? continuedIn(projects, activeId) : undefined),
+    [activeId, projects],
+  )
+  const scheduledResume = scheduledResumes.find((entry) => entry.threadId === activeId)
+  const resetSummary =
+    activeSession &&
+    usageState.find(
+      (state) =>
+        state.provider === activeSession.provider &&
+        sameAccount(state.accountId, activeSession.accountId),
+    )?.summary
+  const resetLimits = resetSummary?.limitSource
+    ? resetSummary.limitSource.status === 'ready'
+      ? resetSummary.limitSource.limits
+      : []
+    : (resetSummary?.limits ?? [])
+  const resetAt = scheduledResume?.resetsAt ?? usageResetAt(resetLimits, Date.now())
+  const resetRequest =
+    thread.error && !thread.running
+      ? thread.items.findLast((item) => item.type === 'message' && item.role === 'user')
+      : undefined
+  const usageReset: ComposerError['usageReset'] =
+    activeSession &&
+    resetRequest &&
+    !continuedChat &&
+    (scheduledResume ||
+      accountAtLimit(usageState, activeSession.provider, activeSession.accountId, Date.now()))
+      ? {
+          resetsAt: resetAt,
+          source: `${providerName(activeSession.provider)}${selectedModelChoice ? ` · ${formatModelName(selectedModelChoice.model.displayName)}` : ''}`,
+          scheduled: Boolean(scheduledResume),
+          schedule: () => usageResumes.schedule(activeSession, resetRequest.id, resetAt!),
+          cancel: () => usageResumes.cancel(activeSession.id),
+        }
+      : undefined
+  const continueOptions = useMemo(() => {
+    if (
+      !activeSession ||
+      continuedChat ||
+      activeSession.id.startsWith('pending:') ||
+      activeSession.agent ||
+      activeSession.connectionId ||
+      !accountAtLimit(usageState, activeSession.provider, activeSession.accountId, Date.now())
+    )
+      return []
+    const defaultSignedIn =
+      providerStatuses.find((status) => status.id === activeSession.provider)?.auth ===
+      'authenticated'
+    return continueAccounts(
+      providerAccounts,
+      activeSession.provider,
+      activeSession.accountId,
+      defaultSignedIn,
+    )
+  }, [activeSession, continuedChat, usageState, providerStatuses, providerAccounts])
+
+  // At the same plan limit, every other signed-in provider is offered as well,
+  // with the model the chat would use there. Choosing one only sets it up:
+  // the chat switches with the next message, which the user sends.
+  const switchOptions = useMemo(() => {
+    if (
+      !movableChat ||
+      !activeSession ||
+      continuedChat ||
+      !accountAtLimit(usageState, activeSession.provider, activeSession.accountId, Date.now())
+    )
+      return []
+    const sources = new Map<string, ModelChoice>()
+    for (const choice of visibleModels) {
+      const source = modelSource(choice)
+      if (source === activeModelSource || sources.has(source) || choice.provider === 'api') continue
+      if (
+        providerStatuses.find((status) => status.id === choice.provider)?.auth !== 'authenticated'
+      )
+        continue
+      const remembered = readSourceSelections()[source]?.modelKey
+      sources.set(
+        source,
+        visibleModels.find((each) => each.key === remembered && modelSource(each) === source) ??
+          visibleModels.find((each) => modelSource(each) === source && each.model.isDefault) ??
+          choice,
+      )
+    }
+    return [...sources.values()]
+  }, [
+    movableChat,
+    activeSession,
+    continuedChat,
+    usageState,
+    visibleModels,
+    activeModelSource,
+    providerStatuses,
+  ])
+
+  const offlineError = useMemo<ComposerError | undefined>(
+    () =>
+      offline
+        ? { id: crypto.randomUUID(), message: 'Reconnecting to the server…', role: 'status' }
+        : undefined,
+    [offline],
+  )
+
+  const currentModelError =
+    modelErrors[selectedModelChoice ? modelSource(selectedModelChoice) : sourceKey({ provider })]
+  const providerProblem = providerStatuses.find((status) => status.id === provider)?.problem
+  const composerProviderError = catalogError
+    ? { ...catalogError, action: { label: 'Retry', run: refreshCatalog } }
+    : accountCheck.provider === provider && accountCheck.error
+      ? { ...accountCheck.error, action: { label: 'Retry', run: retryAccountCheck } }
+      : providerSignInState?.phase === 'failed'
+        ? {
+            id: `sign-in:${providerSignInState.terminalId}`,
+            message: `${providerName(provider, sourceAgentName)} sign-in failed. Try signing in again.`,
+            action: { label: 'Sign in', run: openProviderSetup },
+          }
+        : providerProblem
+          ? {
+              id: `provider:${provider}:${catalogRequest}:${providerProblem}`,
+              message: providerProblem,
+              action: {
+                label:
+                  sendAvailability === 'setup-required'
+                    ? providerStatuses.find((status) => status.id === provider)?.installed
+                      ? 'Sign in'
+                      : 'Set up provider'
+                    : 'Check setup',
+                run: openProviderSetup,
+              },
+            }
+          : undefined
+  feedbackContext.current = {
+    ...(activeId ? { threadId: activeId } : {}),
+    provider,
+    ...(sourceAgent ? { custom: true } : {}),
+    ...(selectedModelChoice?.model.id ? { model: selectedModelChoice.model.id } : {}),
+    surface: settingsOpen
+      ? 'settings'
+      : surface === 'pull-requests'
+        ? 'pull_requests'
+        : designMode
+          ? 'design'
+          : 'chat',
+  }
+  /** Lets the person send an error they saw to the team. Opening the dialog sends nothing. */
+  const reportable = <T extends ComposerError>(
+    error: T,
+    kind: NonNullable<FeedbackRequest['context']['error']>['kind'],
+  ): T =>
+    feedback.status.enabled
+      ? {
+          ...error,
+          report: () =>
+            openFeedback('error_report', {
+              error: { kind, message: error.message.slice(0, 4000) },
+            }),
+        }
+      : error
+  // Once continued, the failed turn's row leads to the chat that carries it on.
+  /** Sets the chat up to switch, with the request that failed back in the composer. */
+  const switchAtLimit = (choice: ModelChoice) => {
+    if (activeId) usageResumes.cancel(activeId)
+    commitModelChoice(choice)
+    const request = lastRequest(thread.items)
+    if (request) editMessage(request.text, request.attachments)
+  }
+  const continueOffer: Pick<ComposerError, 'action' | 'choices'> = continuedChat
+    ? {
+        action: {
+          label: `Continued on ${accountLabelOf(providerAccounts, continuedChat.provider, continuedChat.accountId)}`,
+          run: () => void selectSession(continuedChat.id),
+        },
+      }
+    : thread.running || continueOptions.length + switchOptions.length === 0
+      ? {}
+      : continueOptions.length + switchOptions.length === 1
+        ? {
+            action: continueOptions[0]
+              ? {
+                  label: `Continue on ${continueOptions[0].label}`,
+                  run: () => void continueOnAccount(continueOptions[0]!.id),
+                }
+              : {
+                  label: `Switch to ${switchOptions[0]!.sourceName}`,
+                  run: () => switchAtLimit(switchOptions[0]!),
+                },
+          }
+        : {
+            choices: {
+              label:
+                switchOptions.length === 0
+                  ? 'Continue on another account'
+                  : continueOptions.length === 0
+                    ? 'Switch to another provider'
+                    : 'Continue elsewhere',
+              options: [
+                ...continueOptions.map((account) => ({
+                  id: account.id,
+                  label: account.label,
+                  detail: account.email ?? account.plan,
+                  run: () => void continueOnAccount(account.id),
+                })),
+                ...switchOptions.map((choice) => ({
+                  id: `provider:${modelSource(choice)}`,
+                  label: choice.sourceName,
+                  detail: formatModelName(choice.model.displayName),
+                  run: () => switchAtLimit(choice),
+                })),
+              ],
+            },
+          }
+  const earlierChat =
+    // Shown until its first message; not while an opened chat's history is still loading.
+    activeSession?.continuedFrom &&
+    thread.items.length === 0 &&
+    !thread.running &&
+    loadingThreadId !== activeSession.id
+      ? findSession(projects, activeSession.continuedFrom)?.session
+      : undefined
+  const composerErrors: ComposerError[] = [
+    ...(actionError
+      ? [reportable({ ...actionError, dismiss: () => setActionError(undefined) }, 'action')]
+      : []),
+    ...(thread.error && activeId
+      ? [
+          reportable(
+            {
+              ...thread.error,
+              id: `chat:${activeId}:${thread.error.id}`,
+              ...continueOffer,
+              usageReset,
+              ...(scheduledResume ? { dismiss: () => usageResumes.cancel(activeId) } : {}),
+            },
+            'turn',
+          ),
+        ]
+      : []),
+    ...(earlierChat && activeSession
+      ? [
+          {
+            id: `continues:${activeSession.id}`,
+            role: 'status' as const,
+            tone: 'info' as const,
+            message: continuationNote(
+              earlierChat.title,
+              accountLabelOf(providerAccounts, activeSession.provider, activeSession.accountId),
+              earlierChanges[activeSession.id],
+            ),
+            action: { label: 'Open', run: () => void selectSession(earlierChat.id) },
+          },
+        ]
+      : []),
+    ...(moveChoice && activeSession
+      ? [
+          {
+            id: `moves:${activeSession.id}:${moveChoice.key}`,
+            role: 'status' as const,
+            tone: 'info' as const,
+            message: `Your next message switches this chat to ${moveChoice.sourceName}. The conversation so far goes with it.`,
+            ...(chatOwnChoice
+              ? {
+                  action: {
+                    label: `Stay on ${chatOwnChoice.sourceName}`,
+                    run: () => commitModelChoice(chatOwnChoice),
+                  },
+                }
+              : {}),
+          },
+        ]
+      : []),
+    ...(currentModelError
+      ? [
+          reportable(
+            { ...currentModelError, action: { label: 'Retry models', run: refreshCatalog } },
+            'models',
+          ),
+        ]
+      : []),
+    ...(offlineError ? [offlineError] : []),
+    ...(askFirstBlock
+      ? [{ id: `ask-first:${provider}`, role: 'alert' as const, message: askFirstBlock }]
+      : []),
+  ]
+
+  // workspace.info answered for this very project without a branch: no Git repository to isolate
+  // from. Until it answers for the project on screen, Isolated stays offered.
+  const newChatUnbranched =
+    !activeId && activePath !== undefined && unbranchedProjects.current.has(activePath)
+  const composerProps: ComposerProps = {
+    transport: transport,
+    provider: provider,
+    projects: projectChoices,
+    projectPath: activePath,
+    projectName: activeProject ? displayName(activeProject) : undefined,
+    threadId: activeId && !activeId.startsWith('pending:') ? activeId : undefined,
+    projectsLoading: projectsStatus === 'loading',
+    branch:
+      (!activeId && activePath ? newChatBranch(activePath, isolateSession) : undefined) ??
+      active?.session.worktreeBranch ??
+      workspace?.branch ??
+      pathBranches[0],
+    branches: pathBranches,
+    onBranchMenuOpen: openBranchMenu,
+    branchesLoading: Boolean(activePath) && branchesPath !== activePath,
+    models: pickerModels,
+    modelsLoaded: modelsLoaded,
+    modelId: selectedModelChoice?.key,
+    modelChoice: selectedModelChoice,
+    modelPending: modelChoicePending,
+    effort: selectedEffort,
+    serviceTier: selectedServiceTier,
+    usage: thread.usage,
+    approval: displayedApproval,
+    approvalLoading: approvalLoading,
+    autoReviewSupported: autoReviewSupported,
+    attachmentsSupported: attachmentsSupported,
+    attachmentsLoading: catalogAvailability === 'loading',
+    voiceAvailable: isDesktop && provider === 'codex' && voiceAvailable,
+    voiceLoading: isDesktop && provider === 'codex' && voiceStatusLoading,
+    disabled: stopping,
+    placeholder: stopping ? 'Stopping…' : undefined,
+    sendAvailability: sendAvailability,
+    errors: composerErrors,
+    errorsVisible: !settingsOpen && surface === 'chat',
+    providerError: composerProviderError
+      ? reportable(composerProviderError, 'provider')
+      : undefined,
+    providerSignInRequired: providerStatuses.some(
+      (status) => status.id === provider && status.installed,
+    ),
+    running: visibleRunning,
+    newSession: !activeId,
+    isolate: active?.session.worktreeBranch ? true : isolateSession && !newChatUnbranched,
+    ...(newChatUnbranched ? { isolateUnavailable: 'Isolated needs a Git repository' } : {}),
+    designMode: designMode,
+    ...(askFirstUnsupported
+      ? {
+          askFirstUnavailable: `${providerName(provider, sourceAgentName)} can't ask before running commands`,
+        }
+      : {}),
+    keybindings: keybindings,
+    focusRequest: composerFocusRequest,
+    draftRequest: composerDraft,
+    onDraftChange: updateComposerDraftText,
+    onAttachmentsChange: updateComposerDraftAttachments,
+    onPendingAttachment: keepPendingAttachment,
+    onPendingQueuedEdit: keepQueuedEdit,
+    onResourcesChange: updateComposerDraftResources,
+    onRecallLastPrompt: recallLastPrompt,
+    onReady: handleComposerReady,
+    queuedTurns: queuedTurns,
+    canSteerQueue: canSteerQueue,
+    onModelSelectorOpen: openModelSelector,
+    onModelChange: selectModel,
+    onEffortChange: changeEffort,
+    onServiceTierChange: changeServiceTier,
+    onApprovalChange: changeApproval,
+    onIsolateChange: setIsolateSession,
+    onDesignModeChange: changeDesignMode,
+    onTranscribeVoice: transcribeVoice,
+    onCancelVoice: cancelVoice,
+    onProjectChange: selectProject,
+    onAddProject: addProject,
+    onBranchChange: changeBranch,
+    onProjectRequired: requireProject,
+    onSetupProvider: sendAvailability === 'no-provider' ? openProviderPicker : openProviderSetup,
+    onSend: sendTurn,
+    onSteer: steerTurn,
+    onFeedbackCommand: feedback.status.enabled ? openCommandFeedback : undefined,
+    onNewChatCommand: startNewChat,
+    onAppScreenCommand: openAppScreen,
+    onInterrupt: interrupt,
+    stopping: stopping,
+    onDeleteQueuedTurn: deleteQueuedTurn,
+    onMoveQueuedTurn: moveQueuedTurn,
+    onSteerQueuedTurn: steerQueuedTurn,
+  }
+  liveComposerProps.current = composerProps
+  const besideSession = useMemo(
+    () => (besideId ? findSession(projects, besideId) : undefined),
+    [projects, besideId],
+  )
+  const besideNewPath = split?.beside.kind === 'new' ? split.beside.projectPath : undefined
+  const renderStageHeader = (onClosePane: (() => void) | undefined) => (
+    <StageHeader
+      sessionId={active?.session.id}
+      title={active?.session.title}
+      pinned={active?.session.pinned ?? false}
+      projectPath={activePath}
+      checkpointCount={thread.running ? 0 : checkpoints.length}
+      worktreeBranch={active?.session.worktreeBranch}
+      pullRequest={checkoutPullRequest}
+      onOpenPullRequest={openCheckoutPullRequest}
+      keybindings={keybindings}
+      menuActions={keybindingActions}
+      onOpenRollback={openRollback}
+      onRenameSession={renameSidebarSession}
+      onToggleSessionPin={toggleSidebarSessionPin}
+      onArchiveSession={deleteSidebarSession}
+      onClosePane={onClosePane}
+    />
+  )
+
+  // Restores and sent feedback are confirmations; every other notice is neutral.
+  const noticeTone =
+    undoRestore || notice === 'Restore undone.' || notice === FEEDBACK_SENT_NOTICE
+      ? 'success'
+      : 'info'
+  return (
+    <div
+      className={`shell ${collapsed ? 'is-narrow' : ''}${isDesktop && macOS ? ' is-macos' : ''}`}
+      style={shellStyle(railWidth)}
+    >
+      <TitleBar collapsed={collapsed} keybindings={keybindings} onToggleRail={toggleRail} />
+      {surface === 'chat' ? (
+        <PanelToggles
+          projectPath={activePath}
+          terminalOpen={terminalOpen}
+          workspacePanelOpen={workspacePanelOpen}
+          terminalShortcutActive={terminalPlacement === 'bottom'}
+          keybindings={keybindings}
+          onPrepareTerminal={prepareBottomTerminal}
+          onPrepareWorkspace={prepareWorkspacePanel}
+          onToggleWorkspace={workspacePanelOpen ? closeWorkspacePanel : openWorkspacePanel}
+          onToggleTerminal={toggleTerminal}
+        />
+      ) : null}
+      {isDesktop ? <ZoomHud /> : null}
+
+      <div className="shell__body" ref={shellBody}>
+        <AppBackground covered={settingsOpen} />
+        <Sidebar
+          projects={sidebarProjects}
+          projectsLoading={projectsStatus === 'loading'}
+          activeProjectPath={activePath}
+          activeSessionId={surface === 'chat' ? activeId : undefined}
+          pullRequestsActive={surface === 'pull-requests'}
+          providerName={providerName(provider, sourceAgentName)}
+          keybindings={keybindings}
+          usageStates={usageState}
+          usageCardStates={cardUsageState}
+          accountLabel={accountLabel}
+          activeAccount={activeAccount}
+          accountPools={accountPools}
+          onShowUsage={showUsage}
+          onRetryUsage={retryUsage}
+          onRefreshUsage={refreshAllUsage}
+          onConsumeReset={consumeReset}
+          mode={sidebarSettings.mode}
+          inbox={sidebarInbox}
+          collapsed={collapsed}
+          width={railWidth}
+          account={account}
+          profileIdentity={profileIdentity}
+          onClose={closeSidebar}
+          onWidthChange={resizeSidebar}
+          onAddProject={addSidebarProject}
+          onAddDroppedProjects={addDroppedSidebarProjects}
+          onNewSession={startSidebarSession}
+          onSelectSession={selectSidebarSession}
+          besideSessionId={surface === 'chat' ? besideId : undefined}
+          onOpenSessionBeside={openSessionBeside}
+          sessionDropTarget={chatDrop.target}
+          onRenameProject={renameSidebarProject}
+          onRemoveProject={removeSidebarProject}
+          onTogglePin={toggleSidebarProjectPin}
+          onRenameSession={renameSidebarSession}
+          onToggleSessionPin={toggleSidebarSessionPin}
+          onDeleteSession={deleteSidebarSession}
+          onMarkSessionRead={markSidebarSessionRead}
+          onArchiveSession={archiveSidebarChat}
+          onRestoreSession={restoreSidebarChat}
+          onArchiveProject={archiveSidebarProject}
+          onReorderProject={reorderSidebarProject}
+          onReorderSession={reorderSidebarSession}
+          onOpenSearch={openSidebarSearch}
+          onOpenPullRequests={openPullRequests}
+          onOpenSettings={openSettings}
+          onSendFeedback={feedback.status.enabled ? openAccountFeedback : undefined}
+        />
+
+        <div
+          className={`workspace-layout${workspacePanelOpen ? ' is-panel-open' : ''}${workspacePanelExpanded ? ' is-panel-expanded' : ''}`}
+          style={workspaceLayoutStyle(workspacePanelWidth)}
+        >
+          <main className="stage" ref={stage}>
+            {surface === 'pull-requests' ? (
+              <Suspense fallback={<PullRequestsSkeleton />}>
+                <PullRequestsView
+                  transport={transport}
+                  initialSelection={pullRequestFocus}
+                  onOpenChat={openPullRequestChat}
+                  onSetupTerminalOpen={openProviderLoginTerminal}
+                  setupRefreshRevision={pullRequestSetupRefreshRevision}
+                />
+              </Suspense>
+            ) : split ? null : (
+              renderStageHeader(undefined)
+            )}
+
+            {/* The pull requests view covers the stage, but the bottom panel stays
+                mounted behind it so its tabs and running shells survive the visit. */}
+            <div
+              ref={stageBody}
+              className={`stage__body${activeId || split ? '' : ' is-new-session'}${split ? ' is-split' : ''}${activePath && terminalOpen ? ' has-terminal' : ''}`}
+              hidden={surface === 'pull-requests'}
+            >
+              {surface === 'chat' ? (
+                // Without a split both wrappers take no box, so the single chat's
+                // layout is unchanged, and opening a split keeps it mounted.
+                <div className="split" style={split ? undefined : SPLIT_CONTENTS}>
+                  {PANE_SLOTS.map((slot) => {
+                    const focused = slot === focusedSlot
+                    if (!focused && !split) return null
+                    return (
+                      <SplitPane
+                        key={slot}
+                        slot={slot}
+                        split={split !== undefined}
+                        focused={focused}
+                        start={split?.start === slot}
+                        label={
+                          (focused ? active?.session.title : besideSession?.session.title) ??
+                          'New chat'
+                        }
+                        onFocusPane={focusPaneFromEvent}
+                      >
+                        {focused ? (
+                          <>
+                            {split ? renderStageHeader(closeFocusedPane) : null}
+                            <div
+                              className={`stage__conversation${activeId ? '' : ' is-new-session'}`}
+                            >
+                              {activeId ? (
+                                <AccountLabelContext.Provider value={accountLabel}>
+                                  <ModelNameContext.Provider value={modelName}>
+                                    <Suspense fallback={<ThreadSkeleton />}>
+                                      <LazyThread
+                                        key={threadEntryKey}
+                                        frameStore={threadFrameStore}
+                                        errorsInComposer
+                                        stopping={stopping}
+                                        loading={loadingThreadId === activeId}
+                                        loadFailure={
+                                          historyFailure?.threadId === activeId
+                                            ? historyFailure.message
+                                            : undefined
+                                        }
+                                        onRetryLoad={retryOpenedHistory}
+                                        projectPath={activePath}
+                                        threadId={activeId}
+                                        transport={transport}
+                                        searchJump={
+                                          searchJump?.threadId === activeId ? searchJump : undefined
+                                        }
+                                        onSearchJumpDone={finishSearchJump}
+                                        revealRequest={threadRevealRequest}
+                                        checkpoints={checkpoints}
+                                        onDecide={decideApproval}
+                                        onAnswerUserInput={answerUserInput}
+                                        onEditMessage={editMessage}
+                                        onRevertCheckpoint={revertCheckpoint}
+                                        onUndoChanges={undoTurnChanges}
+                                        onLoadOlderHistory={loadOlderHistory}
+                                        onLoadCompleteHistory={loadCompleteHistory}
+                                        turnRail
+                                      />
+                                    </Suspense>
+                                  </ModelNameContext.Provider>
+                                </AccountLabelContext.Provider>
+                              ) : (
+                                <Empty
+                                  projects={projects}
+                                  activePath={activePath}
+                                  status={projectsStatus}
+                                  startupProjectName={startupProjectName}
+                                  onAddProject={addSidebarProject}
+                                  onRetry={retryProjects}
+                                />
+                              )}
+
+                              <PaneComposer
+                                store={threadController.columns[slot]}
+                                composer={composerProps}
+                              />
+                            </div>
+                          </>
+                        ) : split ? (
+                          <>
+                            <StageHeader
+                              sessionId={besideSession?.session.id}
+                              title={besideSession?.session.title}
+                              pinned={besideSession?.session.pinned ?? false}
+                              projectPath={besideSession?.project.path ?? besideNewPath}
+                              checkpointCount={0}
+                              worktreeBranch={besideSession?.session.worktreeBranch}
+                              keybindings={keybindings}
+                              menuActions={keybindingActions}
+                              onOpenRollback={openRollback}
+                              onRenameSession={renameSidebarSession}
+                              onToggleSessionPin={toggleSidebarSessionPin}
+                              onArchiveSession={deleteSidebarSession}
+                              onClosePane={closeBesidePane}
+                            />
+                            <div
+                              className={`stage__conversation${besideId ? '' : ' is-new-session'}`}
+                            >
+                              {besideId ? (
+                                <AccountLabelContext.Provider value={accountLabel}>
+                                  <ModelNameContext.Provider value={modelName}>
+                                    <Suspense fallback={<ThreadSkeleton />}>
+                                      <LazyThread
+                                        key={split.frozen.entryKey}
+                                        frameStore={threadController.columns[slot]}
+                                        errorsInComposer
+                                        keyboardActive={false}
+                                        loading={loadingThreadId === besideId}
+                                        loadFailure={
+                                          historyFailure?.threadId === besideId
+                                            ? historyFailure.message
+                                            : undefined
+                                        }
+                                        onRetryLoad={retryOpenedHistory}
+                                        projectPath={besideSession?.project.path}
+                                        threadId={besideId}
+                                        transport={transport}
+                                        onSearchJumpDone={finishSearchJump}
+                                        revealRequest={split.frozen.revealRequest}
+                                        checkpoints={NO_CHECKPOINTS}
+                                        onDecide={decideBesideApproval}
+                                        onAnswerUserInput={answerBesideUserInput}
+                                        onEditMessage={editBesideMessage}
+                                        onRevertCheckpoint={revertCheckpoint}
+                                        onUndoChanges={undoTurnChanges}
+                                        onLoadOlderHistory={loadOlderHistory}
+                                        onLoadCompleteHistory={loadCompleteHistory}
+                                        turnRail
+                                      />
+                                    </Suspense>
+                                  </ModelNameContext.Provider>
+                                </AccountLabelContext.Provider>
+                              ) : (
+                                <Empty
+                                  projects={projects}
+                                  activePath={besideNewPath}
+                                  status={projectsStatus}
+                                  startupProjectName={startupProjectName}
+                                  onAddProject={addSidebarProject}
+                                  onRetry={retryProjects}
+                                />
+                              )}
+
+                              <PaneComposer
+                                store={threadController.columns[slot]}
+                                composer={split.frozen.composer}
+                                dormant
+                                queue={besideQueue}
+                              />
+                            </div>
+                          </>
+                        ) : null}
+                      </SplitPane>
+                    )
+                  })}
+                </div>
+              ) : null}
+              {surface === 'chat' ? <ChatDropOverlay store={chatDrop.store} /> : null}
+
+              {activePath && bottomTerminalMounted ? (
+                <div
+                  className={`bottom-terminal${terminalOpen ? ' is-open' : ''}${bottomTerminalPhase === 'closing' ? ' is-closing' : ''}${bottomTerminalPhase === 'closed' ? ' is-parked' : ''}`}
+                  style={{ height: terminalHeight }}
+                  data-testid="bottom-terminal"
+                  aria-hidden={bottomTerminalPhase === 'closed' ? true : undefined}
+                  inert={
+                    bottomTerminalPhase === 'closing' || bottomTerminalPhase === 'closed'
+                      ? true
+                      : undefined
+                  }
+                  onTransitionEnd={finishBottomTerminalMotion}
+                >
+                  <Suspense
+                    fallback={<WorkspacePanelSkeleton placement="bottom" open={terminalOpen} />}
+                  >
+                    <BottomWorkspacePanel
+                      placement="bottom"
+                      open={terminalOpen}
+                      expanded={false}
+                      width={terminalHeight}
+                      transport={transport}
+                      threadId={activeId}
+                      projectPath={activePath}
+                      projectName={activeProject ? displayName(activeProject) : undefined}
+                      branch={
+                        active?.session.worktreeBranch ?? workspace?.branch ?? pathBranches[0]
+                      }
+                      theme={themeColorScheme}
+                      sideChatParentStatus={sideChatParentStatus}
+                      sideChatStartOptions={sideChatStartOptions}
+                      nativeSurfacesVisible={
+                        surface === 'chat' &&
+                        !settingsOpen &&
+                        paletteScope === null &&
+                        !rollbackOpen &&
+                        !checkoutDelete &&
+                        !feedbackRequest
+                      }
+                      onOpen={openBottomPanel}
+                      onClose={closeTerminal}
+                      onWidthChange={setTerminalHeight}
+                      terminalToggleRequest={bottomTerminalToggleRequest}
+                      onOpenPullRequest={openCheckoutPullRequest}
+                    />
+                  </Suspense>
+                </div>
+              ) : null}
+            </div>
+          </main>
+
+          {workspacePanelHasMounted ? (
+            <Suspense
+              fallback={<WorkspacePanelSkeleton placement="right" open={workspacePanelOpen} />}
+            >
+              <RightWorkspacePanel
+                open={workspacePanelOpen}
+                expanded={workspacePanelExpanded}
+                width={workspacePanelWidth}
+                transport={transport}
+                threadId={activeId}
+                projectPath={activePath}
+                projectName={activeProject ? displayName(activeProject) : undefined}
+                branch={active?.session.worktreeBranch ?? workspace?.branch ?? pathBranches[0]}
+                theme={themeColorScheme}
+                sideChatParentStatus={sideChatParentStatus}
+                sideChatStartOptions={sideChatStartOptions}
+                sideChatPromptRequest={sideChatPromptRequest}
+                nativeSurfacesVisible={
+                  !settingsOpen &&
+                  paletteScope === null &&
+                  !rollbackOpen &&
+                  !checkoutDelete &&
+                  !feedbackRequest
+                }
+                onOpen={openWorkspacePanel}
+                onClose={closeWorkspacePanel}
+                onWidthChange={setWorkspacePanelWidth}
+                terminalToggleRequest={workspaceTerminalToggleRequest}
+                externalToolRequest={workspaceToolRequest}
+                frameStore={threadFrameStore}
+                subagentTranscript={
+                  providerStatuses.find((status) => status.id === activeSession?.provider)
+                    ?.capabilities?.subagentTranscript
+                }
+                imagesSupported={attachmentsSupported}
+                onAnnotationDraft={stageBrowserAnnotations}
+                designPreviewRequest={workspaceDesignPreviewRequest}
+                onOpenPullRequest={openCheckoutPullRequest}
+                providerLogin={
+                  providerLoginTerminal?.visible
+                    ? {
+                        id: providerLoginTerminal.id,
+                        title: `${providerLoginTerminal.displayName} ${providerLoginTerminal.operation === 'install' ? 'install' : 'login'}`,
+                        installKey: providerLoginTerminal.installKey,
+                        canCancelSignIn: providerLoginTerminal.operation !== 'install',
+                      }
+                    : undefined
+                }
+                onProviderLoginClose={closeProviderLoginTerminal}
+              />
+            </Suspense>
+          ) : null}
+        </div>
+      </div>
+
+      {SettingsView ? (
+        <div
+          className={`surface-enter${settingsReturning ? ' is-returning' : ''}`}
+          onAnimationEnd={coverShell}
+        >
+          <SurfaceErrorBoundary
+            name="Settings"
+            onClose={closeSettings}
+            fallback={<SettingsSkeleton section={settingsSection.section} />}
+          >
+            <SettingsView
+              initialSection={settingsSection.section}
+              sectionRequest={settingsSection.request}
+              showDebug={debugSettingsVisible}
+              provider={provider}
+              providerName={providerName(provider, sourceAgentName)}
+              transport={transport}
+              projectPath={activePath}
+              projectName={activeProject ? displayName(activeProject) : undefined}
+              // Right after the composer moves to another provider, `account` is
+              // still the last one's until the new read starts; Settings must
+              // not show it as the new provider's.
+              account={accountCheck.provider === provider ? account : undefined}
+              accountLoading={
+                accountCheck.provider !== provider || accountCheck.state === 'loading'
+              }
+              usageLimits={usageController}
+              profileIdentity={profileIdentity}
+              onProfileIdentityChange={updateProfileIdentity}
+              providerStatuses={providerStatuses}
+              acpAgents={acpAgents}
+              providerRoster={providerRoster}
+              onProviderRosterChange={changeProviderRoster}
+              providersView={settingsSection.view}
+              providersLoading={catalogAvailability === 'loading'}
+              models={models}
+              modelsLoading={catalogAvailability === 'loading'}
+              modelErrors={modelErrors}
+              pendingModelSources={pendingModelSources}
+              onModelsWanted={discoverEveryModelSource}
+              hiddenModels={hiddenModels}
+              onModelVisibilityChange={changeModelVisibility}
+              onModelsVisibilityChange={changeModelsVisibility}
+              providerDefaults={providerDefaultsControls}
+              onConnectionsChanged={refreshCatalog}
+              projectCount={projects.length}
+              projectsLoading={projectsStatus === 'loading'}
+              sidebarSettings={sidebarSettings}
+              onSidebarSettingsChange={updateSidebarSettings}
+              themePreference={themePreference}
+              themeColorScheme={themeColorScheme}
+              onThemePreferenceChange={setThemePreference}
+              appearancePreferences={appearancePreferences}
+              onAppearancePreferenceChange={updateAppearancePreference}
+              showMacOSFontSmoothing={macOS}
+              macOSFontSmoothing={macOSFontSmoothing}
+              onMacOSFontSmoothingChange={setMacOSFontSmoothing}
+              macOS={macOS}
+              keybindings={keybindings}
+              onKeybindingChange={changeKeybinding}
+              onKeybindingsReset={resetKeybindings}
+              showMacOSHaptics={isDesktop && macOS}
+              onAccountChange={handleAccountChange}
+              authRefreshRevision={providerAuthRefreshRevision}
+              onProviderLoginTerminalOpen={openProviderLoginTerminal}
+              onReset={resetSettings}
+              onForceOnboarding={forceOnboarding}
+              onClose={closeSettings}
+              onOpenChat={openChatFromSettings}
+            />
+          </SurfaceErrorBoundary>
+        </div>
+      ) : null}
+
+      {onboardingMounted ? (
+        <Suspense fallback={null}>
+          <Onboarding
+            hidden={settingsOpen || providerLoginTerminal !== undefined}
+            finished={!onboardingWanted}
+            displayName={profileIdentity.displayName}
+            onDisplayNameChange={(displayName) => updateProfileIdentity({ displayName })}
+            themePreference={themePreference}
+            onThemePreferenceChange={setThemePreference}
+            providerStatuses={providerStatuses}
+            providersLoading={catalogAvailability === 'loading'}
+            providersError={catalogAvailability === 'failed' ? catalogError?.message : undefined}
+            acpAgents={acpAgents}
+            providerRoster={providerRoster ?? EMPTY_PROVIDER_ROSTER}
+            onProviderRosterChange={changeProviderRoster}
+            transport={transport}
+            onAddProject={() => {
+              setOnboardingPreview(false)
+              void addProject()
+            }}
+            onDismiss={() => {
+              setOnboardingMounted(false)
+              if (onboardingPreview) {
+                setOnboardingPreview(false)
+                return
+              }
+              writeSetting(ONBOARDING_KEY, 'done')
+              setOnboardingDismissed(true)
+            }}
+          />
+        </Suspense>
+      ) : null}
+
+      {paletteScope ? (
+        <Suspense fallback={null}>
+          <CommandPalette
+            commands={commands}
+            scope={paletteScope}
+            deferredSearch={paletteChatSearch}
+            preferredCommandId={
+              paletteScope === 'new-thread' && preferredNewThreadProject
+                ? `new-chat-${encodeURIComponent(preferredNewThreadProject)}`
+                : undefined
+            }
+            onClose={closePalette}
+          />
+        </Suspense>
+      ) : null}
+
+      <SessionSearchHost
+        ref={sessionSearch}
+        transport={transport}
+        projects={archiveProjects}
+        hiddenThreadIds={archivingIds}
+        onSelect={selectSessionSearchResult}
+      />
+
+      {rollbackOpen ? (
+        <Suspense fallback={null}>
+          <RollbackDialog
+            checkpoints={checkpoints}
+            inspection={rollbackInspection}
+            loadingId={rollbackLoadingId}
+            restoring={rollbackRestoring}
+            onInspect={(checkpoint) => void inspectCheckpoint(checkpoint)}
+            onRestore={() => void restoreCheckpoint()}
+            onClose={() => {
+              rollbackInspectionRequest.current = undefined
+              setRollbackLoadingId(undefined)
+              setRollbackOpen(false)
+              setRollbackInspection(undefined)
+            }}
+          />
+        </Suspense>
+      ) : null}
+
+      {feedbackRequest ? (
+        <Suspense fallback={null}>
+          <FeedbackDialog
+            key={feedbackRequest.id}
+            transport={transport}
+            request={feedbackRequest}
+            status={feedback.status}
+            onSent={finishFeedback}
+            onStatusChange={feedback.refresh}
+            onClose={closeFeedback}
+          />
+        </Suspense>
+      ) : null}
+
+      {checkoutDelete ? (
+        <Suspense fallback={null}>
+          <CheckoutDiscardDialog
+            key={checkoutDelete.id}
+            title={checkoutDelete.title}
+            branch={checkoutDelete.branch}
+            busy={checkoutDeleteBusy}
+            onDiscard={() => void discardAndArchive()}
+            onClose={() => dropCheckoutDelete(checkoutDelete.id)}
+          />
+        </Suspense>
+      ) : null}
+
+      {/* A dropped connection used to be invisible: requests queued, pushes
+          stopped, the working rail kept counting, and nothing said why. */}
+      <ProviderUpdateNotice
+        transport={transport}
+        onUpdated={refreshCatalog}
+        suppressed={offline || Boolean(notice) || Boolean(actionError)}
+      />
+      {isDesktop ? (
+        <AppUpdateToast
+          hidden={settingsOpen}
+          quiet={pendingArchives.length > 0 && !archiveToastDismissed}
+        />
+      ) : null}
+      {pendingArchives.length > 0 ? (
+        <Suspense fallback={null}>
+          <ArchiveToast
+            count={pendingArchives.length}
+            visible={!archiveToastDismissed}
+            onUndo={undoArchive}
+            onDismiss={() => setArchiveToastDismissed(true)}
+          />
+        </Suspense>
+      ) : null}
+      <NoticePresence
+        className="notice notice--offline"
+        tone="progress"
+        role="status"
+        visible={offline && (settingsOpen || surface !== 'chat')}
+      >
+        <NoticeBody tone="progress">Reconnecting to the server…</NoticeBody>
+      </NoticePresence>
+
+      <NoticePresence className="notice" tone="error" role="alert" visible={Boolean(missingServer)}>
+        <NoticeBody tone="error">
+          {missingServer === 'gone'
+            ? "This window's TasteCode server has stopped. Restart TasteCode to continue."
+            : 'Another TasteCode is already running, so this window cannot reach its own server. Quit the other TasteCode, then restart this one.'}
+        </NoticeBody>
+      </NoticePresence>
+
+      <NoticePresence
+        className="notice"
+        tone="error"
+        role="alert"
+        visible={Boolean(actionError) && (settingsOpen || surface !== 'chat')}
+        onDismiss={() => setActionError(undefined)}
+        dismissKey={actionError}
+      >
+        <NoticeBody tone="error" onDismiss={() => setActionError(undefined)}>
+          {actionError?.message}
+        </NoticeBody>
+      </NoticePresence>
+
+      <NoticePresence
+        className="notice"
+        tone={noticeTone}
+        role="alert"
+        visible={Boolean(notice)}
+        dismissKey={notice}
+        autoDismissPaused={Boolean(undoRestore)}
+        onDismiss={() => {
+          setNotice(undefined)
+          setUndoRestore(undefined)
+          setReplacedDraft(undefined)
+        }}
+      >
+        <NoticeBody
+          tone={noticeTone}
+          actions={
+            <>
+              {notice === DRAFT_REPLACED_NOTICE && replacedDraft ? (
+                <button className="notice-action" type="button" onClick={restoreReplacedDraft}>
+                  Restore
+                </button>
+              ) : null}
+              {undoRestore ? (
+                <button
+                  className="notice-action notice-action--primary"
+                  type="button"
+                  onClick={() => void reverseRestore()}
+                >
+                  Undo restore
+                </button>
+              ) : null}
+            </>
+          }
+          onDismiss={() => {
+            setNotice(undefined)
+            setUndoRestore(undefined)
+          }}
+        >
+          {notice}
+        </NoticeBody>
+      </NoticePresence>
+    </div>
+  )
+}
+
+function readRailWidth(): number {
+  const stored = Number(readSetting(RAIL_WIDTH_KEY))
+  if (stored === 248 || stored === 276) return DEFAULT_RAIL_WIDTH
+  return Number.isFinite(stored) && stored >= 176 && stored <= 420 ? stored : DEFAULT_RAIL_WIDTH
+}
+
+/** A project name up to this long stays whole on one line in the new-chat heading; a longer one may wrap. */
+const EMPTY_PROJECT_NOWRAP = 28
+
+function Empty(props: {
+  projects: Project[]
+  activePath: string | undefined
+  status: 'loading' | 'ready' | 'failed'
+  startupProjectName: string | undefined
+  onAddProject: () => void
+  onRetry: () => void
+}) {
+  const activeProject = props.projects.find((project) => project.path === props.activePath)
+
+  // Before the first projects.list reply, "no projects" is not a fact yet —
+  // flashing the add-a-project prompt for one round trip reads as a glitch.
+  if (props.status === 'loading' && props.startupProjectName === undefined) {
+    return (
+      <SkeletonStatus label="Loading projects…" className="empty">
+        <Skeleton className="skeleton--block empty__skeleton-prompt" />
+      </SkeletonStatus>
+    )
+  }
+
+  if (props.status === 'failed') {
+    return (
+      <div className="empty">
+        <div className="empty__prompt" role="heading" aria-level={1}>
+          Projects could not be loaded.
+        </div>
+        <button className="btn" type="button" onClick={props.onRetry}>
+          Retry
+        </button>
+      </div>
+    )
+  }
+
+  if (props.status === 'ready' && props.projects.length === 0) {
+    return (
+      <div className="empty">
+        <div className="empty__prompt" role="heading" aria-level={1}>
+          Add a project to start building.
+        </div>
+        <button className="btn" type="button" onClick={props.onAddProject}>
+          Add project
+        </button>
+      </div>
+    )
+  }
+
+  const projectName = activeProject
+    ? displayName(activeProject)
+    : props.status === 'loading' && props.startupProjectName
+      ? props.startupProjectName
+      : 'a project'
+  return (
+    <div className="empty">
+      <div
+        className="empty__prompt"
+        role="heading"
+        aria-level={1}
+        // The name span would read as "in project ?" where layout is unknown; say it once, as shown.
+        aria-label={`What should we build in ${projectName}?`}
+      >
+        What should we build in{' '}
+        <span className={projectName.length <= EMPTY_PROJECT_NOWRAP ? 'empty__project' : undefined}>
+          {projectName}
+        </span>
+        ?
+      </div>
+    </div>
+  )
+}
+
+/** One provider account, as a key; the default account however it is named. */
+function chatAccountKey(provider: ProviderId, accountId: AccountId | undefined): string {
+  return `${provider}\u0000${accountId ?? DEFAULT_ACCOUNT_ID}`
+}
+
+/**
+ * The account a provider's own model list is read as: the one new chats start
+ * on, whose plan may offer other models. Undefined for the default account.
+ */
+function modelListAccount(
+  accounts: ProviderAccountsSnapshot,
+  provider: ProviderId,
+): AccountId | undefined {
+  const active = activeAccountOf(accounts, provider)
+  return active === DEFAULT_ACCOUNT_ID ? undefined : active
+}
+
+function providerName(id: ProviderId, sourceName?: string): string {
+  if (sourceName) return sourceName
+  // ACP is how we talk to the agent, not who the agent is. Showing "ACP" would
+  // name our plumbing instead of the thing the user chose.
+  if (id === 'acp') return 'ACP agent'
+  return providerDisplayName(id)
+}
+
+/**
+ * A finished design run — built, failed, or rejected — releases the toggle,
+ * so the next prompt in the thread is a normal turn instead of restarting
+ * the whole design flow from scratch.
+ */
+function endsDesignBriefing(event: DomainEvent): boolean {
+  if (event.type === 'thread.error') return event.message.startsWith('Design mode failed')
+  if (event.type !== 'item.completed' || event.item.role !== 'assistant') return false
+  const text = event.item.text ?? ''
+  return (
+    text.trim() ===
+      'Design mode was turned off because this request is not a website design task.' ||
+    text.startsWith('Website built.') ||
+    text.startsWith('Dashboard built.') ||
+    text.includes('DEBUG FINISHED · NO WEBSITE BUILT')
+  )
+}
+
+function affectsSessionStatus(event: DomainEvent): boolean {
+  return (
+    event.type === 'turn.started' ||
+    event.type === 'turn.completed' ||
+    event.type === 'approval.requested' ||
+    event.type === 'approval.resolved' ||
+    event.type === 'user_input.requested' ||
+    event.type === 'user_input.resolved' ||
+    event.type === 'thread.error'
+  )
+}
+
+/** Mirrors the server's sidebar status: an approval first, then a question from
+ *  the agent, then whether the turn still runs. */
+function statusFor(
+  state: ThreadState,
+  event: DomainEvent,
+  background: boolean,
+): Project['sessions'][number]['status'] {
+  if (event.type === 'thread.error') return 'failed'
+  if (event.type === 'turn.completed')
+    return event.status === 'failed' ? 'failed' : background ? 'ready' : 'idle'
+  if (state.approvals.length > 0) return 'approval'
+  if (state.userInputs.length > 0) return 'input'
+  return state.running ? 'working' : 'idle'
+}
+
+/** The chat runs a turn, starts one, or its turn waits on the user. */
+function runsTurn(status: Project['sessions'][number]['status'] | undefined): boolean {
+  return (
+    status === 'starting' || status === 'working' || status === 'approval' || status === 'input'
+  )
+}
+
+function withStoppingRow(
+  rows: ReadonlyMap<string, number>,
+  threadId: string,
+  stoppedAt: number,
+): ReadonlyMap<string, number> {
+  return rows.has(threadId) ? rows : new Map(rows).set(threadId, stoppedAt)
+}
+
+function withoutStoppingRow(
+  rows: ReadonlyMap<string, number>,
+  threadId: string,
+): ReadonlyMap<string, number> {
+  if (!rows.has(threadId)) return rows
+  const next = new Map(rows)
+  next.delete(threadId)
+  return next.size === 0 ? NO_STOPPING_ROWS : next
+}
+
+function basename(path: string): string {
+  const parts = path.split(/[\\/]/).filter(Boolean)
+  return parts[parts.length - 1] ?? path
+}
+
+function readTerminalHeight(): number {
+  const stored = Number(readSetting(TERMINAL_HEIGHT_KEY))
+  const height = Number.isFinite(stored) && stored >= 160 ? stored : DEFAULT_BOTTOM_PANEL_HEIGHT
+  return Math.min(height, Math.max(160, Math.floor(window.innerHeight * 0.72)))
+}
+
+function readWorkspacePanelWidth(): number {
+  return restoreWorkspacePanelWidth(
+    Number(readSetting(WORKSPACE_PANEL_WIDTH_KEY)),
+    window.innerWidth,
+  )
+}
+
+function displayName(project: { path: string; name?: string | undefined }): string {
+  return project.name ?? basename(project.path)
+}
+
+/** The first thing a user types is the best title we get for free. */
+export function titleFrom(text: string): string {
+  const clean = text.trim().replace(/\s+/g, ' ')
+  return clean.length > 40 ? `${sliceCodeUnits(clean, 40)}…` : clean
+}
+
+/**
+ * Applied locally as well as sent to the server, so the rail updates as the
+ * message is sent rather than a round trip later.
+ */
+function renameSession(projects: Project[], threadId: string, title: string): Project[] {
+  return updateSession(projects, threadId, (session) =>
+    session.title === title ? session : { ...session, title },
+  )
+}
+
+function loadProjectOrder(): string[] {
+  return parseStoredProjectOrder(readSetting(PROJECT_ORDER_KEY))
+}
+
+let lastSavedProjectOrder: string[] | undefined
+
+function saveProjectOrder(projects: Project[]): void {
+  if (lastSavedProjectOrder?.length === projects.length) {
+    let unchanged = true
+    for (let index = 0; index < projects.length; index += 1) {
+      if (lastSavedProjectOrder[index] !== projects[index]?.path) {
+        unchanged = false
+        break
+      }
+    }
+    if (unchanged) return
+  }
+
+  lastSavedProjectOrder = projects.map((project) => project.path)
+  writeSetting(PROJECT_ORDER_KEY, JSON.stringify(lastSavedProjectOrder))
+}
+
+function loadSessionOrder() {
+  return parseStoredSessionOrder(readSetting(SESSION_ORDER_KEY))
+}
+
+const serializeSessionOrder = createSessionOrderSerializer()
+
+function saveSessionOrder(projects: Project[], dragged: ReadonlySet<string>): void {
+  const serialized = serializeSessionOrder(projects.filter((project) => dragged.has(project.path)))
+  if (serialized === undefined) return
+  writeSetting(SESSION_ORDER_KEY, serialized)
+}
+
+function readStartupProjectName(): string | undefined {
+  return readSetting(STARTUP_PROJECT_NAME_KEY) || undefined
+}
+
+function saveStartupProjectName(project: Project | undefined): void {
+  const name = project ? displayName(project) : undefined
+  if ((readSetting(STARTUP_PROJECT_NAME_KEY) ?? undefined) === name) return
+  if (name) writeSetting(STARTUP_PROJECT_NAME_KEY, name)
+  else removeSetting(STARTUP_PROJECT_NAME_KEY)
+}
+
+type PendingChatDelete = {
+  threadId: string
+  checkout: 'keep' | 'discard' | 'force-discard'
+}
+
+function readPendingChatDeletes(): PendingChatDelete[] {
+  try {
+    const stored: unknown = JSON.parse(readSetting(PENDING_CHAT_DELETES_KEY) ?? '[]')
+    if (!Array.isArray(stored)) return []
+    return stored.filter(
+      (entry): entry is PendingChatDelete =>
+        isRecord(entry) &&
+        typeof entry['threadId'] === 'string' &&
+        (entry['checkout'] === 'keep' ||
+          entry['checkout'] === 'discard' ||
+          entry['checkout'] === 'force-discard'),
+    )
+  } catch {
+    return []
+  }
+}
+
+function savePendingChatDelete(pending: PendingChatDelete): void {
+  const others = readPendingChatDeletes().filter((entry) => entry.threadId !== pending.threadId)
+  writeSetting(PENDING_CHAT_DELETES_KEY, JSON.stringify([...others, pending]))
+}
+
+function forgetPendingChatDeletes(threadIds: readonly string[]): void {
+  const stored = readPendingChatDeletes()
+  const remaining = stored.filter((entry) => !threadIds.includes(entry.threadId))
+  if (remaining.length === stored.length) return
+  if (remaining.length) writeSetting(PENDING_CHAT_DELETES_KEY, JSON.stringify(remaining))
+  else removeSetting(PENDING_CHAT_DELETES_KEY)
+}
+
+type SourceSelection = {
+  modelKey: string
+  effort?: string
+  serviceTier?: string
+}
+
+type ThreadSelection = SourceSelection & { designMode?: boolean }
+
+function readThreadModelSelection(threadId: string | undefined): ThreadSelection | undefined {
+  if (!threadId) return undefined
+  try {
+    const value: unknown = JSON.parse(readSetting(`${MODEL_BY_THREAD_PREFIX}${threadId}`) ?? 'null')
+    if (
+      !isRecord(value) ||
+      typeof value['modelKey'] !== 'string' ||
+      (value['effort'] !== undefined && typeof value['effort'] !== 'string') ||
+      (value['serviceTier'] !== undefined && typeof value['serviceTier'] !== 'string') ||
+      (value['designMode'] !== undefined && typeof value['designMode'] !== 'boolean')
+    )
+      return undefined
+    return {
+      modelKey: value['modelKey'],
+      ...(value['effort'] !== undefined ? { effort: value['effort'] } : {}),
+      ...(value['serviceTier'] !== undefined ? { serviceTier: value['serviceTier'] } : {}),
+      ...(value['designMode'] !== undefined ? { designMode: value['designMode'] } : {}),
+    }
+  } catch {
+    return undefined
+  }
+}
+
+function writeThreadModelSelection(threadId: string, selection: ThreadSelection): void {
+  writeSetting(`${MODEL_BY_THREAD_PREFIX}${threadId}`, JSON.stringify(selection))
+}
+
+type ApprovalPreferences = Partial<Record<DefaultsScope, ApprovalMode>>
+
+function readApprovalPreferences(activeProvider: ProviderId) {
+  const preferences: ApprovalPreferences = {}
+  try {
+    const stored: unknown = JSON.parse(readSetting(APPROVAL_BY_PROVIDER_KEY) ?? '{}')
+    if (isRecord(stored)) {
+      for (const [scope, mode] of Object.entries(stored)) {
+        if (isDefaultsScope(scope) && isApprovalMode(mode)) preferences[scope] = mode
+      }
+    }
+  } catch {
+    // A malformed map should not discard the valid preference from older versions.
+  }
+
+  if (preferences[activeProvider] === undefined) {
+    const legacy = readSetting(APPROVAL_KEY)
+    if (isApprovalMode(legacy)) preferences[activeProvider] = legacy
+  }
+  return preferences
+}
+
+function isApprovalMode(value: unknown): value is ApprovalMode {
+  return value === 'ask' || value === 'auto' || value === 'auto-review' || value === 'full'
+}
+
+function readSourceSelections(): Record<string, SourceSelection> {
+  try {
+    const stored: unknown = JSON.parse(readSetting(MODEL_BY_SOURCE_KEY) ?? '{}')
+    if (!isRecord(stored)) return {}
+    const selections: Array<[string, SourceSelection]> = []
+    for (const [source, selection] of Object.entries(stored)) {
+      if (
+        !isRecord(selection) ||
+        typeof selection['modelKey'] !== 'string' ||
+        (selection['effort'] !== undefined && typeof selection['effort'] !== 'string') ||
+        (selection['serviceTier'] !== undefined && typeof selection['serviceTier'] !== 'string')
+      ) {
+        return {}
+      }
+      selections.push([
+        source,
+        {
+          modelKey: selection['modelKey'],
+          ...(selection['effort'] !== undefined ? { effort: selection['effort'] } : {}),
+          ...(selection['serviceTier'] !== undefined
+            ? { serviceTier: selection['serviceTier'] }
+            : {}),
+        },
+      ])
+    }
+    return Object.fromEntries(selections)
+  } catch {
+    return {}
+  }
+}
+
+function readModelEfforts(): Record<string, string> {
+  try {
+    const stored: unknown = JSON.parse(readSetting(EFFORT_BY_MODEL_KEY) ?? '{}')
+    if (!isRecord(stored)) return {}
+    return Object.fromEntries(
+      Object.entries(stored).filter(
+        (entry): entry is [string, string] => typeof entry[1] === 'string',
+      ),
+    )
+  } catch {
+    return {}
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((entry) => typeof entry === 'string')
+}
+
+/**
+ * The saved visibility record. A profile an older build saved as one hidden
+ * list is imported once: what the user hid stays hidden, and everything else
+ * returns to the current defaults, so an older generation the list still
+ * showed gives way to its successor.
+ */
+function readModelVisibility(): ModelVisibilityRecord {
+  const saved = parseModelVisibility(readSetting(MODEL_VISIBILITY_KEY))
+  if (saved) return saved
+  let legacyHidden: string[] = []
+  try {
+    const stored: unknown = JSON.parse(readSetting(LEGACY_HIDDEN_MODELS_KEY) ?? '[]')
+    if (isStringArray(stored)) legacyHidden = stored
+  } catch {
+    // An unreadable list leaves every model on its default.
+  }
+  if (legacyHidden.length === 0) return EMPTY_MODEL_VISIBILITY
+  const rows: Record<string, string> = {}
+  try {
+    const stored: unknown = JSON.parse(readSetting(LEGACY_MODEL_VISIBILITY_ROWS_KEY) ?? 'null')
+    if (isRecord(stored)) {
+      for (const [key, version] of Object.entries(stored)) {
+        if (typeof version === 'string') rows[key] = version
+      }
+    }
+  } catch {
+    // Without the row record every row is where the list's version says.
+  }
+  legacyHidden = legacyHiddenChoices(
+    legacyHidden,
+    readSetting(LEGACY_MODEL_VISIBILITY_VERSION_KEY),
+    rows,
+  )
+  if (legacyHidden.length === 0) return EMPTY_MODEL_VISIBILITY
+  // Only on the first launch after the upgrade: the sources the cached
+  // catalog lists are imported now, the others once they are listed.
+  const launchCatalog = parseModelCatalogCache(readSetting(MODEL_CATALOG_KEY))?.models ?? []
+  return importLegacyModelVisibility(legacyHidden, launchCatalog, Date.now())
+}
+
+function isProviderId(value: unknown): value is ProviderId {
+  return typeof value === 'string' && PROVIDER_ID_SET.has(value as ProviderId)
+}
+
+/**
+ * The versioned catalog cache does not exist on the first launch after this
+ * feature ships. Rebuild the one selected entry from existing preferences so
+ * that upgrade launch is instant too; the full validated catalog replaces it
+ * as soon as discovery finishes.
+ */
+function readStoredModelChoice(customModels: CustomModel[] = []): ModelChoice | undefined {
+  const storedProvider = readSetting(SETUP_KEY)
+  const provider = PROVIDER_IDS.find((id) => id === storedProvider)
+  if (!provider) return undefined
+  const storedKey = readSetting(MODEL_KEY)
+  if (!storedKey) return undefined
+  // A custom selection survives a cache miss: rebuild its choice straight
+  // from the stored entry instead of treating the key as a raw model id.
+  if (storedKey.startsWith('custom:')) {
+    const custom = customModels.find((entry) => customModelKey(entry) === storedKey)
+    if (!custom) return undefined
+    return customModelChoice(
+      custom,
+      providerDisplayName(custom.provider),
+      providerMark(custom.provider),
+    )
+  }
+  const storedAgentId = provider !== 'api' ? (readSetting(AGENT_KEY) ?? undefined) : undefined
+  const agentId =
+    provider === 'acp' || provider === 'pi'
+      ? storedAgentId
+      : storedAgentId && storedKey.startsWith(`${provider}:${storedAgentId}:`)
+        ? storedAgentId
+        : undefined
+  if ((provider === 'acp' || provider === 'pi') && !agentId) return undefined
+  const agentName = agentId ? (readSetting(AGENT_NAME_KEY) ?? agentId) : undefined
+  const separator = storedKey.lastIndexOf(':')
+  const storedSource = separator > 0 ? storedKey.slice(0, separator) : undefined
+  const connectionId =
+    provider === 'api' && storedSource?.startsWith('api:')
+      ? storedSource.slice('api:'.length)
+      : undefined
+  if (provider === 'api' && !connectionId) return undefined
+  const expectedSource = sourceKey({ provider, connectionId, agentId })
+  const canonical = storedKey.startsWith(`${expectedSource}:`)
+  if (provider === 'api' && !canonical) return undefined
+
+  let modelId: string
+  if (canonical) {
+    const encodedModelId = storedKey.slice(expectedSource.length + 1)
+    if (!encodedModelId) return undefined
+    try {
+      modelId = encodedModelId === 'automatic' ? '' : decodeURIComponent(encodedModelId)
+    } catch {
+      return undefined
+    }
+  } else {
+    // Older builds stored only the raw model id. Keeping this migration path
+    // avoids making the very first cache-enabled launch the one slow launch.
+    modelId = storedKey
+  }
+  const key = canonical ? storedKey : modelChoiceKey(expectedSource, modelId)
+
+  const effort = readSetting(EFFORT_KEY) ?? undefined
+  const agent = agentId && agentName ? { id: agentId, name: agentName } : undefined
+  return {
+    key,
+    provider,
+    sourceName: provider === 'api' ? 'API connection' : providerName(provider, agentName),
+    mark: provider === 'acp' && agentId ? agentMark(agentId) : providerMark(provider),
+    ...(connectionId ? { connectionId } : {}),
+    ...(agent ? { agent } : {}),
+    model: {
+      id: modelId,
+      displayName: modelId || 'Provider default',
+      isDefault: true,
+      reasoningEfforts: effort ? [effort] : [],
+      ...(effort ? { defaultReasoningEffort: effort } : {}),
+      serviceTiers: [],
+    },
+  }
+}
+
+/**
+ * Skip an initial write only when storage already contains the normalized
+ * value. Missing defaults and invalid saved values keep their old self-healing
+ * write, while later state transitions stay unconditional. The pending marker
+ * also survives Strict Mode's repeated effect setup and delayed writes.
+ */
+function usePersistedSettingChange(
+  key: string,
+  value: string | undefined,
+  delayMs = 0,
+): () => void {
+  const [initialStored] = useState(() => readSetting(key))
+  const previous = useRef({ key, value })
+  const initialPersistencePending = useRef(true)
+  const pending = useRef<
+    | {
+        timeout: number
+        persist: () => void
+      }
+    | undefined
+  >(undefined)
+  const cancelPending = useCallback(() => {
+    const current = pending.current
+    if (!current) return
+    window.clearTimeout(current.timeout)
+    pending.current = undefined
+  }, [])
+  const flushPending = useCallback(() => {
+    const current = pending.current
+    if (!current) return
+    window.clearTimeout(current.timeout)
+    pending.current = undefined
+    current.persist()
+  }, [])
+
+  useEffect(() => {
+    if (delayMs <= 0) return
+    window.addEventListener('pagehide', flushPending)
+    return () => window.removeEventListener('pagehide', flushPending)
+  }, [delayMs, flushPending])
+
+  useEffect(() => {
+    const changed = previous.current.key !== key || previous.current.value !== value
+    previous.current = { key, value }
+    const initial = initialPersistencePending.current
+    const serialized = value ?? null
+    if (initial ? initialStored === serialized : !changed) {
+      initialPersistencePending.current = false
+      return
+    }
+
+    const persist = () => {
+      initialPersistencePending.current = false
+      if (value === undefined) removeSetting(key)
+      else writeSetting(key, value)
+    }
+    if (delayMs <= 0) {
+      persist()
+      return
+    }
+    const timeout = window.setTimeout(() => {
+      if (pending.current?.timeout !== timeout) return
+      pending.current = undefined
+      persist()
+    }, delayMs)
+    pending.current = { timeout, persist }
+    return () => {
+      if (pending.current?.timeout !== timeout) return
+      window.clearTimeout(timeout)
+      pending.current = undefined
+    }
+  }, [delayMs, initialStored, key, value])
+  return cancelPending
+}
+
+/**
+ * localStorage writes fail in private windows and at quota — several of ours
+ * ran inside layout effects, where an uncaught throw unmounts the whole app.
+ * Reads were always defensive; writes get the same courtesy.
+ */
+function writeSetting(key: string, value: string): void {
+  try {
+    localStorage.setItem(key, value)
+  } catch {
+    // A lost preference beats a white screen.
+  }
+}
+
+/** What each provider's last voice.status said, so the composer can show it before the next read answers. */
+const VOICE_AVAILABLE_KEY = 'harness.voiceAvailable'
+
+function rememberedVoice(provider: ProviderId): boolean | undefined {
+  const value = readSetting(`${VOICE_AVAILABLE_KEY}:${provider}`)
+  return value === 'true' ? true : value === 'false' ? false : undefined
+}
+
+/** With site data blocked, merely touching localStorage throws SecurityError —
+ *  and most reads run inside useState initializers on first render. */
+function readSetting(key: string): string | null {
+  try {
+    return localStorage.getItem(key)
+  } catch {
+    return null
+  }
+}
+
+function removeSetting(key: string): void {
+  try {
+    localStorage.removeItem(key)
+  } catch {
+    // Nothing to lose.
+  }
+}
+
+/**
+ * Save the catalog snapshot with each validated source's age. A catalog the
+ * reader would reject drops the key instead: an outgrown snapshot is never
+ * read again, and keeping the last one that fit would paint models a source
+ * no longer lists.
+ */
+function writeModelCatalogCache(
+  models: ModelChoice[],
+  validatedSources: ReadonlyMap<string, number>,
+): void {
+  const raw = serializeModelCatalogCache(models, {
+    validatedSources: validatedSources.keys(),
+    // A later completion must not refresh an earlier source's age.
+    validatedAt: Math.min(...validatedSources.values()),
+  })
+  if (raw === undefined) removeSetting(MODEL_CATALOG_KEY)
+  else writeSetting(MODEL_CATALOG_KEY, raw)
+}

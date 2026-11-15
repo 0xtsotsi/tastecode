@@ -1,0 +1,104 @@
+import { runInNewContext } from 'node:vm'
+import { describe, expect, it, vi } from 'vitest'
+import {
+  DESIGN_MOTION_GUIDANCE,
+  designMotionGuidance,
+  REFERENCE_REVEAL_SOURCE,
+} from './motion-guidance.js'
+import type { PageBlueprint } from './page.js'
+import { websiteMotion } from './website-motion.js'
+
+// Dashboards are parked behind DASHBOARD_REFERENCES_ENABLED; these tests keep that path working.
+vi.mock('./dashboard-references.js', () => ({ DASHBOARD_REFERENCES_ENABLED: true }))
+
+it('selects operational motion from the brief or saved page architecture', () => {
+  const dashboard = designMotionGuidance({
+    pageType: 'dashboard',
+    originalRequest: 'Build a finance workspace.',
+  })
+  expect(dashboard).toContain('filters, sorting, tabs, navigation, drawers and chart controls')
+  expect(dashboard).toContain('keyboard operation')
+  expect(dashboard).toContain('prefers-reduced-motion')
+  expect(dashboard).not.toContain('Plan and implement a visible hero entrance')
+  expect(dashboard).toContain('Use one shared duration and easing pair for these transitions')
+  // SAFETY: Only architecture.mode is read from this saved-page fixture.
+  expect(
+    designMotionGuidance(undefined, { architecture: { mode: 'operate_monitor' } } as PageBlueprint),
+  ).toBe(dashboard)
+  expect(
+    designMotionGuidance({
+      pageType: 'landing_page',
+      originalRequest: 'A landing page for our analytics dashboard.',
+    }),
+  ).toBe(DESIGN_MOTION_GUIDANCE)
+  expect(designMotionGuidance()).toBe(DESIGN_MOTION_GUIDANCE)
+})
+
+it('keeps the reveals mode as one reused motion vocabulary instead of an effect per section', () => {
+  const reveals = websiteMotion('reveals').guidance
+  expect(reveals).toContain(
+    'Give the page one motion vocabulary: two or three named reveal types (for example rise, slide and media) with shared durations, easing and stagger, reused across sections',
+  )
+  expect(reveals).toContain('instead of inventing its own effect')
+  expect(reveals).toContain('Do not apply the same fade-up to every section')
+})
+
+describe('reference reveal lifecycle', () => {
+  it('never hides painted content, replays, or leaves hidden content after cleanup/reduced motion', () => {
+    let enter: (entries: unknown[]) => void
+    let preference: () => void
+    const reduced = {
+      matches: false,
+      addEventListener: (_: string, fn: () => void) => {
+        preference = fn
+      },
+      removeEventListener: vi.fn(),
+    }
+    const observer = { observe: vi.fn(), unobserve: vi.fn(), disconnect: vi.fn() }
+    const makeElement = (top: number) => ({
+      dataset: {} as Record<string, string>,
+      getBoundingClientRect: () => ({ top, bottom: top + 1600 }),
+      animate: vi.fn(() => ({
+        pause: vi.fn(),
+        play: vi.fn(),
+        cancel: vi.fn(),
+        onfinish: undefined as undefined | (() => void),
+      })),
+    })
+    const visible = makeElement(200)
+    const below = makeElement(1200)
+    const later = makeElement(3000)
+    const root = { querySelectorAll: () => [visible, below, later] }
+    const install = runInNewContext(
+      REFERENCE_REVEAL_SOURCE.replace('export function', 'function') + '\ninstallReferenceReveals',
+      {
+        document: { visibilityState: 'visible' },
+        innerHeight: 800,
+        matchMedia: () => reduced,
+        IntersectionObserver: function (callback: typeof enter, options: unknown) {
+          enter = callback
+          expect(options).toEqual({ threshold: 0, rootMargin: '0px 0px 96px 0px' })
+          return observer
+        },
+      },
+    )
+    const cleanup = install(root)
+    expect(visible.animate).not.toHaveBeenCalled()
+    const animation = below.animate.mock.results[0]!.value
+    expect(animation.pause).toHaveBeenCalledOnce()
+    enter!([{ target: below, isIntersecting: true, boundingClientRect: { bottom: 1800 } }])
+    expect(observer.unobserve).toHaveBeenCalledWith(below)
+    expect(animation.play).toHaveBeenCalledOnce()
+    animation.onfinish!()
+    expect(animation.cancel).toHaveBeenCalledOnce()
+    reduced.matches = true
+    preference!()
+    expect(later.animate.mock.results[0]!.value.cancel).toHaveBeenCalledOnce()
+    cleanup()
+    reduced.matches = false
+    install(root)()
+    expect(below.animate).toHaveBeenCalledOnce()
+    expect(later.animate).toHaveBeenCalledOnce()
+    expect(reduced.removeEventListener).toHaveBeenCalled()
+  })
+})

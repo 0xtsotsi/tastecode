@@ -1,0 +1,909 @@
+import { createHash } from 'node:crypto'
+import { statSync } from 'node:fs'
+import path from 'node:path'
+import { DEFAULT_ACCOUNT_ID } from '@harness/contracts'
+import type {
+  DomainEvent,
+  Item,
+  ProviderHistoryListOptions,
+  ProviderHistorySession,
+  ProviderHistorySource,
+  ProviderId,
+} from '@harness/contracts'
+import { Store, type ProviderHistoryListing } from './store.js'
+import { projectHistoryItems, withoutContinuationContext } from './side-chat.js'
+import {
+  DESIGN_FOLLOW_UP_NOTICE,
+  DESIGN_PHASE_MARKER,
+  RESTORE_CONTEXT_NOTICE,
+} from './provider-session.js'
+import { withoutUnreadSubagentResults } from './subagent-broker.js'
+
+type Source = {
+  provider: ProviderId
+  history: ProviderHistorySource
+  forAccount?(accountHome: string): Promise<ProviderHistorySource>
+}
+type Imported = {
+  provider: ProviderId
+  threadId: string
+  session: ProviderHistorySession
+  loadedRevision: string | null
+}
+
+/** Metadata is refreshed in the background; transcripts are read only when opened. */
+export class ProviderHistory {
+  #entries = new Map<string, Imported>()
+  #byThread = new Map<string, Imported>()
+  #refreshing: Promise<boolean> | undefined
+  #reading = new Map<string, Promise<boolean>>()
+  /** Internal sessions are never imported, so one absent copy stays absent. */
+  #internalWithoutCopy = new Set<string>()
+  /** Settles once each provider's first scan is done, whether it found anything or failed. */
+  #scanned = new Map<ProviderId, { done: Promise<void>; settle: () => void }>()
+  /** Each source's stored listings, read from the store at its first scan. */
+  #listings = new Map<ProviderId, Map<string, ProviderHistoryListing>>()
+  #closed = false
+  #accountSources = new Map<string, Promise<ProviderHistorySource>>()
+  /** What each source listed at its last scan, project or not, for the import list. */
+  #listed = new Map<ProviderId, ProviderHistorySession[]>()
+  /** Sources whose latest scan failed, so nobody waits on a listing that is not coming. */
+  #listFailed = new Set<ProviderId>()
+
+  constructor(
+    private store: Store,
+    private sources: Source[],
+    private hooks: {
+      isBusy(threadId: string): boolean
+      canImport?(): boolean
+      changed(threadIds: string[]): void
+      log(message: string): void
+      accountHome?(threadId: string): string | undefined
+    },
+  ) {
+    for (const entry of store.providerHistories()) this.#remember(entry)
+    for (const { provider } of sources) {
+      let settle!: () => void
+      const done = new Promise<void>((resolve) => (settle = resolve))
+      this.#scanned.set(provider, { done, settle })
+    }
+  }
+
+  /**
+   * Resolves once this provider's saved sessions were scanned for the first
+   * time. A chat of one provider needs only its own scan before it is read or
+   * continued; a large Claude history took 30-180 s, and a Codex turn waited
+   * for all of it.
+   */
+  scanned(provider: ProviderId): Promise<void> {
+    if (this.#closed) return Promise.resolve()
+    return this.#scanned.get(provider)?.done ?? Promise.resolve()
+  }
+
+  /** Whether a saved provider session is linked to this chat, so a load may merge outside turns. */
+  hasCopy(threadId: string): boolean {
+    const entry = this.#byThread.get(threadId)
+    return entry !== undefined && !entry.session.internal
+  }
+
+  /** A source that has no listing to offer because its scan failed. */
+  listFailed(provider: ProviderId): boolean {
+    return this.#listFailed.has(provider) && !this.#listed.has(provider)
+  }
+
+  /** The providers that have a saved-session source. */
+  providers(): ProviderId[] {
+    return this.sources.map(({ provider }) => provider)
+  }
+
+  /**
+   * What a provider saved that a user could import: every session of its last
+   * scan, wherever it ran, except helper conversations and sessions a chat
+   * left, which a deleted chat counts as. Undefined until that scan is done.
+   */
+  savedSessions(
+    provider: ProviderId,
+  ): Array<{ session: ProviderHistorySession; imported: boolean }> | undefined {
+    const listed = this.#listed.get(provider)
+    if (!listed) return undefined
+    const source = this.sources.find((candidate) => candidate.provider === provider)
+    const resolve = (id: string) => source?.history.resolveSessionId?.(id) ?? id
+    const native = new Set(
+      this.store
+        .nativeProviderThreads(provider)
+        .map((thread) => resolve(thread.providerSessionId ?? thread.id)),
+    )
+    const left = new Set(this.store.leftProviderSessions(provider).map(resolve))
+    return listed.flatMap((session) => {
+      if (session.internal || !session.id || left.has(session.id)) return []
+      if (!path.isAbsolute(session.workspacePath) || !Number.isFinite(session.createdAt)) return []
+      const entry = this.#entries.get(`${provider}:${session.id}`)
+      if (entry?.session.internal) return []
+      const imported =
+        native.has(session.id) || (entry !== undefined && !!this.store.thread(entry.threadId))
+      return [{ session, imported }]
+    })
+  }
+
+  /**
+   * Makes a saved session a chat now, without waiting for a scan. `title`
+   * replaces the provider's own for this chat; later scans keep it.
+   */
+  adopt(
+    provider: ProviderId,
+    session: ProviderHistorySession,
+    projectPath: string,
+    title?: string,
+  ): string {
+    const threadId = `external:${provider}:${session.id}`
+    if (!this.store.thread(threadId)) {
+      this.store.addProviderThread(
+        threadId,
+        provider,
+        title ? { ...session, title } : session,
+        projectPath,
+      )
+      this.#internalWithoutCopy.delete(threadId)
+    }
+    if (session.approval && this.store.threadApproval(threadId) === undefined)
+      this.store.setThreadApproval(threadId, session.approval)
+    this.store.saveProviderHistory(provider, threadId, session)
+    this.#remember({ provider, threadId, session, loadedRevision: null })
+    return threadId
+  }
+
+  /**
+   * Keeps a saved session out of its folder's chats, the way a scan keeps out
+   * a removed copy. A scan imports everything saved in a project's folder, so
+   * without this a folder that became a project for one chosen chat would
+   * bring in all the others. Importing it later still works.
+   */
+  holdBack(provider: ProviderId, session: ProviderHistorySession): void {
+    if (this.#entries.has(`${provider}:${session.id}`)) return
+    const threadId = `external:${provider}:${session.id}`
+    if (this.store.thread(threadId)) return
+    this.store.saveProviderHistory(provider, threadId, session)
+    this.#remember({ provider, threadId, session, loadedRevision: null })
+  }
+
+  /** Native child history is read on demand; it never starts or resumes an engine. */
+  async readSubagentTranscript(threadId: string, itemId: string): Promise<Item[]> {
+    const thread = this.store.thread(threadId)
+    if (!thread) throw new Error('Thread not found')
+    const item = this.store.itemSnapshot(threadId, itemId)
+    if (!item?.subagent || item.type !== 'tool_call' || item.subagent.threadId) {
+      throw new Error('Native subagent not found in this thread')
+    }
+    const registered = this.sources.find(({ provider }) => provider === thread.provider)
+    if (this.#closed || !registered?.history.readSubagentTranscript) return []
+    const namedAccount = thread.accountId !== undefined && thread.accountId !== DEFAULT_ACCOUNT_ID
+    if (namedAccount && !this.hooks.accountHome) return []
+    const accountHome = this.hooks.accountHome?.(threadId)
+    if (namedAccount && accountHome === undefined) return []
+    let source = registered.history
+    if (accountHome !== undefined) {
+      if (!registered.forAccount) return []
+      const key = `${thread.provider}\0${accountHome}`
+      let pending = this.#accountSources.get(key)
+      if (!pending) {
+        pending = registered.forAccount(accountHome).catch((error: unknown) => {
+          this.#accountSources.delete(key)
+          throw error
+        })
+        this.#accountSources.set(key, pending)
+      }
+      source = await pending
+    }
+    if (this.#closed || !source.readSubagentTranscript) return []
+    const linked = this.#byThread.get(threadId)
+    const session =
+      accountHome === undefined && linked?.provider === thread.provider ? linked.session : undefined
+    const id = thread.providerSessionId ?? session?.id
+    if (!id) return []
+    return source.readSubagentTranscript(
+      session?.id === id
+        ? session
+        : {
+            id,
+            workspacePath: thread.worktreePath ?? thread.projectPath,
+            title: thread.title,
+            createdAt: thread.createdAt,
+            updatedAt: thread.lastActiveAt,
+            revision: '',
+          },
+      item,
+    )
+  }
+
+  /**
+   * Drops what links a chat to a provider's saved session, after the chat
+   * moved to another provider. That session stays the chat's own (the store
+   * keeps it as one the chat left), so a later scan neither imports nor reads it.
+   */
+  forget(threadId: string): void {
+    const entry = this.#byThread.get(threadId)
+    if (!entry) return
+    this.#byThread.delete(threadId)
+    const key = `${entry.provider}:${entry.session.id}`
+    if (this.#entries.get(key)?.threadId === threadId) this.#entries.delete(key)
+  }
+
+  #remember(entry: Imported): void {
+    const previous = this.#entries.get(`${entry.provider}:${entry.session.id}`)
+    if (previous && previous.threadId !== entry.threadId) this.#byThread.delete(previous.threadId)
+    this.#entries.set(`${entry.provider}:${entry.session.id}`, entry)
+    this.#byThread.set(entry.threadId, entry)
+  }
+
+  /**
+   * Callbacks that let a source skip transcripts it listed before, also across
+   * restarts: a cold Claude listing read 3 GB. `save` stores what the source
+   * computed and, after a complete listing, forgets transcripts it no longer named.
+   */
+  #listing(provider: ProviderId) {
+    const stored = this.#listings.get(provider) ?? this.store.providerHistoryMetadata(provider)
+    this.#listings.set(provider, stored)
+    const named = new Set<string>()
+    const remembered = new Map<string, ProviderHistoryListing>()
+    return {
+      options: {
+        cached: (locator, revision) => {
+          named.add(locator)
+          const entry = stored.get(locator)
+          return entry?.revision === revision ? entry.session : undefined
+        },
+        remember: (locator, revision, session) => {
+          named.add(locator)
+          const entry = stored.get(locator)
+          if (
+            entry?.revision !== revision ||
+            JSON.stringify(entry.session) !== JSON.stringify(session)
+          )
+            remembered.set(locator, { revision, session })
+        },
+      } satisfies ProviderHistoryListOptions,
+      save: (complete: boolean) => {
+        const forgotten = complete ? [...stored.keys()].filter((key) => !named.has(key)) : []
+        if (!remembered.size && !forgotten.length) return
+        try {
+          this.store.saveProviderHistoryMetadata(provider, remembered, forgotten)
+        } catch {
+          // Unsaved listings are only read again after the next restart.
+          this.hooks.log(`${provider} history metadata could not be saved`)
+          return
+        }
+        for (const [locator, entry] of remembered) stored.set(locator, entry)
+        for (const locator of forgotten) stored.delete(locator)
+      },
+    }
+  }
+
+  /** Resolves whether any chat changed, so a caller can poll less while nothing does. */
+  refresh(): Promise<boolean> {
+    if (this.#closed) return Promise.resolve(false)
+    return (this.#refreshing ??= this.#refresh().finally(() => {
+      this.#refreshing = undefined
+    }))
+  }
+
+  async #refresh(): Promise<boolean> {
+    let anyChanged = false
+    await Promise.all(
+      this.sources.map(async ({ provider, history }) => {
+        try {
+          const listing = this.#listing(provider)
+          const sessions = await history.list(listing.options).then(
+            (sessions) => {
+              listing.save(true)
+              return sessions
+            },
+            (error: unknown) => {
+              listing.save(false)
+              throw error
+            },
+          )
+          this.#listed.set(provider, sessions)
+          this.#listFailed.delete(provider)
+          if (this.#closed || this.hooks.canImport?.() === false) return
+          // Temporary sessions can close between scans, or disappear on restart.
+          // Their durable marker must win even before discovery has seen a row.
+          for (const entry of this.store.providerHistories()) {
+            if (entry.provider !== provider || !entry.session.internal) continue
+            this.#remember({
+              ...entry,
+              session: {
+                ...entry.session,
+                id: history.resolveSessionId?.(entry.session.id) ?? entry.session.id,
+              },
+            })
+          }
+          // Starting a provider and scanning its saved sessions can overlap. Resolve
+          // ownership only after the scan, preferring native tasks over imported copies.
+          const nativeThreads = new Map(
+            this.store.nativeProviderThreads(provider).map((thread) => {
+              const id = thread.providerSessionId ?? thread.id
+              return [history.resolveSessionId?.(id) ?? id, thread]
+            }),
+          )
+          // Sessions chats ran on before they moved to another provider.
+          const left = new Set(
+            this.store
+              .leftProviderSessions(provider)
+              .map((id) => history.resolveSessionId?.(id) ?? id),
+          )
+          const changed: string[] = []
+          const imported: Imported[] = []
+          const repair = new Set<string>()
+          for (const session of sessions) {
+            if (!session.internal) continue
+            const threadId = `external:${provider}:${session.id}`
+            if (this.#internalWithoutCopy.has(threadId)) continue
+            const thread = this.store.thread(threadId)
+            if (!thread) this.#internalWithoutCopy.add(threadId)
+            // Repair old read-only imports without touching native sessions or local replies.
+            else if (
+              !thread.worktreePath &&
+              !this.hooks.isBusy(threadId) &&
+              !this.store.queuedTurns(threadId).length &&
+              !this.store.localHistory(threadId).length
+            ) {
+              this.store.deleteThread(threadId)
+              this.#byThread.delete(threadId)
+              this.#internalWithoutCopy.add(threadId)
+              changed.push(threadId)
+            }
+          }
+          this.store.batchLifecycleUpdates(() => {
+            const folders = new ProjectFolders(this.store)
+            for (const session of sessions) {
+              if (session.internal || !session.id || left.has(session.id)) continue
+              if (!path.isAbsolute(session.workspacePath) || !Number.isFinite(session.createdAt))
+                continue
+              const native = nativeThreads.get(session.id)
+              // An isolated chat runs its provider in a private worktree, but
+              // belongs to the project it was started from.
+              const projectPath = folders.project(native?.projectPath ?? session.workspacePath)
+              if (projectPath === undefined) continue
+              const key = `${provider}:${session.id}`
+              const previous = this.#entries.get(key)
+              if (previous?.session.internal) continue
+              const duplicateId = `external:${provider}:${session.id}`
+              const duplicate = native && this.store.thread(duplicateId)
+              if (
+                duplicate &&
+                (this.hooks.isBusy(duplicateId) || this.store.queuedTurns(duplicateId).length)
+              )
+                continue
+              const repairing = Boolean(
+                duplicate &&
+                (!previous ||
+                  previous.threadId !== native?.id ||
+                  previous.loadedRevision !== session.revision ||
+                  this.store.localHistory(duplicateId).length === 0),
+              )
+              if (
+                !repairing &&
+                (!native || native.id === previous?.threadId) &&
+                previous?.session.revision === session.revision &&
+                previous.session.title === session.title
+              )
+                continue
+              // Retain a tombstone when a user deletes the local copy.
+              if (previous && !native && !this.store.thread(previous.threadId)) continue
+              const existing =
+                native ?? (previous ? this.store.thread(previous.threadId) : undefined)
+              if (existing?.ephemeral) {
+                const internal = { ...session, internal: true }
+                this.store.saveProviderHistory(provider, existing.id, internal)
+                imported.push({
+                  provider,
+                  threadId: existing.id,
+                  session: internal,
+                  loadedRevision: null,
+                })
+                continue
+              }
+              const threadId = existing?.id ?? `external:${provider}:${session.id}`
+              if (!existing) {
+                this.store.addProviderThread(threadId, provider, session, projectPath)
+                this.#internalWithoutCopy.delete(threadId)
+              } else if (
+                (previous?.threadId === threadId &&
+                  existing.title === previous.session.title &&
+                  session.title) ||
+                // The title taken from the chat's first prompt waited for this name.
+                (session.named && this.store.provisionalTitle(threadId) !== undefined)
+              ) {
+                this.store.renameThread(threadId, session.title)
+              }
+              // A session run outside TasteCode keeps the access level it last ran with
+              // there, until the chat has one of its own.
+              if (session.approval && this.store.threadApproval(threadId) === undefined)
+                this.store.setThreadApproval(threadId, session.approval)
+              // An archived chat is imported closed, because its provider will
+              // not resume it. Once unarchived there, it can be continued again.
+              if (
+                existing?.closedAt !== undefined &&
+                threadId === duplicateId &&
+                previous?.threadId === threadId &&
+                previous.session.archived &&
+                !session.archived
+              ) {
+                this.store.reopenThread(threadId)
+              }
+              const entry = {
+                provider,
+                threadId,
+                session,
+                loadedRevision:
+                  !repairing && previous?.threadId === threadId ? previous.loadedRevision : null,
+              }
+              this.store.saveProviderHistory(provider, threadId, session)
+              imported.push(entry)
+              changed.push(threadId)
+              if (repairing) repair.add(threadId)
+            }
+          })
+          for (const entry of imported) this.#remember(entry)
+          if (changed.length) {
+            anyChanged = true
+            this.hooks.changed(changed)
+          }
+          for (const threadId of repair) await this.load(threadId)
+        } catch {
+          this.#listFailed.add(provider)
+          // Never log source content or paths from a malformed provider record.
+          this.hooks.log(`${provider} history could not be refreshed; will retry`)
+        } finally {
+          this.#scanned.get(provider)?.settle()
+        }
+      }),
+    )
+    return anyChanged
+  }
+
+  async load(threadId: string): Promise<boolean> {
+    if (this.#closed || this.hooks.isBusy(threadId)) return false
+    const pending = this.#reading.get(threadId)
+    if (pending) return pending
+    let entry = this.#byThread.get(threadId)
+    const thread = this.store.thread(threadId)
+    // A session the chat has left since: its turns are already the chat's own.
+    if (entry && thread && entry.provider !== thread.provider) {
+      this.forget(threadId)
+      return false
+    }
+    if (
+      !entry ||
+      entry.session.internal ||
+      !thread ||
+      entry.loadedRevision === entry.session.revision
+    )
+      return false
+    const provider = entry.provider
+    const source = this.sources.find((source) => source.provider === provider)
+    if (!source) return false
+    const reading = (async () => {
+      let changed = false
+      while (entry && entry.loadedRevision !== entry.session.revision) {
+        const current = entry
+        const seq = this.store.lastSeq(threadId)
+        let local = this.store.localHistory(threadId).map(({ event }) => event)
+        const events = await source.history.read(current.session, {
+          localTurnIds: startedTurnIds(local),
+        })
+        if (
+          this.#closed ||
+          this.hooks.isBusy(threadId) ||
+          !this.store.thread(threadId) ||
+          !this.#byThread.has(threadId)
+        )
+          return changed
+        const duplicateId = `external:${provider}:${current.session.id}`
+        if (
+          duplicateId !== threadId &&
+          (this.hooks.isBusy(duplicateId) || this.store.queuedTurns(duplicateId).length)
+        )
+          return changed
+        if (events.length === 0) {
+          // An imported chat has no transcript but this copy, so the reader retries.
+          if (duplicateId === threadId)
+            throw new Error('Saved provider chat is unavailable; try again')
+          // A native chat keeps its own transcript; the copy only adds turns taken
+          // outside TasteCode. A copy that is gone (Codex archived the session and
+          // its rollout was deleted) must not keep the chat from opening. This
+          // revision is not read again; a changed copy is.
+          current.loadedRevision = current.session.revision
+          break
+        }
+        // A turn that finished during the read is local too; its echo must still be dropped.
+        if (this.store.lastSeq(threadId) !== seq)
+          local = this.store.localHistory(threadId).map(({ event }) => event)
+        // A chat that continues another starts as a copy of that chat's saved
+        // session. The turns from before it existed are the earlier chat's.
+        const entries = importedEvents(
+          thread.continuedFrom === undefined || duplicateId === threadId
+            ? events
+            : turnsSince(events, thread.createdAt),
+          threadId,
+          local,
+        )
+        const duplicate =
+          duplicateId !== threadId &&
+          this.store.thread(duplicateId) !== undefined &&
+          !this.hooks.isBusy(duplicateId) &&
+          !this.store.queuedTurns(duplicateId).length
+        const duplicateLocal = duplicate
+          ? this.store.localHistory(duplicateId).map(({ event }) => event)
+          : []
+        const mirror =
+          duplicate && duplicateLocal.length === 0 && !this.store.thread(duplicateId)?.worktreePath
+        // The canonical merge records the loaded revision that stops later repairs,
+        // so a duplicate holding real replies is repaired first.
+        if (duplicate && !mirror)
+          this.store.mergeProviderHistory(
+            duplicateId,
+            current.session.revision,
+            importedEvents(events, duplicateId, [...local, ...duplicateLocal]),
+          )
+        changed =
+          this.store.mergeProviderHistory(threadId, current.session.revision, entries) || changed
+        current.loadedRevision = current.session.revision
+        if (duplicate) {
+          // Only remove a read-only mirror after its real outside turns have been
+          // imported successfully. Replies written in the duplicate remain intact.
+          if (mirror) this.store.deleteThread(duplicateId)
+          this.hooks.changed([threadId, duplicateId])
+        }
+        entry = this.#byThread.get(threadId)
+      }
+      return changed
+    })().finally(() => {
+      this.#reading.delete(threadId)
+    })
+    this.#reading.set(threadId, reading)
+    return reading
+  }
+
+  async close(): Promise<void> {
+    this.#closed = true
+    for (const scan of this.#scanned.values()) scan.settle()
+    await Promise.allSettled([this.#refreshing, ...this.#reading.values()])
+    const accounts = await Promise.allSettled(this.#accountSources.values())
+    await Promise.allSettled([
+      ...this.sources.map(({ history }) => history.dispose?.()),
+      ...accounts.map((result) =>
+        result.status === 'fulfilled' ? result.value.dispose?.() : undefined,
+      ),
+    ])
+    this.#accountSources.clear()
+  }
+}
+
+/**
+ * Which project saved folders belong to. Saved sessions share a few folders, and
+ * the store does not cache a folder that is not a project.
+ */
+export class ProjectFolders {
+  #known = new Map<string, string | undefined>()
+  #aliases: Map<string, string[]> | undefined
+
+  constructor(private store: Store) {}
+
+  project(folder: string): string | undefined {
+    if (this.#known.has(folder)) return this.#known.get(folder)
+    const spelled = savedFolder(folder)
+    let project =
+      this.store.project(folder)?.path ??
+      (spelled === folder ? undefined : this.store.project(spelled)?.path)
+    if (project === undefined) {
+      // Providers may save the same folder with another case or separator.
+      // Only the file system can say whether such a spelling is the same folder.
+      if (!this.#aliases) {
+        this.#aliases = new Map()
+        for (const { path: stored } of this.store.projects()) {
+          const spelling = folderSpelling(stored)
+          this.#aliases.set(spelling, [...(this.#aliases.get(spelling) ?? []), stored])
+        }
+      }
+      const candidates = this.#aliases.get(folderSpelling(folder))
+      const identity = candidates && folderIdentity(folder)
+      if (identity) project = candidates.find((candidate) => folderIdentity(candidate) === identity)
+      // A folder that is gone has no identity; then only another spelling of the
+      // same path counts, case aside where the file system ignores case.
+      else project = candidates?.find((candidate) => folderKey(candidate) === folderKey(folder))
+    }
+    this.#known.set(folder, project)
+    return project
+  }
+}
+
+function folderSpelling(folder: string): string {
+  return path.resolve(savedFolder(folder)).toLowerCase()
+}
+
+/**
+ * The spelling a folder is filed under. On Windows the same folder arrives as
+ * `E:/work/site` (OpenCode), `\\?\E:\work\site` (Codex at times), with a
+ * lowercase drive (CLIs started from VS Code) or with a trailing separator;
+ * all of them become `E:\work\site`. Elsewhere a folder stays as saved. Case
+ * beyond the drive letter is kept; folderKey compares without it.
+ */
+export function savedFolder(folder: string, platform = process.platform): string {
+  if (platform !== 'win32') return folder
+  const plain = folder.startsWith('\\\\?\\UNC\\')
+    ? `\\\\${folder.slice(8)}`
+    : folder.startsWith('\\\\?\\')
+      ? folder.slice(4)
+      : folder
+  let spelled = path.win32.normalize(plain).replace(/^[a-z]:/, (drive) => drive.toUpperCase())
+  const { root } = path.win32.parse(spelled)
+  if (spelled.length > root.length) spelled = spelled.replace(/\\+$/, '')
+  return spelled
+}
+
+/** Equal for two spellings of one folder path: on Windows also across letter case. */
+export function folderKey(folder: string, platform = process.platform): string {
+  const spelled = savedFolder(folder, platform)
+  return platform === 'win32' ? spelled.toLowerCase() : spelled
+}
+
+/** Same device and file id; a missing folder has none. */
+function folderIdentity(folder: string): string | undefined {
+  try {
+    const stat = statSync(folder, { bigint: true })
+    return stat.ino === 0n ? undefined : `${stat.dev}:${stat.ino}`
+  } catch {
+    return undefined
+  }
+}
+
+function startedTurnIds(events: DomainEvent[]): Set<string> {
+  return new Set(events.flatMap((event) => (event.type === 'turn.started' ? [event.turn.id] : [])))
+}
+
+/** The events of turns that started at `since` or later, and those of no turn. */
+function turnsSince(events: DomainEvent[], since: number): DomainEvent[] {
+  const earlier = new Set(
+    events.flatMap((event) =>
+      event.type === 'turn.started' && event.turn.createdAt < since ? [event.turn.id] : [],
+    ),
+  )
+  return events.filter((event) => {
+    const id = turnId(event)
+    return id === undefined || !earlier.has(id)
+  })
+}
+
+function turnId(event: DomainEvent): string | undefined {
+  if (event.type === 'turn.started') return event.turn.id
+  if (event.type === 'item.started' || event.type === 'item.completed') return event.item.turnId
+  return 'turnId' in event ? event.turnId : undefined
+}
+
+export function importedEvents(
+  events: DomainEvent[],
+  threadId: string,
+  local: DomainEvent[],
+): Array<{ key: string; event: DomainEvent }> {
+  const finalItems = new Map(
+    projectHistoryItems(events.map((event, seq) => ({ seq, event }))).map((item) => [
+      item.id,
+      item,
+    ]),
+  )
+  const seenItems = new Set<string>()
+  events = events.flatMap((event): DomainEvent[] => {
+    const id =
+      event.type === 'item.started' || event.type === 'item.completed'
+        ? event.item.id
+        : event.type === 'item.delta'
+          ? event.itemId
+          : undefined
+    if (!id) return [event]
+    if (seenItems.has(id)) return []
+    seenItems.add(id)
+    const item = finalItems.get(id)
+    return item ? [{ type: 'item.completed', item }] : []
+  })
+  // A queued prompt keeps its enqueue time for display, but the provider saw it
+  // when its turn started; either moment can be the native row's time.
+  const localTurnStarts = new Map(
+    local.flatMap((event) =>
+      event.type === 'turn.started' ? [[event.turn.id, event.turn.createdAt] as const] : [],
+    ),
+  )
+  const localTurns = new Set(localTurnStarts.keys())
+  const users = local.flatMap((event) =>
+    (event.type === 'item.completed' || event.type === 'item.started') && event.item.role === 'user'
+      ? [event.item]
+      : [],
+  )
+  const echoed = new Set<string>()
+  // A chat brought in from another app shows its saved prompts as rows of their own, so
+  // there TasteCode's wrappers come off them. A chat run here keeps its provider rows
+  // exactly as they were saved.
+  const importedChat = threadId.startsWith('external:') || threadId.startsWith('imported:')
+  for (const event of events) {
+    const id = turnId(event)
+    if (!id) continue
+    if (localTurns.has(id)) echoed.add(id)
+    // A Design phase prompt is the app's own instruction, and the local log already
+    // shows that phase as Design activity. A provider such as Claude saves each phase
+    // as a turn whose id matches no local turn.
+    if (
+      (event.type === 'item.completed' || event.type === 'item.started') &&
+      event.item.role === 'user' &&
+      isDesignPhasePrompt(withoutRestoreNotice(event.item.text))
+    )
+      echoed.add(id)
+  }
+  const candidates = events
+    .flatMap((event) => {
+      if (
+        (event.type !== 'item.completed' && event.type !== 'item.started') ||
+        event.item.role !== 'user' ||
+        echoed.has(event.item.turnId)
+      )
+        return []
+      const native = event.item
+      return users.flatMap((item) => {
+        if (echoed.has(item.turnId) || !sameUserMessage(item, native)) return []
+        const started = localTurnStarts.get(item.turnId)
+        const distance = Math.min(
+          Math.abs(item.createdAt - native.createdAt),
+          started === undefined ? Infinity : Math.abs(started - native.createdAt),
+        )
+        // Match prompts, not turns: a steer stays in the local turn it steered, while a
+        // provider such as Claude saves it as a turn of its own.
+        return distance < 60_000 ? [{ local: item.id, native: native.turnId, distance }] : []
+      })
+    })
+    .sort((a, b) => a.distance - b.distance)
+  const matched = new Set<string>()
+  for (const candidate of candidates) {
+    if (matched.has(candidate.local) || echoed.has(candidate.native)) continue
+    matched.add(candidate.local)
+    echoed.add(candidate.native)
+  }
+  const result = new Map<string, DomainEvent>()
+  const usageCounts = new Map<string, number>()
+  let currentTurn = ''
+  for (const event of events) {
+    const id = turnId(event)
+    if (id) currentTurn = id
+    if (echoed.has(id ?? currentTurn) && event.type !== 'thread.started') continue
+    // Historical permission requests must never become actionable approvals.
+    if (
+      event.type.startsWith('approval.') ||
+      event.type.startsWith('user_input.') ||
+      event.type === 'thread.error'
+    )
+      continue
+    let mapped: DomainEvent = event
+    if (event.type === 'thread.started')
+      mapped = { ...event, thread: { ...event.thread, id: threadId } }
+    else if (event.type === 'turn.started')
+      mapped = { ...event, turn: { ...event.turn, id: `import:${event.turn.id}`, threadId } }
+    else if (event.type === 'item.completed' || event.type === 'item.started')
+      mapped = {
+        type: 'item.completed',
+        item: {
+          ...event.item,
+          // A chat that ran in TasteCode before saved our wrappers around the user's words.
+          ...(importedChat && event.item.role === 'user' && event.item.text !== undefined
+            ? { text: shownWords(event.item.text) }
+            : {}),
+          id: `import:${event.item.id}`,
+          turnId: `import:${event.item.turnId}`,
+          // A saved snapshot has no live session to finish its background work.
+          ...(event.item.subagent?.state === 'running'
+            ? { subagent: { ...event.item.subagent, state: 'interrupted' } }
+            : {}),
+        },
+      }
+    else if (event.type === 'item.delta')
+      mapped = { ...event, turnId: `import:${event.turnId}`, itemId: `import:${event.itemId}` }
+    else if ('turnId' in event) mapped = { ...event, turnId: `import:${event.turnId}` }
+    const key =
+      mapped.type === 'usage.updated'
+        ? `usage:${currentTurn}:${usageCounts.get(currentTurn) ?? 0}`
+        : mapped.type === 'thread.started'
+          ? 'thread'
+          : mapped.type === 'turn.started'
+            ? `start:${mapped.turn.id}`
+            : mapped.type === 'item.completed' || mapped.type === 'item.started'
+              ? `item:${mapped.item.id}`
+              : 'turnId' in mapped
+                ? `${mapped.type}:${mapped.turnId}`
+                : `${mapped.type}:${createHash('sha256').update(JSON.stringify(mapped)).digest('hex')}`
+    result.set(key, mapped)
+    if (mapped.type === 'usage.updated')
+      usageCounts.set(currentTurn, (usageCounts.get(currentTurn) ?? 0) + 1)
+  }
+  return [...result].map(([key, event]) => ({ key, event }))
+}
+
+function withoutRestoreNotice(text: string | undefined): string | undefined {
+  return text?.startsWith(RESTORE_CONTEXT_NOTICE) ? text.slice(RESTORE_CONTEXT_NOTICE.length) : text
+}
+
+/**
+ * A Design phase prompt: one with the phase notice, or a Design brief or the brief's
+ * continuation with the user's answers, both sent bare (alone) before 2026-09-16.
+ */
+function isDesignPhasePrompt(text: string | undefined): boolean {
+  return (
+    text !== undefined &&
+    (text.startsWith(DESIGN_PHASE_MARKER) ||
+      text.startsWith(BRIEFING_START) ||
+      text.startsWith(BRIEFING_CONTINUATION_START))
+  )
+}
+
+/** The first line of designBriefingPrompt since the 2026-08-14 rename. */
+const BRIEFING_START = 'You are running TasteCode Design Briefing mode.\n'
+/** The first line of designBriefingContinuation since the 2026-08-14 rename. */
+const BRIEFING_CONTINUATION_START =
+  'Continue the TasteCode Design Briefing using the answers below.\n'
+
+/**
+ * What an imported chat shows of a prompt TasteCode wrapped before sending it: the
+ * user's words, or the request a not_design continuation carried. Only exact
+ * prefixes and markers TasteCode writes are taken off, never user prose.
+ */
+function shownWords(text: string): string {
+  let words = withoutRestoreNotice(text) ?? text
+  // A continued chat's first prompt carries the earlier conversation before the
+  // user's words.
+  words = withoutContinuationContext(words)
+  // Sub-agent results the agent had not read go in front of the user's words.
+  words = withoutUnreadSubagentResults(words)
+  // The Design follow-up envelope, matched by its whole text.
+  if (words.startsWith(DESIGN_FOLLOW_UP_NOTICE)) words = words.slice(DESIGN_FOLLOW_UP_NOTICE.length)
+  return designContinuationRequest(words) ?? words
+}
+
+/** designTaskContinuation's opening; the user's original request follows in its block. */
+const CONTINUATION_START =
+  'Design mode is now off. The preceding Design Briefing protocol, JSON-only format, and tool-free restrictions have ended.\n\n'
+const CONTINUATION_REQUEST_OPEN = '\n<original-user-request>\n'
+const CONTINUATION_REQUEST_CLOSE = '\n</original-user-request>'
+
+/** The request a Design brief that answered not_design carries on as an ordinary turn. */
+function designContinuationRequest(text: string): string | undefined {
+  if (!text.startsWith(CONTINUATION_START)) return undefined
+  const open = text.indexOf(CONTINUATION_REQUEST_OPEN)
+  const close = text.lastIndexOf(CONTINUATION_REQUEST_CLOSE)
+  return open !== -1 && close > open
+    ? text.slice(open + CONTINUATION_REQUEST_OPEN.length, close)
+    : undefined
+}
+
+function sameUserMessage(left: Item, right: Item): boolean {
+  let text = withoutRestoreNotice(right.text)
+  // A continued chat's first prompt carries the earlier conversation before the
+  // user's words; local history keeps only the words.
+  if (text !== undefined) text = withoutContinuationContext(text)
+  // Sub-agent results the agent had not read go in front of the user's words.
+  if (text !== undefined) text = withoutUnreadSubagentResults(text)
+  // Native logs contain our Design follow-up envelope; local history keeps only
+  // the user's submission. Unwrap solely for echo matching, never arbitrary prose.
+  if (text?.startsWith('This is an ordinary user turn, not an active TasteCode Design phase. ')) {
+    const marker = '\n\nUser request:\n'
+    const start = text.indexOf(marker)
+    if (start !== -1) text = text.slice(start + marker.length)
+  }
+  return (
+    (left.text === right.text || left.text === text) &&
+    sameAttachments(left.attachments ?? [], right.attachments ?? [])
+  )
+}
+
+/** A provider such as Claude saves an attached picture's bytes, not the path it came from. */
+function sameAttachments(local: readonly string[], native: readonly string[]): boolean {
+  return (
+    local.length === native.length &&
+    local.every((path, index) => path === native[index] || native[index]?.startsWith('data:'))
+  )
+}

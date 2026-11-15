@@ -1,0 +1,2791 @@
+// @vitest-environment happy-dom
+import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { Profiler } from 'react'
+import { Sidebar, type Session } from './Sidebar.js'
+import type { AccountLimitsState } from './AccountLimits.js'
+import type { ProfileIdentityPreferences } from '../profile-preferences.js'
+
+const hapticMocks = vi.hoisted(() => ({
+  perform: vi.fn(),
+  prepare: vi.fn(),
+}))
+const performHaptic = hapticMocks.perform
+const prepareHaptics = hapticMocks.prepare
+const droppedProjectFolderPaths = vi.hoisted(() =>
+  vi.fn<(files: ArrayLike<File>) => Promise<string[]>>(),
+)
+
+vi.mock('../bridge.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../bridge.js')>()),
+  canDropProjectFolders: true,
+  droppedProjectFolderPaths,
+  isMacOS: () => true,
+}))
+
+vi.mock('../haptics.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../haptics.js')>()),
+  appHapticsSupported: () => true,
+  performAppHaptic: hapticMocks.perform,
+  prepareAppHaptics: hapticMocks.prepare,
+}))
+
+class TestMediaQueryList extends EventTarget implements MediaQueryList {
+  onchange: ((this: MediaQueryList, ev: MediaQueryListEvent) => void) | null = null
+  constructor(
+    readonly matches: boolean,
+    readonly media: string,
+  ) {
+    super()
+  }
+  addListener(): void {}
+  removeListener(): void {}
+}
+
+afterEach(() => {
+  vi.useRealTimers()
+  cleanup()
+  localStorage.removeItem('harness.openProjects')
+  vi.unstubAllGlobals()
+  performHaptic.mockClear()
+  prepareHaptics.mockClear()
+  droppedProjectFolderPaths.mockReset()
+})
+
+const session = (id: string, title: string) => ({
+  id,
+  title,
+  provider: 'codex' as const,
+  createdAt: 1,
+  status: 'idle' as const,
+  lifecycle: { state: 'active' as const, keepActive: false },
+  unread: false,
+})
+
+/** Rows have no layout in happy-dom; give one a place in a vertical list. */
+function mockRowRect(row: Element, top: number, height: number) {
+  vi.spyOn(row, 'getBoundingClientRect').mockReturnValue({
+    bottom: top + height,
+    height,
+    left: 0,
+    right: 200,
+    top,
+    width: 200,
+    x: 0,
+    y: top,
+    toJSON: () => ({}),
+  })
+}
+
+function renderProjectCatalog(
+  projects: Array<{ path: string; name: string; sessions: [] }>,
+  active?: string,
+  usageStates?: AccountLimitsState[],
+  projectsLoading?: boolean,
+) {
+  const content = (active: string | undefined, loading = projectsLoading) => (
+    <Sidebar
+      projects={projects}
+      projectsLoading={loading}
+      activeProjectPath={active}
+      activeSessionId={undefined}
+      account={undefined}
+      providerName="Codex"
+      usageStates={usageStates}
+      collapsed={false}
+      width={248}
+      onWidthChange={vi.fn()}
+      onClose={vi.fn()}
+      onAddProject={vi.fn()}
+      onNewSession={vi.fn()}
+      onSelectSession={vi.fn()}
+      onRenameProject={vi.fn()}
+      onRemoveProject={vi.fn()}
+      onTogglePin={vi.fn()}
+      onRenameSession={vi.fn()}
+      onDeleteSession={vi.fn()}
+      onArchiveProject={vi.fn()}
+      onReorderSession={vi.fn()}
+      onOpenSearch={vi.fn()}
+      onOpenSettings={vi.fn()}
+    />
+  )
+  const view = render(content(active))
+  return {
+    ...view,
+    navigate: (active?: string) => view.rerender(content(active)),
+    finishLoading: () => view.rerender(content(active, false)),
+  }
+}
+
+function controlledIdleCallbacks() {
+  const callbacks: IdleRequestCallback[] = []
+  vi.stubGlobal('requestIdleCallback', (callback: IdleRequestCallback) => {
+    callbacks.push(callback)
+    return callbacks.length
+  })
+  vi.stubGlobal('cancelIdleCallback', vi.fn())
+  return callbacks
+}
+
+describe('Sidebar chat actions', () => {
+  it('opens a chat beside the active one from its menu or with Alt+click, and marks it', async () => {
+    const onSelectSession = vi.fn()
+    const onOpenSessionBeside = vi.fn()
+    const project = {
+      path: '/work/project',
+      name: 'project',
+      pinned: false,
+      sessions: [
+        session('active', 'Active chat'),
+        session('beside', 'Beside chat'),
+        session('other', 'Other chat'),
+      ],
+    }
+    render(
+      <Sidebar
+        projects={[project]}
+        activeProjectPath="/work/project"
+        activeSessionId="active"
+        besideSessionId="beside"
+        onOpenSessionBeside={onOpenSessionBeside}
+        account={undefined}
+        providerName="Codex"
+        collapsed={false}
+        width={248}
+        onWidthChange={vi.fn()}
+        onClose={vi.fn()}
+        onAddProject={vi.fn()}
+        onNewSession={vi.fn()}
+        onSelectSession={onSelectSession}
+        onRenameProject={vi.fn()}
+        onRemoveProject={vi.fn()}
+        onTogglePin={vi.fn()}
+        onRenameSession={vi.fn()}
+        onDeleteSession={vi.fn()}
+        onArchiveProject={vi.fn()}
+        onReorderSession={vi.fn()}
+        onOpenSearch={vi.fn()}
+        onOpenSettings={vi.fn()}
+      />,
+    )
+    const row = (title: string) => screen.getByRole('button', { name: new RegExp(`^${title},`) })
+
+    expect(row('Beside chat').closest('.sessrow')!.classList.contains('is-beside')).toBe(true)
+    expect(row('Active chat').closest('.sessrow')!.classList.contains('is-beside')).toBe(false)
+
+    fireEvent.click(row('Other chat'), { altKey: true })
+    expect(onOpenSessionBeside).toHaveBeenCalledWith('other')
+    expect(onSelectSession).not.toHaveBeenCalled()
+
+    fireEvent.contextMenu(row('Other chat'))
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Open beside' }))
+    expect(onOpenSessionBeside).toHaveBeenCalledTimes(2)
+
+    // The chats already on screen have nothing to open beside.
+    fireEvent.click(row('Beside chat'), { altKey: true })
+    expect(onSelectSession).toHaveBeenCalledWith('beside')
+    fireEvent.contextMenu(row('Active chat'))
+    await screen.findByRole('menuitem', { name: 'Rename chat' })
+    expect(screen.queryByRole('menuitem', { name: 'Open beside' })).toBeNull()
+  })
+  it('shows placeholder projects instead of an empty list while projects load', () => {
+    const view = renderProjectCatalog([], undefined, undefined, true)
+
+    expect(screen.getByRole('status').textContent).toBe('Loading projects…')
+    expect(screen.queryByText('Nothing here yet.')).toBeNull()
+    expect(screen.getByRole('button', { name: 'New chat' })).toBeTruthy()
+
+    view.finishLoading()
+    expect(screen.queryByText('Loading projects…')).toBeNull()
+    expect(screen.getByText('Nothing here yet.')).toBeTruthy()
+  })
+
+  it('holds the inbox rail in place while its module loads', async () => {
+    render(
+      <Sidebar
+        projects={[]}
+        projectsLoading
+        activeProjectPath={undefined}
+        activeSessionId={undefined}
+        account={undefined}
+        providerName="Codex"
+        mode="inbox"
+        inbox={{
+          onSettle: vi.fn(),
+          onUnsettle: vi.fn(),
+          onSnooze: vi.fn(),
+          onUnsnooze: vi.fn(),
+          onKeepActive: vi.fn(),
+        }}
+        collapsed={false}
+        width={248}
+        onWidthChange={vi.fn()}
+        onClose={vi.fn()}
+        onAddProject={vi.fn()}
+        onNewSession={vi.fn()}
+        onSelectSession={vi.fn()}
+        onRenameProject={vi.fn()}
+        onRemoveProject={vi.fn()}
+        onTogglePin={vi.fn()}
+        onRenameSession={vi.fn()}
+        onDeleteSession={vi.fn()}
+        onArchiveProject={vi.fn()}
+        onReorderSession={vi.fn()}
+        onOpenSearch={vi.fn()}
+        onOpenSettings={vi.fn()}
+      />,
+    )
+
+    expect(screen.getByText('Loading threads…')).toBeTruthy()
+    expect(document.querySelector('.inbox-skeleton-toolbar')).not.toBeNull()
+
+    expect(await screen.findByRole('textbox', { name: 'Search threads' })).toBeTruthy()
+    expect(document.querySelector('.inbox-skeleton-toolbar')).toBeNull()
+    expect(screen.getByText('Loading threads…')).toBeTruthy()
+  })
+
+  it('hides unavailable plan limits while the account component is loading', () => {
+    const usage = {
+      inputTokens: 0,
+      cachedInputTokens: 0,
+      outputTokens: 0,
+      reasoningTokens: 0,
+      totalTokens: 0,
+    }
+    renderProjectCatalog([], undefined, [
+      {
+        provider: 'grok',
+        status: 'ready',
+        summary: {
+          session: usage,
+          today: usage,
+          limits: [],
+          limitSource: { provider: 'grok', status: 'unavailable' },
+        },
+      },
+    ])
+
+    fireEvent.click(screen.getByRole('button', { name: 'Account' }))
+
+    const dialog = screen.getByRole('dialog', { name: 'Account and plan limits' })
+    expect(within(dialog).queryByRole('region', { name: 'Plan limits' })).toBeNull()
+    expect(within(dialog).getByRole('button', { name: 'Edit profile' })).toBeTruthy()
+  })
+
+  it('opens on the plan limits while they are still loading', () => {
+    renderProjectCatalog([], undefined, [{ provider: 'codex', status: 'loading' }])
+
+    fireEvent.click(screen.getByRole('button', { name: 'Account' }))
+
+    const dialog = screen.getByRole('dialog', { name: 'Account and plan limits' })
+    const limits = within(dialog).getByRole('region', { name: 'Plan limits' })
+    expect(dialog.firstElementChild).toBe(limits)
+    expect(limits.getAttribute('aria-busy')).toBe('true')
+    expect(within(dialog).queryByRole('button', { name: /Usage/ })).toBeNull()
+    expect(document.activeElement).toBe(limits)
+  })
+
+  it('labels the card meter with its provider and marks a source whose limits are unknown', () => {
+    const totals = {
+      inputTokens: 0,
+      cachedInputTokens: 0,
+      outputTokens: 0,
+      reasoningTokens: 0,
+      totalTokens: 0,
+    }
+    const ready = (
+      provider: AccountLimitsState['provider'],
+      usedPercent: number,
+    ): AccountLimitsState => ({
+      provider,
+      status: 'ready',
+      summary: {
+        session: totals,
+        today: totals,
+        limits: [],
+        limitSource: { provider, status: 'ready', limits: [{ label: 'Weekly', usedPercent }] },
+      },
+    })
+    const meter = () => document.querySelector<HTMLElement>('.account__usage')
+    const view = renderProjectCatalog([], undefined, [ready('codex', 0), ready('grok', 40)])
+
+    // The tightest limit wins and says whose it is.
+    expect(meter()?.title).toBe('Grok · Weekly · 60% left')
+    expect(meter()?.querySelector('.account__usage-value')?.textContent).toBe('60% left')
+    expect(meter()?.querySelector('svg.account__usage-mark')).not.toBeNull()
+    expect(meter()?.querySelector('.account__usage-unknown')).toBeNull()
+
+    // A provider that failed with nothing on record, or was not read yet,
+    // might be the tighter one: the known figure stays and says so.
+    view.unmount()
+    const second = renderProjectCatalog([], undefined, [
+      ready('codex', 60),
+      { provider: 'claude-code', status: 'error', message: 'Claude usage request failed.' },
+      {
+        provider: 'grok',
+        status: 'ready',
+        summary: {
+          session: totals,
+          today: totals,
+          limits: [],
+          limitSource: { provider: 'grok', status: 'unavailable', reason: 'failed' },
+        },
+      },
+    ])
+    expect(meter()?.title).toBe('Codex · Weekly · 40% left · Claude Code and Grok limits unknown')
+    expect(meter()?.querySelector('.account__usage-unknown')).not.toBeNull()
+
+    // A first read still running is not unknown yet, and a source without
+    // plan limits is known to have none.
+    second.unmount()
+    renderProjectCatalog([], undefined, [
+      ready('codex', 60),
+      { provider: 'claude-code', status: 'loading' },
+      {
+        provider: 'grok',
+        status: 'ready',
+        summary: {
+          session: totals,
+          today: totals,
+          limits: [],
+          limitSource: { provider: 'grok', status: 'unavailable', reason: 'noPlan' },
+        },
+      },
+    ])
+    expect(meter()?.title).toBe('Codex · Weekly · 40% left')
+    expect(meter()?.querySelector('.account__usage-unknown')).toBeNull()
+  })
+
+  it('shows no figure while every source with limits is unknown', () => {
+    renderProjectCatalog([], undefined, [
+      { provider: 'claude-code', status: 'error', message: 'Claude usage request failed.' },
+    ])
+    expect(document.querySelector('.account__usage')).toBeNull()
+    expect(document.querySelector('.account__name')?.textContent).toBe('Local profile')
+  })
+
+  it('draws the card avatar as the photo, else the generated seal for the profile', () => {
+    const view = (profileIdentity: ProfileIdentityPreferences | undefined) => (
+      <Sidebar
+        projects={[]}
+        activeProjectPath={undefined}
+        activeSessionId={undefined}
+        account={undefined}
+        profileIdentity={profileIdentity}
+        providerName="Codex"
+        collapsed={false}
+        width={248}
+        onWidthChange={vi.fn()}
+        onClose={vi.fn()}
+        onAddProject={vi.fn()}
+        onNewSession={vi.fn()}
+        onSelectSession={vi.fn()}
+        onRenameProject={vi.fn()}
+        onRemoveProject={vi.fn()}
+        onTogglePin={vi.fn()}
+        onRenameSession={vi.fn()}
+        onDeleteSession={vi.fn()}
+        onArchiveProject={vi.fn()}
+        onReorderSession={vi.fn()}
+        onOpenSearch={vi.fn()}
+        onOpenSettings={vi.fn()}
+      />
+    )
+    const avatar = () => document.querySelector<HTMLElement>('.account__avatar')!
+    const seal = () => avatar().querySelector<SVGSVGElement>('svg.generated-avatar')
+
+    const rendered = render(view({ displayName: 'Alex Rivera' }))
+    expect(seal()).not.toBeNull()
+    expect(avatar().textContent).toBe('')
+    const alex = seal()!.innerHTML
+
+    // The card strikes the same seal as the profile page: the chosen seed wins over the name.
+    rendered.rerender(view({ displayName: 'Alex Rivera', avatarSeed: 'tide' }))
+    expect(seal()!.innerHTML).not.toBe(alex)
+
+    // Another name draws another seal; a profile without one still gets a seal.
+    rendered.rerender(view({ displayName: 'Leon' }))
+    expect(seal()!.innerHTML).not.toBe(alex)
+    rendered.rerender(view({ displayName: '' }))
+    expect(seal()).not.toBeNull()
+    rendered.rerender(view(undefined))
+    expect(seal()).not.toBeNull()
+    expect(document.querySelector('.account__name')?.textContent).toBe('Local profile')
+
+    rendered.rerender(
+      view({ displayName: 'Alex Rivera', avatarDataUrl: 'data:image/png;base64,iVBORw0KGgo=' }),
+    )
+    expect(avatar().querySelector('img')?.getAttribute('src')).toBe(
+      'data:image/png;base64,iVBORw0KGgo=',
+    )
+    expect(seal()).toBeNull()
+  })
+
+  it('mounts a large project catalog in bounded idle batches', () => {
+    const callbacks = controlledIdleCallbacks()
+    const projects = Array.from({ length: 100 }, (_, index) => ({
+      path: `/work/project-${index}`,
+      name: `Project ${index}`,
+      sessions: [] as [],
+    }))
+
+    renderProjectCatalog(projects)
+
+    expect(document.querySelectorAll('.proj')).toHaveLength(30)
+    while (callbacks.length > 0) {
+      const callback = callbacks.shift()
+      act(() => callback?.({ didTimeout: false, timeRemaining: () => 50 }))
+    }
+    expect(document.querySelectorAll('.proj')).toHaveLength(100)
+  })
+
+  it('includes a deep active project in the first catalog commit', () => {
+    controlledIdleCallbacks()
+    const projects = Array.from({ length: 100 }, (_, index) => ({
+      path: `/work/project-${index}`,
+      name: `Project ${index}`,
+      sessions: [] as [],
+    }))
+
+    renderProjectCatalog(projects, '/work/project-75')
+
+    expect(document.querySelectorAll('.proj')).toHaveLength(76)
+    expect(screen.getByRole('button', { name: 'Project 75' })).toBeTruthy()
+  })
+
+  it('finishes project batches through timers when idle callbacks are unavailable', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('requestIdleCallback', undefined)
+    vi.stubGlobal('cancelIdleCallback', undefined)
+    const projects = Array.from({ length: 100 }, (_, index) => ({
+      path: `/work/project-${index}`,
+      name: `Project ${index}`,
+      sessions: [] as [],
+    }))
+
+    renderProjectCatalog(projects)
+
+    expect(document.querySelectorAll('.proj')).toHaveLength(30)
+    while (vi.getTimerCount() > 0) {
+      await act(async () => vi.runOnlyPendingTimersAsync())
+    }
+    expect(document.querySelectorAll('.proj')).toHaveLength(100)
+  })
+
+  it('shows a divider below the fixed actions only after the project list scrolls', () => {
+    render(
+      <Sidebar
+        projects={[]}
+        activeProjectPath={undefined}
+        activeSessionId={undefined}
+        account={undefined}
+        providerName="Codex"
+        collapsed={false}
+        width={248}
+        onWidthChange={vi.fn()}
+        onClose={vi.fn()}
+        onAddProject={vi.fn()}
+        onNewSession={vi.fn()}
+        onSelectSession={vi.fn()}
+        onRenameProject={vi.fn()}
+        onRemoveProject={vi.fn()}
+        onTogglePin={vi.fn()}
+        onRenameSession={vi.fn()}
+        onDeleteSession={vi.fn()}
+        onArchiveProject={vi.fn()}
+        onReorderSession={vi.fn()}
+        onOpenSearch={vi.fn()}
+        onOpenSettings={vi.fn()}
+      />,
+    )
+
+    const actions = document.querySelector('.rail__actions')
+    const body = document.querySelector<HTMLElement>('.rail__body')
+    expect(actions?.classList.contains('is-scrolled')).toBe(false)
+    if (!body) throw new Error('Missing sidebar body')
+
+    body.scrollTop = 12
+    fireEvent.scroll(body)
+    expect(actions?.classList.contains('is-scrolled')).toBe(true)
+
+    body.scrollTop = 0
+    fireEvent.scroll(body)
+    expect(actions?.classList.contains('is-scrolled')).toBe(false)
+  })
+
+  it('toggles an empty project without leaving the current chat', () => {
+    const onClose = vi.fn()
+    vi.spyOn(window, 'matchMedia').mockImplementation(
+      (query) => new TestMediaQueryList(query === '(max-width: 700px)', query),
+    )
+    render(
+      <Sidebar
+        projects={[{ path: '/work/empty', name: 'Empty project', sessions: [] }]}
+        activeProjectPath={undefined}
+        activeSessionId={undefined}
+        account={undefined}
+        providerName="Codex"
+        collapsed={false}
+        width={248}
+        onWidthChange={vi.fn()}
+        onClose={onClose}
+        onAddProject={vi.fn()}
+        onNewSession={vi.fn()}
+        onSelectSession={vi.fn()}
+        onRenameProject={vi.fn()}
+        onRemoveProject={vi.fn()}
+        onTogglePin={vi.fn()}
+        onRenameSession={vi.fn()}
+        onDeleteSession={vi.fn()}
+        onArchiveProject={vi.fn()}
+        onReorderSession={vi.fn()}
+        onOpenSearch={vi.fn()}
+        onOpenSettings={vi.fn()}
+      />,
+    )
+
+    const projectButton = screen.getByRole('button', { name: 'Empty project' })
+    expect(projectButton.getAttribute('aria-expanded')).toBe('false')
+    fireEvent.click(projectButton)
+    expect(onClose).not.toHaveBeenCalled()
+    expect(screen.getByText('No chats')).toBeTruthy()
+    expect(projectButton.getAttribute('aria-expanded')).toBe('true')
+
+    fireEvent.click(projectButton)
+    expect(projectButton.getAttribute('aria-expanded')).toBe('false')
+    expect(onClose).not.toHaveBeenCalled()
+  })
+
+  it('keeps the projects the user opened open after a reload', () => {
+    const projects = [
+      { path: 'C:/work/alpha', name: 'Alpha', sessions: [] as [] },
+      { path: 'C:/work/beta', name: 'Beta', sessions: [] as [] },
+    ]
+    const first = renderProjectCatalog(projects)
+    fireEvent.click(screen.getByRole('button', { name: 'Beta' }))
+    expect(screen.getByRole('button', { name: 'Beta' }).getAttribute('aria-expanded')).toBe('true')
+    first.unmount()
+
+    const second = renderProjectCatalog(projects)
+    expect(screen.getByRole('button', { name: 'Beta' }).getAttribute('aria-expanded')).toBe('true')
+    expect(screen.getByRole('button', { name: 'Alpha' }).getAttribute('aria-expanded')).toBe(
+      'false',
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Beta' }))
+    second.unmount()
+
+    renderProjectCatalog(projects)
+    expect(screen.getByRole('button', { name: 'Beta' }).getAttribute('aria-expanded')).toBe('false')
+  })
+
+  it('uses the latest project action after its owner callback changes', () => {
+    const firstNewSession = vi.fn()
+    const latestNewSession = vi.fn()
+    const view = (onNewSession: (projectPath?: string, chooseProject?: boolean) => void) => (
+      <Sidebar
+        projects={[
+          {
+            path: '/work/harness',
+            name: 'TasteCode',
+            sessions: [session('thread-1', 'Chat 1')],
+          },
+        ]}
+        activeProjectPath={undefined}
+        activeSessionId={undefined}
+        account={undefined}
+        providerName="Codex"
+        collapsed={false}
+        width={248}
+        onWidthChange={vi.fn()}
+        onClose={vi.fn()}
+        onAddProject={vi.fn()}
+        onNewSession={onNewSession}
+        onSelectSession={vi.fn()}
+        onRenameProject={vi.fn()}
+        onRemoveProject={vi.fn()}
+        onTogglePin={vi.fn()}
+        onRenameSession={vi.fn()}
+        onDeleteSession={vi.fn()}
+        onArchiveProject={vi.fn()}
+        onReorderSession={vi.fn()}
+        onOpenSearch={vi.fn()}
+        onOpenSettings={vi.fn()}
+      />
+    )
+    const rendered = render(view(firstNewSession))
+    const projectHead = rendered.container.querySelector('.proj__head')
+    if (!projectHead) throw new Error('Missing project header')
+    expect(projectHead.querySelector('.proj__mark')).not.toBeNull()
+    expect(projectHead.querySelectorAll('svg')).toHaveLength(0)
+
+    fireEvent.focus(screen.getByRole('button', { name: 'New chat here' }))
+    expect(projectHead.querySelectorAll('svg')).toHaveLength(2)
+
+    rendered.rerender(view(latestNewSession))
+    fireEvent.click(screen.getByRole('button', { name: 'New chat here' }))
+
+    expect(firstNewSession).not.toHaveBeenCalled()
+    expect(latestNewSession).toHaveBeenCalledWith('/work/harness', undefined)
+  })
+
+  it('uses the classic account footer in the inbox sidebar', async () => {
+    const onAddProject = vi.fn()
+    const onOpenSettings = vi.fn()
+    const view = (
+      <Sidebar
+        projects={[]}
+        activeProjectPath={undefined}
+        activeSessionId={undefined}
+        account={{ signedIn: true, email: 'private@example.com', plan: 'Pro' }}
+        providerName="Codex"
+        usageStates={[
+          {
+            status: 'ready',
+            provider: 'codex',
+            summary: {
+              session: {
+                inputTokens: 800,
+                cachedInputTokens: 0,
+                outputTokens: 200,
+                reasoningTokens: 0,
+                totalTokens: 1_000,
+              },
+              today: {
+                inputTokens: 4_000,
+                cachedInputTokens: 0,
+                outputTokens: 1_000,
+                reasoningTokens: 0,
+                totalTokens: 5_000,
+              },
+              limits: [{ label: '7 days', usedPercent: 85 }],
+              limitSource: {
+                provider: 'codex',
+                status: 'ready',
+                limits: [{ label: '7 days', usedPercent: 85 }],
+              },
+            },
+          },
+        ]}
+        onRetryUsage={vi.fn()}
+        mode="inbox"
+        inbox={{
+          onSettle: vi.fn(),
+          onUnsettle: vi.fn(),
+          onSnooze: vi.fn(),
+          onUnsnooze: vi.fn(),
+          onKeepActive: vi.fn(),
+        }}
+        collapsed={false}
+        width={248}
+        onWidthChange={vi.fn()}
+        onClose={vi.fn()}
+        onAddProject={onAddProject}
+        onNewSession={vi.fn()}
+        onSelectSession={vi.fn()}
+        onRenameProject={vi.fn()}
+        onRemoveProject={vi.fn()}
+        onTogglePin={vi.fn()}
+        onRenameSession={vi.fn()}
+        onDeleteSession={vi.fn()}
+        onArchiveProject={vi.fn()}
+        onReorderSession={vi.fn()}
+        onOpenSearch={vi.fn()}
+        onOpenSettings={onOpenSettings}
+      />
+    )
+
+    const rendered = render(view)
+    for (const [usedPercent, expected, low] of [
+      [11, '89% left', false],
+      [79.9, '20% left', false],
+      [85, '15% left', true],
+      [100, '0% left', true],
+    ] as const) {
+      rendered.rerender({
+        ...view,
+        props: {
+          ...view.props,
+          usageStates: [
+            {
+              ...view.props.usageStates[0],
+              summary: {
+                ...view.props.usageStates[0].summary,
+                limitSource: {
+                  provider: 'codex',
+                  status: 'ready',
+                  limits: [{ label: '7 days', usedPercent }],
+                },
+              },
+            },
+          ],
+        },
+      })
+      expect(document.querySelector('.account__usage-value')?.textContent).toBe(expected)
+      expect(document.querySelector('.account__meter')?.hasAttribute('data-low')).toBe(low)
+    }
+    rendered.rerender({
+      ...view,
+      props: { ...view.props, usageStates: [{ provider: 'codex', status: 'loading' }] },
+    })
+    expect(document.querySelector('.account__usage')).toBeNull()
+    rendered.rerender(view)
+
+    expect(screen.queryByRole('button', { name: /Switch to V[12]/ })).toBeNull()
+    expect(await screen.findByRole('textbox', { name: 'Search threads' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'New chat' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Add Project' })).toBeTruthy()
+    expect(document.querySelector('.account__name')?.textContent).toBe('Local profile')
+    const accountTrigger = screen.getByRole('button', { name: 'Account' })
+    expect(accountTrigger.querySelector('.account__usage-value')?.textContent).toBe('15% left')
+    expect(accountTrigger.querySelector('.account__usage')?.getAttribute('title')).toBe(
+      'Codex · 7 days · 15% left',
+    )
+    expect(accountTrigger.querySelector('.account__usage .account__usage-mark')).not.toBeNull()
+    expect(
+      accountTrigger.querySelector<HTMLElement>('.account__meter > span')?.style.transform,
+    ).toBe('scaleX(0.15)')
+    expect(accountTrigger.getAttribute('aria-expanded')).toBe('false')
+    // The gear beside the card opens Settings without going through the popup.
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
+    expect(onOpenSettings).toHaveBeenLastCalledWith()
+    expect(accountTrigger.getAttribute('aria-expanded')).toBe('false')
+    onOpenSettings.mockClear()
+    fireEvent.click(screen.getByRole('button', { name: 'New chat' }))
+    expect(onAddProject).toHaveBeenCalledOnce()
+    fireEvent.click(accountTrigger)
+    expect(accountTrigger.getAttribute('aria-expanded')).toBe('true')
+    const accountDialog = screen.getByRole('dialog', { name: 'Account and plan limits' })
+    expect(accountDialog).toBeTruthy()
+    expect(accountDialog.classList.contains('menu--compact')).toBe(true)
+    expect(accountDialog.classList.contains('menu--settings')).toBe(true)
+    // The limits show straight away; there is no second "Usage … left" row
+    // repeating them under the list.
+    const limits = await within(accountDialog).findByRole('region', { name: 'Codex' })
+    expect(within(accountDialog).queryByRole('button', { name: /Usage/ })).toBeNull()
+    expect(within(limits).getByText('7 days')).toBeTruthy()
+    expect(within(accountDialog).getAllByText('15% left')).toHaveLength(1)
+    const limitBar = screen.getByRole('progressbar', { name: 'Codex 7 days left' })
+    expect(limitBar.getAttribute('aria-valuenow')).toBe('15')
+    expect(
+      limitBar.closest<HTMLElement>('.account-menu__limit')!.style.getPropertyValue('--left'),
+    ).toBe('0.15')
+    expect(document.activeElement).toBe(
+      within(accountDialog).getByRole('region', { name: 'Plan limits' }),
+    )
+
+    expect(screen.queryAllByRole('menuitem')).toHaveLength(0)
+    const accountActions = screen
+      .getAllByRole('button')
+      .filter((button) => ['Edit profile', 'Settings'].includes(button.textContent ?? ''))
+    for (const item of accountActions) expect(item.querySelector('svg')).not.toBeNull()
+    expect(accountDialog.firstElementChild?.classList.contains('account-menu__usage')).toBe(true)
+    expect(accountDialog.lastElementChild?.classList.contains('account-menu__actions')).toBe(true)
+    expect(
+      within(accountDialog.lastElementChild as HTMLElement).getByRole('button', {
+        name: 'Edit profile',
+      }),
+    ).toBeTruthy()
+    expect(
+      within(accountDialog.lastElementChild as HTMLElement).getByRole('button', {
+        name: 'Settings',
+      }),
+    ).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Edit profile' }))
+    expect(onOpenSettings).toHaveBeenCalledWith('profile')
+    expect(accountTrigger.getAttribute('aria-expanded')).toBe('false')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Account' }))
+    fireEvent.keyDown(screen.getByRole('dialog'), { key: 'Escape' })
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Account' }))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Account' }))
+    fireEvent.click(
+      within(screen.getByRole('dialog', { name: 'Account and plan limits' })).getByRole('button', {
+        name: /Settings/,
+      }),
+    )
+    expect(onOpenSettings).toHaveBeenCalledTimes(2)
+    expect(onOpenSettings).toHaveBeenLastCalledWith()
+  })
+
+  it('offers Archive on hover and keeps rename and delete in the row menu', () => {
+    const onRenameSession = vi.fn()
+    const onDeleteSession = vi.fn()
+    const onArchiveSession = vi.fn()
+
+    render(
+      <Sidebar
+        projects={[
+          {
+            path: '/work/harness',
+            name: 'TasteCode',
+            sessions: [session('thread-1', 'Polish the sidebar')],
+          },
+        ]}
+        activeProjectPath="/work/harness"
+        activeSessionId="thread-1"
+        account={undefined}
+        providerName="Codex"
+        collapsed={false}
+        width={248}
+        onWidthChange={vi.fn()}
+        onClose={vi.fn()}
+        onAddProject={vi.fn()}
+        onNewSession={vi.fn()}
+        onSelectSession={vi.fn()}
+        onRenameProject={vi.fn()}
+        onRemoveProject={vi.fn()}
+        onTogglePin={vi.fn()}
+        onRenameSession={onRenameSession}
+        onDeleteSession={onDeleteSession}
+        onArchiveSession={onArchiveSession}
+        onArchiveProject={vi.fn()}
+        onReorderSession={vi.fn()}
+        onOpenSearch={vi.fn()}
+        onOpenSettings={vi.fn()}
+      />,
+    )
+
+    expect(screen.queryByRole('button', { name: 'Project options' })).toBeNull()
+    fireEvent.focus(screen.getByRole('button', { name: 'TasteCode' }))
+    expect(screen.getByRole('button', { name: 'Project options' })).toBeTruthy()
+
+    const chat = screen.getByText('Polish the sidebar').closest('button')!
+    // The provider is a mark in the gutter; its name stays in the label.
+    expect(chat.firstElementChild?.classList.contains('sess__provider')).toBe(true)
+    expect(chat.querySelector('.sess__provider svg')).toBeTruthy()
+    expect(within(chat).queryByText('Codex')).toBeNull()
+    expect(chat.getAttribute('aria-label')).toBe('Polish the sidebar, Codex')
+    // One pill marks the active chat, and only the active row draws it.
+    expect(document.querySelectorAll('.sessrow__indicator')).toHaveLength(1)
+    expect(
+      chat.closest('.sessrow')?.firstElementChild?.classList.contains('sessrow__indicator'),
+    ).toBe(true)
+
+    // One action on hover, and it does not take anything away.
+    const archive = screen.getByRole('button', { name: 'Archive Polish the sidebar' })
+    expect(archive.querySelector('svg')).not.toBeNull()
+    expect(chat.closest('.sessrow')?.classList.contains('has-action')).toBe(true)
+    expect(screen.queryByRole('button', { name: 'Delete Polish the sidebar' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Rename Polish the sidebar' })).toBeNull()
+    fireEvent.click(archive)
+    expect(onArchiveSession).toHaveBeenCalledWith('thread-1')
+
+    fireEvent.contextMenu(chat)
+    expect(screen.getAllByRole('menuitem').map((item) => item.textContent)).toEqual([
+      'Pin chat',
+      'Rename chat',
+      'Archive chat',
+      'Delete chat',
+    ])
+    expect(
+      screen
+        .getByRole('menuitem', { name: 'Delete chat' })
+        .classList.contains('menu__item--danger'),
+    ).toBe(true)
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Rename chat' }))
+    const input = screen.getByDisplayValue('Polish the sidebar')
+    expect(input.classList.contains('rename--chat')).toBe(true)
+    expect(input.getAttribute('aria-label')).toBe('Rename Polish the sidebar')
+    expect(input.closest('.sessrow')?.classList.contains('is-active')).toBe(true)
+    expect(input.closest('.sessrow')?.querySelector('.sessrow__indicator')).not.toBeNull()
+    fireEvent.change(input, { target: { value: 'Wider sidebar chats' } })
+    fireEvent.keyDown(input, { key: 'Enter', isComposing: true })
+    expect(onRenameSession).not.toHaveBeenCalled()
+    fireEvent.keyDown(input, { key: 'Enter' })
+    expect(onRenameSession).toHaveBeenCalledWith('thread-1', 'Wider sidebar chats')
+
+    fireEvent.contextMenu(screen.getByRole('button', { name: 'Polish the sidebar, Codex' }))
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Delete chat' }))
+    expect(onDeleteSession).toHaveBeenCalledWith('thread-1')
+  })
+
+  it('returns focus to the row after a rename ends with Enter or Escape, not on blur', () => {
+    const onRenameSession = vi.fn()
+    const onRenameProject = vi.fn()
+    render(
+      <Sidebar
+        projects={[
+          {
+            path: '/work/harness',
+            name: 'TasteCode',
+            sessions: [session('thread-1', 'Polish the sidebar')],
+          },
+        ]}
+        activeProjectPath="/work/harness"
+        activeSessionId="thread-1"
+        account={undefined}
+        providerName="Codex"
+        collapsed={false}
+        width={248}
+        onWidthChange={vi.fn()}
+        onClose={vi.fn()}
+        onAddProject={vi.fn()}
+        onNewSession={vi.fn()}
+        onSelectSession={vi.fn()}
+        onRenameProject={onRenameProject}
+        onRemoveProject={vi.fn()}
+        onTogglePin={vi.fn()}
+        onRenameSession={onRenameSession}
+        onDeleteSession={vi.fn()}
+        onArchiveProject={vi.fn()}
+        onReorderSession={vi.fn()}
+        onOpenSearch={vi.fn()}
+        onOpenSettings={vi.fn()}
+      />,
+    )
+    const chatRow = () => screen.getByRole('button', { name: 'Polish the sidebar, Codex' })
+    const renameChat = () => {
+      fireEvent.contextMenu(chatRow())
+      fireEvent.click(screen.getByRole('menuitem', { name: 'Rename chat' }))
+      return screen.getByRole('textbox', { name: 'Rename Polish the sidebar' })
+    }
+
+    let input = renameChat()
+    fireEvent.change(input, { target: { value: 'Wider sidebar chats' } })
+    // A cancelled keydown suppresses the keypress that would click the row.
+    expect(fireEvent.keyDown(input, { key: 'Enter' })).toBe(false)
+    expect(onRenameSession).toHaveBeenCalledWith('thread-1', 'Wider sidebar chats')
+    expect(document.activeElement).toBe(chatRow())
+
+    input = renameChat()
+    expect(fireEvent.keyDown(input, { key: 'Escape' })).toBe(false)
+    expect(document.activeElement).toBe(chatRow())
+
+    const elsewhere = document.createElement('button')
+    document.body.append(elsewhere)
+    try {
+      input = renameChat()
+      elsewhere.focus()
+      fireEvent.blur(input)
+      expect(screen.queryByRole('textbox', { name: 'Rename Polish the sidebar' })).toBeNull()
+      expect(document.activeElement).toBe(elsewhere)
+    } finally {
+      elsewhere.remove()
+    }
+
+    fireEvent.focus(screen.getByRole('button', { name: 'TasteCode' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Project options' }))
+    fireEvent.click(screen.getByRole('menuitem', { name: /Edit name/ }))
+    const projectInput = screen.getByDisplayValue('TasteCode')
+    fireEvent.change(projectInput, { target: { value: 'Harness' } })
+    fireEvent.keyDown(projectInput, { key: 'Enter' })
+    expect(onRenameProject).toHaveBeenCalledWith('/work/harness', 'Harness')
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'TasteCode' }))
+  })
+
+  it('names the project rename field after the project', () => {
+    renderProjectCatalog([{ path: '/work/proj', name: 'proj', sessions: [] }])
+
+    fireEvent.contextMenu(screen.getByRole('button', { name: 'proj' }))
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Edit name' }))
+
+    expect(screen.getByRole('textbox', { name: 'Rename proj' })).toBeTruthy()
+  })
+
+  it('confirms bulk archive and sidebar removal before acting', async () => {
+    const onArchiveProject = vi.fn()
+    const onRemoveProject = vi.fn()
+    render(
+      <Sidebar
+        projects={[
+          {
+            path: '/work/harness',
+            name: 'TasteCode',
+            sessions: [session('thread-1', 'First chat'), session('thread-2', 'Second chat')],
+          },
+        ]}
+        activeProjectPath="/work/harness"
+        activeSessionId="thread-1"
+        account={undefined}
+        providerName="Codex"
+        collapsed={false}
+        width={248}
+        onWidthChange={vi.fn()}
+        onClose={vi.fn()}
+        onAddProject={vi.fn()}
+        onNewSession={vi.fn()}
+        onSelectSession={vi.fn()}
+        onRenameProject={vi.fn()}
+        onRemoveProject={onRemoveProject}
+        onTogglePin={vi.fn()}
+        onRenameSession={vi.fn()}
+        onDeleteSession={vi.fn()}
+        onArchiveProject={onArchiveProject}
+        onReorderSession={vi.fn()}
+        onOpenSearch={vi.fn()}
+        onOpenSettings={vi.fn()}
+      />,
+    )
+
+    fireEvent.doubleClick(screen.getByRole('button', { name: 'TasteCode' }))
+    expect(screen.queryByDisplayValue('TasteCode')).toBeNull()
+
+    fireEvent.contextMenu(screen.getByRole('button', { name: 'TasteCode' }))
+    const pinItem = screen.getByRole('menuitem', { name: 'Pin to top' })
+    const editItem = screen.getByRole('menuitem', { name: 'Edit name' })
+    const archiveItem = screen.getByRole('menuitem', { name: 'Delete chats' })
+    const removeItem = screen.getByRole('menuitem', { name: 'Remove from sidebar' })
+    for (const item of [pinItem, editItem, archiveItem, removeItem]) {
+      expect(item.querySelector('svg')).not.toBeNull()
+    }
+    expect(removeItem.classList.contains('menu__item--danger')).toBe(true)
+
+    fireEvent.click(archiveItem)
+    const deleteDialog = await screen.findByRole('alertdialog', {
+      name: 'Delete 2 chats in TasteCode?',
+    })
+    expect(deleteDialog.textContent).toContain('/work/harness')
+    const deleteButton = screen.getByRole('button', { name: 'Delete 2 chats' })
+    expect(deleteButton.classList.contains('is-destructive')).toBe(true)
+    fireEvent.click(deleteButton)
+    expect(onArchiveProject).toHaveBeenCalledWith(['thread-1', 'thread-2'])
+
+    fireEvent.click(screen.getByRole('button', { name: 'Project options' }))
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Remove from sidebar' }))
+    const removeDialog = await screen.findByRole('alertdialog', {
+      name: 'Remove TasteCode from the sidebar?',
+    })
+    expect(removeDialog.closest('.sheet')?.parentElement).toBe(document.body)
+    expect(
+      screen.getByText(
+        'The folder and its 2 chats stay where they are. Add the folder again to bring them back.',
+      ),
+    ).toBeTruthy()
+    const removeButton = screen.getByRole('button', { name: 'Remove' })
+    // Only the sidebar entry goes, so removal is not dressed as destructive.
+    expect(removeButton.classList.contains('is-destructive')).toBe(false)
+    expect(document.activeElement?.textContent).toBe('Cancel')
+    fireEvent.click(removeButton)
+    expect(onRemoveProject).toHaveBeenCalledWith('/work/harness')
+  })
+
+  it('shows pinned chats once at the top and unpins them from their row menu', () => {
+    const onToggleSessionPin = vi.fn()
+    const pinned = { ...session('thread-1', 'Pinned chat'), pinned: true }
+    render(
+      <Sidebar
+        projects={[
+          {
+            path: '/work/harness',
+            name: 'TasteCode',
+            sessions: [pinned, session('thread-2', 'Regular chat')],
+          },
+        ]}
+        activeProjectPath="/work/harness"
+        activeSessionId="thread-1"
+        account={undefined}
+        providerName="Codex"
+        collapsed={false}
+        width={248}
+        onWidthChange={vi.fn()}
+        onClose={vi.fn()}
+        onAddProject={vi.fn()}
+        onNewSession={vi.fn()}
+        onSelectSession={vi.fn()}
+        onRenameProject={vi.fn()}
+        onRemoveProject={vi.fn()}
+        onTogglePin={vi.fn()}
+        onRenameSession={vi.fn()}
+        onToggleSessionPin={onToggleSessionPin}
+        onDeleteSession={vi.fn()}
+        onArchiveProject={vi.fn()}
+        onReorderSession={vi.fn()}
+        onOpenSearch={vi.fn()}
+        onOpenSettings={vi.fn()}
+      />,
+    )
+
+    expect(screen.getByText('Pinned')).toBeTruthy()
+    expect(screen.getAllByText('Pinned chat')).toHaveLength(1)
+    fireEvent.contextMenu(screen.getByRole('button', { name: 'Pinned chat, Codex' }))
+    for (const item of screen.getAllByRole('menuitem')) {
+      expect(item.querySelector('svg')).not.toBeNull()
+    }
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Unpin chat' }))
+    expect(onToggleSessionPin).toHaveBeenCalledWith('thread-1')
+  })
+
+  it.each([
+    ['ready', 'ready', 'is-success'],
+    ['failed', 'failed', 'is-failed'],
+    ['approval', 'waiting for approval', 'is-attention'],
+    ['input', 'needs attention', 'is-attention'],
+    ['queued', 'queued', 'is-attention'],
+  ] as const)('shows the %s thread status indicator', (status, label, indicator) => {
+    render(
+      <Sidebar
+        projects={[
+          {
+            path: '/work/harness',
+            name: 'TasteCode',
+            sessions: [{ ...session('thread-1', 'Status chat'), status, unread: true }],
+          },
+        ]}
+        activeProjectPath="/work/harness"
+        activeSessionId={undefined}
+        account={undefined}
+        providerName="Codex"
+        collapsed={false}
+        width={248}
+        onWidthChange={vi.fn()}
+        onClose={vi.fn()}
+        onAddProject={vi.fn()}
+        onNewSession={vi.fn()}
+        onSelectSession={vi.fn()}
+        onRenameProject={vi.fn()}
+        onRemoveProject={vi.fn()}
+        onTogglePin={vi.fn()}
+        onRenameSession={vi.fn()}
+        onDeleteSession={vi.fn()}
+        onArchiveProject={vi.fn()}
+        onReorderSession={vi.fn()}
+        onOpenSearch={vi.fn()}
+        onOpenSettings={vi.fn()}
+      />,
+    )
+
+    const row = screen.getByRole('button', { name: `Status chat, Codex, ${label}, unread` })
+    expect(row.querySelector(`.sess__status-dot.${indicator}`)).not.toBeNull()
+    expect(row.closest('.sessrow')?.classList.contains('is-unread')).toBe(true)
+    if (status === 'ready') {
+      expect(row.querySelector('.sess__unread-dot')).toBeNull()
+    }
+  })
+
+  it('keeps working and unread chats in the saved chat order', () => {
+    const unread = {
+      ...session('thread-unread', 'Just done'),
+      status: 'ready' as const,
+      unread: true,
+    }
+    const working = {
+      ...session('thread-working', 'Still running'),
+      status: 'working' as const,
+    }
+    render(
+      <Sidebar
+        projects={[
+          {
+            path: '/work/harness',
+            name: 'TasteCode',
+            sessions: [
+              session('thread-old', 'Older chat'),
+              unread,
+              working,
+              session('thread-new', 'Newer chat'),
+            ],
+          },
+        ]}
+        activeProjectPath="/work/harness"
+        activeSessionId="thread-old"
+        account={undefined}
+        providerName="Codex"
+        collapsed={false}
+        width={248}
+        onWidthChange={vi.fn()}
+        onClose={vi.fn()}
+        onAddProject={vi.fn()}
+        onNewSession={vi.fn()}
+        onSelectSession={vi.fn()}
+        onRenameProject={vi.fn()}
+        onRemoveProject={vi.fn()}
+        onTogglePin={vi.fn()}
+        onRenameSession={vi.fn()}
+        onDeleteSession={vi.fn()}
+        onArchiveProject={vi.fn()}
+        onReorderSession={vi.fn()}
+        onOpenSearch={vi.fn()}
+        onOpenSettings={vi.fn()}
+      />,
+    )
+
+    expect(
+      [...document.querySelectorAll('.proj__drawer .sess__title')].map(
+        (title) => title.textContent,
+      ),
+    ).toEqual(['Older chat', 'Just done', 'Still running', 'Newer chat'])
+    const justDone = screen.getByRole('button', { name: 'Just done, Codex, ready, unread' })
+    // Unread is the heavier title; the row's one slot shows the finished dot.
+    expect(justDone.querySelector('.sess__meta')?.children).toHaveLength(1)
+    expect(justDone.querySelector('.sess__meta > .sess__status-dot.is-success')).not.toBeNull()
+    expect(justDone.querySelector('.sess__unread-dot')).toBeNull()
+    expect(justDone.closest('.sessrow')?.classList.contains('is-unread')).toBe(true)
+  })
+
+  it('moves archived chats out of their project into Archived and restores them', () => {
+    const onRestoreSession = vi.fn()
+    const onSelectSession = vi.fn()
+    const archivedChat = (index: number): Session => ({
+      ...session(`thread-old-${index}`, `Finished work ${index}`),
+      lifecycle: { state: 'settled', settledAt: 100 - index, reason: 'manual' },
+    })
+    const working = { ...session('thread-busy', 'Busy chat'), status: 'working' as const }
+    const view = (active?: string) => (
+      <Sidebar
+        projects={[
+          {
+            path: '/work/harness',
+            name: 'TasteCode',
+            sessions: [
+              session('thread-1', 'Current work'),
+              working,
+              ...Array.from({ length: 12 }, (_, index) => archivedChat(index)),
+            ],
+          },
+        ]}
+        activeProjectPath="/work/harness"
+        activeSessionId={active}
+        account={undefined}
+        providerName="Codex"
+        collapsed={false}
+        width={248}
+        onWidthChange={vi.fn()}
+        onClose={vi.fn()}
+        onAddProject={vi.fn()}
+        onNewSession={vi.fn()}
+        onSelectSession={onSelectSession}
+        onRenameProject={vi.fn()}
+        onRemoveProject={vi.fn()}
+        onTogglePin={vi.fn()}
+        onRenameSession={vi.fn()}
+        onDeleteSession={vi.fn()}
+        onArchiveSession={vi.fn()}
+        onRestoreSession={onRestoreSession}
+        onArchiveProject={vi.fn()}
+        onReorderSession={vi.fn()}
+        onOpenSearch={vi.fn()}
+        onOpenSettings={vi.fn()}
+      />
+    )
+    const rendered = render(view('thread-1'))
+
+    expect(
+      [...document.querySelectorAll('.proj__drawer .sess__title')].map(
+        (title) => title.textContent,
+      ),
+    ).toEqual(['Current work', 'Busy chat'])
+    // A running chat keeps its spinner under the pointer and offers no archive.
+    const busy = screen.getByRole('button', { name: 'Busy chat, Codex, working' })
+    expect(busy.querySelector('.sess__spinner')).not.toBeNull()
+    expect(busy.closest('.sessrow')?.classList.contains('has-action')).toBe(false)
+    expect(screen.queryByRole('button', { name: 'Archive Busy chat' })).toBeNull()
+
+    const toggle = screen.getByRole('button', { name: 'Archived, 12 chats' })
+    expect(toggle.getAttribute('aria-expanded')).toBe('false')
+    expect(screen.queryByText('Finished work 0')).toBeNull()
+    fireEvent.click(toggle)
+    // The most recently archived first, in batches of ten.
+    const archived = screen.getByRole('region', { name: 'Archived' })
+    expect(archived.querySelectorAll('.sessrow')).toHaveLength(10)
+    expect(archived.querySelector('.sess__title')?.textContent).toBe('Finished work 0')
+    fireEvent.click(within(archived).getByRole('button', { name: 'Show more' }))
+    expect(archived.querySelectorAll('.sessrow')).toHaveLength(12)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Restore Finished work 3' }))
+    expect(onRestoreSession).toHaveBeenCalledWith('thread-old-3')
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Finished work 3, Codex, archived, TasteCode' }),
+    )
+    expect(onSelectSession).toHaveBeenCalledWith('thread-old-3')
+
+    // An open archived chat keeps the section open around it.
+    fireEvent.click(toggle)
+    expect(toggle.getAttribute('aria-expanded')).toBe('false')
+    rendered.rerender(view('thread-old-11'))
+    expect(toggle.getAttribute('aria-expanded')).toBe('true')
+    expect(
+      screen
+        .getByRole('button', { name: 'Finished work 11, Codex, archived, TasteCode' })
+        .closest('.sessrow')
+        ?.querySelector('.sessrow__indicator'),
+    ).not.toBeNull()
+  })
+
+  it('lists chats that need you above the tree and clears an entry once it is read', () => {
+    const onSelectSession = vi.fn()
+    const onMarkSessionRead = vi.fn()
+    const approval = {
+      ...session('thread-approval', 'Run the migration'),
+      status: 'approval' as const,
+      statusSince: 1,
+    }
+    const failed = {
+      ...session('thread-failed', 'Build the release'),
+      status: 'failed' as const,
+      unread: true,
+      statusSince: 2,
+    }
+    // A finished answer stays in the tree only.
+    const done = {
+      ...session('thread-done', 'Answer is ready'),
+      status: 'ready' as const,
+      unread: true,
+      statusSince: 3,
+    }
+    const tree = (sessions: Session[]) => [{ path: '/work/harness', name: 'TasteCode', sessions }]
+    const view = (projects: ReturnType<typeof tree>, active?: string) => (
+      <Sidebar
+        projects={projects}
+        activeProjectPath="/work/harness"
+        activeSessionId={active}
+        account={undefined}
+        providerName="Codex"
+        collapsed={false}
+        width={248}
+        onWidthChange={vi.fn()}
+        onClose={vi.fn()}
+        onAddProject={vi.fn()}
+        onNewSession={vi.fn()}
+        onSelectSession={onSelectSession}
+        onRenameProject={vi.fn()}
+        onRemoveProject={vi.fn()}
+        onTogglePin={vi.fn()}
+        onRenameSession={vi.fn()}
+        onDeleteSession={vi.fn()}
+        onMarkSessionRead={onMarkSessionRead}
+        onArchiveProject={vi.fn()}
+        onReorderSession={vi.fn()}
+        onOpenSearch={vi.fn()}
+        onOpenSettings={vi.fn()}
+      />
+    )
+    const waiting = tree([session('thread-quiet', 'Quiet chat'), approval, failed, done])
+    const rendered = render(view(waiting))
+
+    const band = screen.getByRole('region', { name: 'Needs you' })
+    expect(
+      within(band)
+        .getAllByRole('button')
+        .map((button) => button.getAttribute('aria-label')),
+    ).toEqual([
+      'Run the migration, waiting for approval, TasteCode',
+      'Build the release, failed, TasteCode',
+      'Mark Build the release as read',
+    ])
+    // The tree below keeps its own order and lists each chat once more.
+    expect(
+      [...document.querySelectorAll('.proj__drawer .sess__title')].map(
+        (title) => title.textContent,
+      ),
+    ).toEqual(['Quiet chat', 'Run the migration', 'Build the release', 'Answer is ready'])
+
+    fireEvent.click(within(band).getByRole('button', { name: 'Mark Build the release as read' }))
+    expect(onMarkSessionRead).toHaveBeenCalledWith('thread-failed')
+    fireEvent.click(within(band).getByRole('button', { name: /^Run the migration,/ }))
+    expect(onSelectSession).toHaveBeenCalledWith('thread-approval')
+
+    // The open chat is already in front of the user.
+    rendered.rerender(view(waiting, 'thread-approval'))
+    expect(
+      within(screen.getByRole('region', { name: 'Needs you' })).queryByRole('button', {
+        name: /^Run the migration,/,
+      }),
+    ).toBeNull()
+
+    // Answered and read: nothing waits, and the band takes no space at all.
+    rendered.rerender(
+      view(
+        tree([
+          session('thread-quiet', 'Quiet chat'),
+          { ...approval, status: 'idle' },
+          { ...failed, unread: false },
+          done,
+        ]),
+      ),
+    )
+    expect(screen.queryByRole('region', { name: 'Needs you' })).toBeNull()
+    expect(document.querySelector('.needs-band')).toBeNull()
+  })
+
+  it('folds the band after five chats, three on a short window, and counts a folded project', () => {
+    // An earlier test's matchMedia stub must not answer for this one; happy-dom
+    // evaluates the real queries against its page viewport.
+    vi.restoreAllMocks()
+    const page = (window as unknown as { happyDOM: { setViewport(size: object): void } }).happyDOM
+    const height = window.innerHeight
+    const resizeTo = (value: number) => act(() => page.setViewport({ height: value }))
+    resizeTo(900)
+    onTestFinished(() => page.setViewport({ height }))
+    const waiting = Array.from({ length: 7 }, (_, index) => ({
+      ...session(`thread-${index}`, `Waiting ${index}`),
+      status: 'input' as const,
+      statusSince: index,
+    }))
+    render(
+      <Sidebar
+        projects={[
+          { path: '/work/open', name: 'Open project', sessions: [session('open-1', 'Open chat')] },
+          { path: '/work/folded', name: 'Folded project', sessions: waiting },
+        ]}
+        activeProjectPath="/work/open"
+        activeSessionId="open-1"
+        account={undefined}
+        providerName="Codex"
+        collapsed={false}
+        width={248}
+        onWidthChange={vi.fn()}
+        onClose={vi.fn()}
+        onAddProject={vi.fn()}
+        onNewSession={vi.fn()}
+        onSelectSession={vi.fn()}
+        onRenameProject={vi.fn()}
+        onRemoveProject={vi.fn()}
+        onTogglePin={vi.fn()}
+        onRenameSession={vi.fn()}
+        onDeleteSession={vi.fn()}
+        onArchiveProject={vi.fn()}
+        onReorderSession={vi.fn()}
+        onOpenSearch={vi.fn()}
+        onOpenSettings={vi.fn()}
+      />,
+    )
+
+    const band = screen.getByRole('region', { name: 'Needs you' })
+    expect(band.querySelectorAll('.sessrow')).toHaveLength(5)
+    // Questions cannot be marked read: they leave once answered in the chat.
+    expect(within(band).queryByRole('button', { name: /^Mark / })).toBeNull()
+    fireEvent.click(within(band).getByRole('button', { name: '+2 more' }))
+    expect(band.querySelectorAll('.sessrow')).toHaveLength(7)
+    fireEvent.click(within(band).getByRole('button', { name: 'Show less' }))
+    expect(band.querySelectorAll('.sessrow')).toHaveLength(5)
+
+    // Below 800 px of window height the band keeps three rows.
+    resizeTo(799)
+    expect(band.querySelectorAll('.sessrow')).toHaveLength(3)
+    expect(within(band).getByRole('button', { name: '+4 more' })).toBeTruthy()
+    resizeTo(800)
+    expect(band.querySelectorAll('.sessrow')).toHaveLength(5)
+
+    const folded = screen.getByRole('button', { name: 'Folded project, 7 need you' })
+    expect(folded.getAttribute('aria-expanded')).toBe('false')
+    expect(folded.querySelector('.proj__attention')?.getAttribute('data-attention')).toBe('input')
+    fireEvent.click(folded)
+    expect(
+      screen.getByRole('button', { name: 'Folded project' }).querySelector('.proj__attention'),
+    ).toBeNull()
+  })
+
+  it('keeps band rows to their title on a rail under 220 px', () => {
+    const view = (width: number) => (
+      <Sidebar
+        projects={[
+          {
+            path: '/work/harness',
+            name: 'TasteCode',
+            sessions: [{ ...session('thread-1', 'Run the migration'), status: 'approval' }],
+          },
+        ]}
+        activeProjectPath="/work/harness"
+        activeSessionId={undefined}
+        account={undefined}
+        providerName="Codex"
+        collapsed={false}
+        width={width}
+        onWidthChange={vi.fn()}
+        onClose={vi.fn()}
+        onAddProject={vi.fn()}
+        onNewSession={vi.fn()}
+        onSelectSession={vi.fn()}
+        onRenameProject={vi.fn()}
+        onRemoveProject={vi.fn()}
+        onTogglePin={vi.fn()}
+        onRenameSession={vi.fn()}
+        onDeleteSession={vi.fn()}
+        onArchiveProject={vi.fn()}
+        onReorderSession={vi.fn()}
+        onOpenSearch={vi.fn()}
+        onOpenSettings={vi.fn()}
+      />
+    )
+    const rendered = render(view(256))
+    const band = screen.getByRole('region', { name: 'Needs you' })
+    expect(band.querySelector('.sess__project')?.textContent).toBe('TasteCode')
+    expect(document.querySelector('.rail__body')?.hasAttribute('data-narrow')).toBe(false)
+
+    rendered.rerender(view(219))
+    expect(document.querySelector('.rail__body')?.hasAttribute('data-narrow')).toBe(true)
+    rendered.rerender(view(220))
+    expect(document.querySelector('.rail__body')?.hasAttribute('data-narrow')).toBe(false)
+  })
+
+  it('shows five project chats until the list is expanded', () => {
+    render(
+      <Sidebar
+        projects={[
+          {
+            path: '/work/harness',
+            name: 'TasteCode',
+            sessions: Array.from({ length: 7 }, (_, index) =>
+              session(`thread-${index + 1}`, `Chat ${index + 1}`),
+            ),
+          },
+        ]}
+        activeProjectPath="/work/harness"
+        activeSessionId="thread-1"
+        account={undefined}
+        providerName="Codex"
+        collapsed={false}
+        width={248}
+        onWidthChange={vi.fn()}
+        onClose={vi.fn()}
+        onAddProject={vi.fn()}
+        onNewSession={vi.fn()}
+        onSelectSession={vi.fn()}
+        onRenameProject={vi.fn()}
+        onRemoveProject={vi.fn()}
+        onTogglePin={vi.fn()}
+        onRenameSession={vi.fn()}
+        onDeleteSession={vi.fn()}
+        onArchiveProject={vi.fn()}
+        onReorderSession={vi.fn()}
+        onOpenSearch={vi.fn()}
+        onOpenSettings={vi.fn()}
+      />,
+    )
+
+    expect(screen.getByRole('button', { name: 'Chat 5, Codex' })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Chat 6, Codex' })).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Show 2 more' }))
+    expect(screen.getByRole('button', { name: 'Chat 7, Codex' })).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Show less' }))
+    expect(screen.queryByRole('button', { name: 'Chat 6, Codex' })).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Show 2 more' }))
+    fireEvent.click(screen.getByRole('button', { name: 'TasteCode' }))
+    fireEvent.click(screen.getByRole('button', { name: 'TasteCode' }))
+    expect(screen.queryByRole('button', { name: 'Chat 6, Codex' })).toBeNull()
+    expect(screen.getByRole('button', { name: 'Show 2 more' })).toBeTruthy()
+  })
+
+  it('keeps a working, unread or open chat below the fold in sight, at its own place', () => {
+    const chats: Session[] = Array.from({ length: 9 }, (_, index) =>
+      session(`thread-${index + 1}`, `Chat ${index + 1}`),
+    )
+    chats[6] = { ...chats[6]!, status: 'working' }
+    chats[7] = { ...chats[7]!, status: 'ready', unread: true }
+    const content = (activeSessionId: string) => (
+      <Sidebar
+        projects={[{ path: '/work/harness', name: 'TasteCode', sessions: chats }]}
+        activeProjectPath="/work/harness"
+        activeSessionId={activeSessionId}
+        account={undefined}
+        providerName="Codex"
+        collapsed={false}
+        width={248}
+        onWidthChange={vi.fn()}
+        onClose={vi.fn()}
+        onAddProject={vi.fn()}
+        onNewSession={vi.fn()}
+        onSelectSession={vi.fn()}
+        onRenameProject={vi.fn()}
+        onRemoveProject={vi.fn()}
+        onTogglePin={vi.fn()}
+        onRenameSession={vi.fn()}
+        onDeleteSession={vi.fn()}
+        onArchiveProject={vi.fn()}
+        onReorderSession={vi.fn()}
+        onOpenSearch={vi.fn()}
+        onOpenSettings={vi.fn()}
+      />
+    )
+    const titles = () =>
+      [...document.querySelectorAll('.proj__drawer .sess__title')].map((title) => title.textContent)
+    const firstFive = ['Chat 1', 'Chat 2', 'Chat 3', 'Chat 4', 'Chat 5']
+    const view = render(content('thread-1'))
+
+    // Rows 7 and 8 keep their places; the quiet rows 6 and 9 stay folded.
+    expect(titles()).toEqual([...firstFive, 'Chat 7', 'Chat 8'])
+    const working = screen.getByRole('button', { name: 'Chat 7, Codex, working' })
+    expect(working.querySelector('.sess__spinner')).not.toBeNull()
+    const unread = screen.getByRole('button', { name: 'Chat 8, Codex, ready, unread' })
+    expect(unread.closest('.sessrow')?.classList.contains('is-unread')).toBe(true)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Show 2 more' }))
+    expect(titles()).toEqual([...firstFive, 'Chat 6', 'Chat 7', 'Chat 8', 'Chat 9'])
+    fireEvent.click(screen.getByRole('button', { name: 'Show less' }))
+    expect(titles()).toEqual([...firstFive, 'Chat 7', 'Chat 8'])
+
+    // The open chat shows where it stands, with the active pill, until another chat opens.
+    view.rerender(content('thread-9'))
+    expect(titles()).toEqual([...firstFive, 'Chat 7', 'Chat 8', 'Chat 9'])
+    const open = screen.getByRole('button', { name: 'Chat 9, Codex' }).closest('.sessrow')
+    expect(open?.querySelector('.sessrow__indicator')).not.toBeNull()
+    expect(screen.getByRole('button', { name: 'Show 1 more' })).toBeTruthy()
+
+    view.rerender(content('thread-2'))
+    expect(titles()).toEqual([...firstFive, 'Chat 7', 'Chat 8'])
+    expect(screen.getByRole('button', { name: 'Show 2 more' })).toBeTruthy()
+  })
+
+  it('drops the fold toggle once every chat below the fold is in sight', () => {
+    const chats: Session[] = Array.from({ length: 6 }, (_, index) =>
+      session(`thread-${index + 1}`, `Chat ${index + 1}`),
+    )
+    chats[5] = { ...chats[5]!, status: 'approval' }
+    render(
+      <Sidebar
+        projects={[{ path: '/work/harness', name: 'TasteCode', sessions: chats }]}
+        activeProjectPath="/work/harness"
+        activeSessionId="thread-1"
+        account={undefined}
+        providerName="Codex"
+        collapsed={false}
+        width={248}
+        onWidthChange={vi.fn()}
+        onClose={vi.fn()}
+        onAddProject={vi.fn()}
+        onNewSession={vi.fn()}
+        onSelectSession={vi.fn()}
+        onRenameProject={vi.fn()}
+        onRemoveProject={vi.fn()}
+        onTogglePin={vi.fn()}
+        onRenameSession={vi.fn()}
+        onDeleteSession={vi.fn()}
+        onArchiveProject={vi.fn()}
+        onReorderSession={vi.fn()}
+        onOpenSearch={vi.fn()}
+        onOpenSettings={vi.fn()}
+      />,
+    )
+
+    const drawer = document.querySelector<HTMLElement>('.proj__drawer')!
+    expect(
+      within(drawer).getByRole('button', { name: 'Chat 6, Codex, waiting for approval' }),
+    ).toBeTruthy()
+    expect(drawer.querySelector('.proj__sessions-toggle')).toBeNull()
+  })
+
+  it('reorders a chat that shows below the fold', () => {
+    const onReorderSession = vi.fn()
+    const chats: Session[] = Array.from({ length: 8 }, (_, index) =>
+      session(`thread-${index + 1}`, `Chat ${index + 1}`),
+    )
+    chats[6] = { ...chats[6]!, status: 'working' }
+    render(
+      <Sidebar
+        projects={[{ path: '/work/harness', name: 'TasteCode', sessions: chats }]}
+        activeProjectPath="/work/harness"
+        activeSessionId="thread-1"
+        account={undefined}
+        providerName="Codex"
+        collapsed={false}
+        width={248}
+        onWidthChange={vi.fn()}
+        onClose={vi.fn()}
+        onAddProject={vi.fn()}
+        onNewSession={vi.fn()}
+        onSelectSession={vi.fn()}
+        onRenameProject={vi.fn()}
+        onRemoveProject={vi.fn()}
+        onTogglePin={vi.fn()}
+        onRenameSession={vi.fn()}
+        onDeleteSession={vi.fn()}
+        onArchiveProject={vi.fn()}
+        onReorderSession={onReorderSession}
+        onOpenSearch={vi.fn()}
+        onOpenSettings={vi.fn()}
+      />,
+    )
+
+    const source = screen.getByRole('button', { name: 'Chat 7, Codex, working' }).closest('li')!
+    const target = screen.getByRole('button', { name: 'Chat 2, Codex' }).closest('li')!
+    const rows = Array.from(document.querySelectorAll<HTMLElement>('[data-archive-session-id]'))
+    rows.forEach((row, index) => mockRowRect(row, index * 30, 30))
+    const start = rows.indexOf(source) * 30 + 15
+    // Up past the threshold, then into Chat 2's slot.
+    fireEvent.pointerDown(source, { button: 0, pointerId: 1, clientY: start })
+    fireEvent.pointerMove(source, { pointerId: 1, clientY: start - 6 })
+    fireEvent.pointerMove(source, { pointerId: 1, clientY: rows.indexOf(target) * 30 + 8 })
+    fireEvent.pointerUp(source, { pointerId: 1 })
+
+    expect(onReorderSession).toHaveBeenCalledWith('/work/harness', 'thread-7', 'thread-2', 'before')
+  })
+
+  it('keeps a folded project bounded when many chats below the fold are unread', () => {
+    const chats: Session[] = Array.from({ length: 100 }, (_, index) => ({
+      ...session(`thread-${index + 1}`, `Chat ${index + 1}`),
+      ...(index >= 5 && index < 90 ? { status: 'ready' as const, unread: true } : {}),
+    }))
+    render(
+      <Sidebar
+        projects={[{ path: '/work/large', name: 'Large project', sessions: chats }]}
+        activeProjectPath="/work/large"
+        activeSessionId="thread-1"
+        account={undefined}
+        providerName="Codex"
+        collapsed={false}
+        width={248}
+        onWidthChange={vi.fn()}
+        onClose={vi.fn()}
+        onAddProject={vi.fn()}
+        onNewSession={vi.fn()}
+        onSelectSession={vi.fn()}
+        onRenameProject={vi.fn()}
+        onRemoveProject={vi.fn()}
+        onTogglePin={vi.fn()}
+        onRenameSession={vi.fn()}
+        onDeleteSession={vi.fn()}
+        onArchiveProject={vi.fn()}
+        onReorderSession={vi.fn()}
+        onOpenSearch={vi.fn()}
+        onOpenSettings={vi.fn()}
+      />,
+    )
+
+    const list = screen.getByRole('list', { name: 'Large project chats' })
+    expect(list.querySelectorAll('.sessrow').length).toBeLessThanOrEqual(28)
+    list.scrollTop = 90 * 30
+    fireEvent.scroll(list)
+    const last = screen.getByRole('button', { name: 'Chat 90, Codex, ready, unread' }).closest('li')
+    expect(last?.getAttribute('aria-posinset')).toBe('90')
+    expect(last?.getAttribute('aria-setsize')).toBe('90')
+    expect(screen.queryByRole('button', { name: 'Chat 91, Codex' })).toBeNull()
+    expect(screen.getByRole('button', { name: 'Show 10 more' })).toBeTruthy()
+  })
+
+  it.each([65, 10_000])(
+    'keeps a %d-chat expanded project bounded while every chat stays reachable',
+    (sessionCount) => {
+      let commitCount = 0
+      render(
+        <Profiler id="large-sidebar" onRender={() => (commitCount += 1)}>
+          <Sidebar
+            projects={[
+              {
+                path: '/work/large',
+                name: 'Large project',
+                sessions: Array.from({ length: sessionCount }, (_, index) =>
+                  session(`thread-${index + 1}`, `Chat ${index + 1}`),
+                ),
+              },
+            ]}
+            activeProjectPath="/work/large"
+            activeSessionId="thread-1"
+            account={undefined}
+            providerName="Codex"
+            collapsed={false}
+            width={248}
+            onWidthChange={vi.fn()}
+            onClose={vi.fn()}
+            onAddProject={vi.fn()}
+            onNewSession={vi.fn()}
+            onSelectSession={vi.fn()}
+            onRenameProject={vi.fn()}
+            onRemoveProject={vi.fn()}
+            onTogglePin={vi.fn()}
+            onRenameSession={vi.fn()}
+            onDeleteSession={vi.fn()}
+            onArchiveProject={vi.fn()}
+            onReorderSession={vi.fn()}
+            onOpenSearch={vi.fn()}
+            onOpenSettings={vi.fn()}
+          />
+        </Profiler>,
+      )
+
+      fireEvent.click(screen.getByRole('button', { name: `Show ${sessionCount - 5} more` }))
+      const list = screen.getByRole('list', { name: 'Large project chats' })
+      expect(list.getAttribute('tabindex')).toBe('0')
+      expect(list.querySelectorAll('.sessrow').length).toBeLessThanOrEqual(28)
+      expect(screen.queryByRole('button', { name: `Chat ${sessionCount}, Codex` })).toBeNull()
+
+      const commitsBeforeSameRangeScroll = commitCount
+      list.scrollTop = 1
+      fireEvent.scroll(list)
+      list.scrollTop = 29
+      fireEvent.scroll(list)
+      expect(commitCount).toBe(commitsBeforeSameRangeScroll)
+
+      list.scrollTop = 30
+      fireEvent.scroll(list)
+      expect(commitCount).toBe(commitsBeforeSameRangeScroll + 1)
+
+      list.scrollTop = sessionCount * 30
+      fireEvent.scroll(list)
+
+      const last = screen.getByRole('button', { name: `Chat ${sessionCount}, Codex` }).closest('li')
+      expect(last?.getAttribute('aria-posinset')).toBe(String(sessionCount))
+      expect(last?.getAttribute('aria-setsize')).toBe(String(sessionCount))
+      expect(list.querySelectorAll('.sessrow').length).toBeLessThanOrEqual(28)
+    },
+  )
+
+  it('keeps an expanded long project scrolled in place when a chat is deleted or restored', () => {
+    const sessions = Array.from({ length: 70 }, (_, index) =>
+      session(`thread-${index + 1}`, `Chat ${index + 1}`),
+    )
+    const content = (projectSessions: typeof sessions, activeSessionId: string) => (
+      <Sidebar
+        projects={[{ path: '/work/large', name: 'Large project', sessions: projectSessions }]}
+        activeProjectPath="/work/large"
+        activeSessionId={activeSessionId}
+        account={undefined}
+        providerName="Codex"
+        collapsed={false}
+        width={248}
+        onWidthChange={vi.fn()}
+        onClose={vi.fn()}
+        onAddProject={vi.fn()}
+        onNewSession={vi.fn()}
+        onSelectSession={vi.fn()}
+        onRenameProject={vi.fn()}
+        onRemoveProject={vi.fn()}
+        onTogglePin={vi.fn()}
+        onRenameSession={vi.fn()}
+        onDeleteSession={vi.fn()}
+        onArchiveProject={vi.fn()}
+        onReorderSession={vi.fn()}
+        onOpenSearch={vi.fn()}
+        onOpenSettings={vi.fn()}
+      />
+    )
+    const view = render(content(sessions, 'thread-1'))
+    fireEvent.click(screen.getByRole('button', { name: 'Show 65 more' }))
+    const list = screen.getByRole('list', { name: 'Large project chats' })
+    list.scrollTop = 60 * 30
+    fireEvent.scroll(list)
+
+    view.rerender(
+      content(
+        sessions.filter((entry) => entry.id !== 'thread-61'),
+        'thread-1',
+      ),
+    )
+    expect(list.scrollTop).toBe(60 * 30)
+    expect(screen.getByRole('button', { name: 'Chat 62, Codex' })).toBeTruthy()
+
+    view.rerender(content(sessions, 'thread-1'))
+    expect(list.scrollTop).toBe(60 * 30)
+    expect(screen.getByRole('button', { name: 'Chat 61, Codex' })).toBeTruthy()
+
+    view.rerender(content(sessions, 'thread-40'))
+    expect(list.scrollTop).toBe(39 * 30 - 8 * 30)
+  })
+
+  it('starts with only the active project expanded', () => {
+    vi.useFakeTimers()
+    const view = render(
+      <Sidebar
+        projects={[
+          { path: '/work/active', name: 'Active', sessions: [session('active-1', 'Active chat')] },
+          { path: '/work/quiet', name: 'Quiet', sessions: [session('quiet-1', 'Quiet chat')] },
+        ]}
+        activeProjectPath="/work/active"
+        activeSessionId="active-1"
+        account={undefined}
+        providerName="Codex"
+        collapsed={false}
+        width={248}
+        onWidthChange={vi.fn()}
+        onClose={vi.fn()}
+        onAddProject={vi.fn()}
+        onNewSession={vi.fn()}
+        onSelectSession={vi.fn()}
+        onRenameProject={vi.fn()}
+        onRemoveProject={vi.fn()}
+        onTogglePin={vi.fn()}
+        onRenameSession={vi.fn()}
+        onDeleteSession={vi.fn()}
+        onArchiveProject={vi.fn()}
+        onReorderSession={vi.fn()}
+        onOpenSearch={vi.fn()}
+        onOpenSettings={vi.fn()}
+      />,
+    )
+
+    expect(screen.getByRole('button', { name: 'Active' }).getAttribute('aria-expanded')).toBe(
+      'true',
+    )
+    expect(screen.getByRole('button', { name: 'Quiet' }).getAttribute('aria-expanded')).toBe(
+      'false',
+    )
+    expect(view.container.querySelectorAll('.sess')).toHaveLength(1)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Active' }))
+    expect(view.container.querySelectorAll('.sess')).toHaveLength(1)
+    act(() => vi.advanceTimersByTime(260))
+    expect(view.container.querySelectorAll('.sess')).toHaveLength(0)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Quiet' }))
+    expect(view.container.querySelectorAll('.sess')).toHaveLength(1)
+    vi.useRealTimers()
+  })
+
+  it('keeps opened projects expanded when switching projects or leaving the active chat', () => {
+    const projects = [
+      { path: '/work/first', name: 'First', sessions: [] as [] },
+      { path: '/work/second', name: 'Second', sessions: [] as [] },
+      { path: '/work/third', name: 'Third', sessions: [] as [] },
+    ]
+    const view = renderProjectCatalog(projects, '/work/first')
+    const expanded = (name: string) =>
+      screen.getByRole('button', { name }).getAttribute('aria-expanded')
+    fireEvent.click(screen.getByRole('button', { name: 'Second' }))
+    view.navigate('/work/second')
+    expect(expanded('First')).toBe('true')
+    expect(expanded('Second')).toBe('true')
+    expect(expanded('Third')).toBe('false')
+
+    view.navigate()
+    expect(expanded('First')).toBe('true')
+    expect(expanded('Second')).toBe('true')
+
+    fireEvent.click(screen.getByRole('button', { name: 'First' }))
+    view.navigate('/work/third')
+    expect(expanded('First')).toBe('false')
+    expect(expanded('Second')).toBe('true')
+    expect(expanded('Third')).toBe('true')
+
+    view.navigate('/work/first')
+    expect(expanded('First')).toBe('true')
+    expect(expanded('Third')).toBe('true')
+  })
+
+  it('reorders chats when one is dragged between sidebar rows', () => {
+    const onReorderSession = vi.fn()
+    const onSelectSession = vi.fn()
+
+    render(
+      <Sidebar
+        projects={[
+          {
+            path: '/work/harness',
+            name: 'TasteCode',
+            sessions: [session('thread-1', 'First chat'), session('thread-2', 'Second chat')],
+          },
+        ]}
+        activeProjectPath="/work/harness"
+        activeSessionId="thread-1"
+        account={undefined}
+        providerName="Codex"
+        collapsed={false}
+        width={248}
+        onWidthChange={vi.fn()}
+        onClose={vi.fn()}
+        onAddProject={vi.fn()}
+        onNewSession={vi.fn()}
+        onSelectSession={onSelectSession}
+        onRenameProject={vi.fn()}
+        onRemoveProject={vi.fn()}
+        onTogglePin={vi.fn()}
+        onRenameSession={vi.fn()}
+        onDeleteSession={vi.fn()}
+        onArchiveProject={vi.fn()}
+        onReorderSession={onReorderSession}
+        onOpenSearch={vi.fn()}
+        onOpenSettings={vi.fn()}
+      />,
+    )
+
+    const source = screen.getByRole('button', { name: 'First chat, Codex' }).closest('li')!
+    const target = screen.getByRole('button', { name: 'Second chat, Codex' }).closest('li')!
+    mockRowRect(source, 30, 30)
+    mockRowRect(target, 60, 30)
+
+    fireEvent.pointerDown(source, { button: 0, pointerId: 1, clientY: 45 })
+    expect(prepareHaptics).toHaveBeenCalledOnce()
+    fireEvent.pointerMove(source, { pointerId: 1, clientY: 47 })
+    expect(source.classList.contains('is-row-dragging')).toBe(false)
+    // Crossing the threshold picks the row up where it lies, without a jump.
+    fireEvent.pointerMove(source, { pointerId: 1, clientY: 52 })
+    expect(source.classList.contains('is-row-dragging')).toBe(true)
+    expect(source.style.translate).toBeFalsy()
+    fireEvent.pointerMove(source, { pointerId: 1, clientY: 92 })
+    // The held row rides with the pointer (clamped to the list); the other
+    // slides up into its slot.
+    expect(source.style.translate).toBe('0 30px')
+    expect(target.classList.contains('is-row-shifting')).toBe(true)
+    expect(target.style.translate).toBe('0 -30px')
+    expect(performHaptic).toHaveBeenCalledExactlyOnceWith('alignment')
+    expect(onReorderSession).not.toHaveBeenCalled()
+
+    fireEvent.pointerUp(source, { pointerId: 1 })
+    expect(onReorderSession).toHaveBeenCalledExactlyOnceWith(
+      '/work/harness',
+      'thread-1',
+      'thread-2',
+      'after',
+    )
+    expect(source.style.translate).toBe('')
+    expect(target.style.translate).toBe('')
+    // The release that ended the drag must not open the chat.
+    fireEvent.click(screen.getByRole('button', { name: 'First chat, Codex' }))
+    expect(onSelectSession).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', { name: 'First chat, Codex' }))
+    expect(onSelectSession).toHaveBeenCalledExactlyOnceWith('thread-1')
+
+    onReorderSession.mockClear()
+    fireEvent.pointerDown(source, { button: 0, pointerId: 2, clientY: 45 })
+    fireEvent.pointerMove(source, { pointerId: 2, clientY: 52 })
+    fireEvent.pointerMove(source, { pointerId: 2, clientY: 92 })
+    expect(target.style.translate).toBe('0 -30px')
+    fireEvent.keyDown(window, { key: 'Escape' })
+    fireEvent.pointerUp(source, { pointerId: 2 })
+    expect(onReorderSession).not.toHaveBeenCalled()
+    expect(target.style.translate).toBe('')
+  })
+
+  it('carries a chat out of the rail to the drop target without reordering or opening it', () => {
+    const onReorderSession = vi.fn()
+    const onSelectSession = vi.fn()
+    const target = { move: vi.fn(), drop: vi.fn(), leave: vi.fn() }
+    render(
+      <Sidebar
+        projects={[
+          {
+            path: '/work/harness',
+            name: 'TasteCode',
+            sessions: [session('thread-1', 'First chat'), session('thread-2', 'Second chat')],
+          },
+        ]}
+        activeProjectPath="/work/harness"
+        activeSessionId="thread-2"
+        account={undefined}
+        providerName="Codex"
+        collapsed={false}
+        width={248}
+        onWidthChange={vi.fn()}
+        onClose={vi.fn()}
+        onAddProject={vi.fn()}
+        onNewSession={vi.fn()}
+        onSelectSession={onSelectSession}
+        sessionDropTarget={target}
+        onRenameProject={vi.fn()}
+        onRemoveProject={vi.fn()}
+        onTogglePin={vi.fn()}
+        onRenameSession={vi.fn()}
+        onDeleteSession={vi.fn()}
+        onArchiveProject={vi.fn()}
+        onReorderSession={onReorderSession}
+        onOpenSearch={vi.fn()}
+        onOpenSettings={vi.fn()}
+      />,
+    )
+
+    const button = screen.getByRole('button', { name: 'First chat, Codex' })
+    const source = button.closest('li')!
+    const other = screen.getByRole('button', { name: 'Second chat, Codex' }).closest('li')!
+    mockRowRect(source, 30, 30)
+    mockRowRect(other, 60, 30)
+    // The rail spans x 0 to 200.
+    mockRowRect(document.querySelector('.rail')!, 0, 800)
+
+    // Sideways inside the rail starts nothing: a click with a slip is still a click.
+    fireEvent.pointerDown(source, { button: 0, pointerId: 1, clientX: 100, clientY: 45 })
+    fireEvent.pointerMove(source, { pointerId: 1, clientX: 190, clientY: 46 })
+    expect(source.classList.contains('is-row-dragging')).toBe(false)
+    fireEvent.pointerUp(source, { pointerId: 1 })
+    fireEvent.click(button)
+    expect(onSelectSession).toHaveBeenCalledExactlyOnceWith('thread-1')
+    expect(target.move).not.toHaveBeenCalled()
+    onSelectSession.mockClear()
+
+    // Reordering, then past the rail's edge: the row is carried out and the
+    // reorder preview steps back.
+    fireEvent.pointerDown(source, { button: 0, pointerId: 2, clientX: 100, clientY: 45 })
+    fireEvent.pointerMove(source, { pointerId: 2, clientX: 100, clientY: 52 })
+    fireEvent.pointerMove(source, { pointerId: 2, clientX: 100, clientY: 92 })
+    expect(other.style.translate).toBe('0 -30px')
+    fireEvent.pointerMove(source, { pointerId: 2, clientX: 400, clientY: 300 })
+    expect(target.move).toHaveBeenLastCalledWith('thread-1', 400, 300)
+    expect(source.style.translate).toBe('')
+    expect(other.style.translate).toBe('')
+    expect(source.classList.contains('is-row-dragging')).toBe(true)
+    // Back over the rail it reorders again.
+    fireEvent.pointerMove(source, { pointerId: 2, clientX: 100, clientY: 92 })
+    expect(target.leave).toHaveBeenCalledOnce()
+    expect(other.style.translate).toBe('0 -30px')
+    fireEvent.pointerMove(source, { pointerId: 2, clientX: 640, clientY: 320 })
+    fireEvent.pointerUp(source, { pointerId: 2 })
+    expect(target.drop).toHaveBeenCalledExactlyOnceWith('thread-1', 640, 320)
+    expect(onReorderSession).not.toHaveBeenCalled()
+    expect(source.classList.contains('is-row-dragging')).toBe(false)
+    expect(other.classList.contains('is-row-shifting')).toBe(false)
+    // The release that ended the drag does not open the chat; the next click does.
+    fireEvent.click(button)
+    expect(onSelectSession).not.toHaveBeenCalled()
+    fireEvent.click(button)
+    expect(onSelectSession).toHaveBeenCalledExactlyOnceWith('thread-1')
+
+    // Escape while outside cancels: no drop.
+    target.leave.mockClear()
+    target.drop.mockClear()
+    fireEvent.pointerDown(source, { button: 0, pointerId: 3, clientX: 100, clientY: 45 })
+    fireEvent.pointerMove(source, { pointerId: 3, clientX: 400, clientY: 45 })
+    fireEvent.keyDown(window, { key: 'Escape' })
+    fireEvent.pointerUp(source, { pointerId: 3 })
+    expect(target.leave).toHaveBeenCalledOnce()
+    expect(target.drop).not.toHaveBeenCalled()
+  })
+
+  it('carries a pinned chat out of the rail, while a click on it still opens it', () => {
+    const onSelectSession = vi.fn()
+    const target = { move: vi.fn(), drop: vi.fn(), leave: vi.fn() }
+    const content = (dropTarget: typeof target | undefined) => (
+      <Sidebar
+        projects={[
+          {
+            path: '/work/harness',
+            name: 'TasteCode',
+            sessions: [
+              { ...session('pinned-1', 'Pinned chat'), pinned: true },
+              session('thread-2', 'Other chat'),
+            ],
+          },
+        ]}
+        activeProjectPath="/work/harness"
+        activeSessionId="thread-2"
+        account={undefined}
+        providerName="Codex"
+        collapsed={false}
+        width={248}
+        onWidthChange={vi.fn()}
+        onClose={vi.fn()}
+        onAddProject={vi.fn()}
+        onNewSession={vi.fn()}
+        onSelectSession={onSelectSession}
+        sessionDropTarget={dropTarget}
+        onRenameProject={vi.fn()}
+        onRemoveProject={vi.fn()}
+        onTogglePin={vi.fn()}
+        onRenameSession={vi.fn()}
+        onDeleteSession={vi.fn()}
+        onArchiveProject={vi.fn()}
+        onReorderSession={vi.fn()}
+        onOpenSearch={vi.fn()}
+        onOpenSettings={vi.fn()}
+      />
+    )
+    const view = render(content(target))
+    const row = document.querySelector<HTMLElement>(
+      '.pinned-sessions [data-archive-session-id="pinned-1"]',
+    )!
+    const button = within(row).getByRole('button', { name: 'Pinned chat, Codex' })
+    mockRowRect(row, 30, 30)
+    mockRowRect(document.querySelector('.rail')!, 0, 800)
+    expect(row.classList.contains('is-reorderable')).toBe(true)
+
+    fireEvent.click(button)
+    expect(onSelectSession).toHaveBeenCalledExactlyOnceWith('pinned-1')
+    onSelectSession.mockClear()
+
+    // Pinned chats keep their order: up and down over the rail does nothing.
+    fireEvent.pointerDown(row, { button: 0, pointerId: 1, clientX: 100, clientY: 45 })
+    fireEvent.pointerMove(row, { pointerId: 1, clientX: 100, clientY: 90 })
+    expect(row.style.translate).toBeFalsy()
+    expect(row.classList.contains('is-row-dragging')).toBe(false)
+    fireEvent.pointerMove(row, { pointerId: 1, clientX: 420, clientY: 90 })
+    expect(target.move).toHaveBeenLastCalledWith('pinned-1', 420, 90)
+    fireEvent.pointerUp(row, { pointerId: 1 })
+    expect(target.drop).toHaveBeenCalledExactlyOnceWith('pinned-1', 420, 90)
+    fireEvent.click(button)
+    expect(onSelectSession).not.toHaveBeenCalled()
+
+    // Without a drop target a pinned row is not draggable at all.
+    view.rerender(content(undefined))
+    expect(row.classList.contains('is-reorderable')).toBe(false)
+  })
+
+  it('reorders projects when one is dragged between sidebar rows', () => {
+    const onReorderProject = vi.fn()
+    render(
+      <Sidebar
+        projects={[
+          { path: '/work/first', name: 'First', sessions: [] },
+          { path: '/work/second', name: 'Second', sessions: [] },
+        ]}
+        activeProjectPath="/work/first"
+        activeSessionId={undefined}
+        account={undefined}
+        providerName="Codex"
+        collapsed={false}
+        width={248}
+        onWidthChange={vi.fn()}
+        onClose={vi.fn()}
+        onAddProject={vi.fn()}
+        onNewSession={vi.fn()}
+        onSelectSession={vi.fn()}
+        onRenameProject={vi.fn()}
+        onRemoveProject={vi.fn()}
+        onTogglePin={vi.fn()}
+        onRenameSession={vi.fn()}
+        onDeleteSession={vi.fn()}
+        onArchiveProject={vi.fn()}
+        onReorderProject={onReorderProject}
+        onReorderSession={vi.fn()}
+        onOpenSearch={vi.fn()}
+        onOpenSettings={vi.fn()}
+      />,
+    )
+
+    const source = screen.getByRole('button', { name: 'First' }).closest('section')!
+    const target = screen.getByRole('button', { name: 'Second' }).closest('section')!
+    const head = source.querySelector('.proj__head')!
+    mockRowRect(source, 20, 30)
+    mockRowRect(target, 50, 30)
+
+    fireEvent.pointerDown(head, { button: 0, pointerId: 1, clientY: 35 })
+    fireEvent.pointerMove(head, { pointerId: 1, clientY: 42 })
+    fireEvent.pointerMove(head, { pointerId: 1, clientY: 82 })
+    expect(source.style.translate).toBe('0 30px')
+    expect(target.style.translate).toBe('0 -30px')
+    fireEvent.pointerUp(head, { pointerId: 1 })
+
+    expect(onReorderProject).toHaveBeenCalledExactlyOnceWith('/work/first', '/work/second', 'after')
+  })
+
+  it('adds all folders dropped on the sidebar with clear drop feedback', async () => {
+    const onAddDroppedProjects = vi.fn()
+    droppedProjectFolderPaths.mockResolvedValue(['/work/first', '/work/second'])
+    render(
+      <Sidebar
+        projects={[]}
+        activeProjectPath={undefined}
+        activeSessionId={undefined}
+        account={undefined}
+        providerName="Codex"
+        collapsed={false}
+        width={248}
+        onWidthChange={vi.fn()}
+        onClose={vi.fn()}
+        onAddProject={vi.fn()}
+        onAddDroppedProjects={onAddDroppedProjects}
+        onNewSession={vi.fn()}
+        onSelectSession={vi.fn()}
+        onRenameProject={vi.fn()}
+        onRemoveProject={vi.fn()}
+        onTogglePin={vi.fn()}
+        onRenameSession={vi.fn()}
+        onDeleteSession={vi.fn()}
+        onArchiveProject={vi.fn()}
+        onReorderSession={vi.fn()}
+        onOpenSearch={vi.fn()}
+        onOpenSettings={vi.fn()}
+      />,
+    )
+
+    const rail = screen.getByRole('navigation')
+    const files = [new File([], 'first'), new File([], 'second')]
+    const dataTransfer = { files, types: ['Files'], dropEffect: 'none' }
+
+    fireEvent.dragEnter(rail, { dataTransfer })
+    expect(screen.getByRole('status').textContent).toContain('Drop folders to add projects')
+    expect(rail.classList).toContain('is-folder-drop-target')
+
+    expect(fireEvent.dragOver(rail, { dataTransfer })).toBe(false)
+    fireEvent.drop(rail, { dataTransfer })
+
+    expect(screen.queryByRole('status')).toBeNull()
+    await waitFor(() =>
+      expect(onAddDroppedProjects).toHaveBeenCalledWith(['/work/first', '/work/second']),
+    )
+    expect(droppedProjectFolderPaths).toHaveBeenCalledWith(files)
+  })
+
+  it('does not add anything when a drop contains no folders', async () => {
+    const onAddDroppedProjects = vi.fn()
+    droppedProjectFolderPaths.mockResolvedValue([])
+    render(
+      <Sidebar
+        projects={[]}
+        activeProjectPath={undefined}
+        activeSessionId={undefined}
+        account={undefined}
+        providerName="Codex"
+        collapsed={false}
+        width={248}
+        onWidthChange={vi.fn()}
+        onClose={vi.fn()}
+        onAddProject={vi.fn()}
+        onAddDroppedProjects={onAddDroppedProjects}
+        onNewSession={vi.fn()}
+        onSelectSession={vi.fn()}
+        onRenameProject={vi.fn()}
+        onRemoveProject={vi.fn()}
+        onTogglePin={vi.fn()}
+        onRenameSession={vi.fn()}
+        onDeleteSession={vi.fn()}
+        onArchiveProject={vi.fn()}
+        onReorderSession={vi.fn()}
+        onOpenSearch={vi.fn()}
+        onOpenSettings={vi.fn()}
+      />,
+    )
+
+    fireEvent.drop(screen.getByRole('navigation'), {
+      dataTransfer: { files: [new File([], 'notes.txt')], types: ['Files'], dropEffect: 'none' },
+    })
+
+    await waitFor(() => expect(droppedProjectFolderPaths).toHaveBeenCalledOnce())
+    expect(onAddDroppedProjects).not.toHaveBeenCalled()
+  })
+
+  it('closes an open sidebar from the mobile backdrop', () => {
+    const onClose = vi.fn()
+
+    render(
+      <Sidebar
+        projects={[]}
+        activeProjectPath={undefined}
+        activeSessionId={undefined}
+        account={undefined}
+        providerName="Codex"
+        collapsed={false}
+        width={248}
+        onWidthChange={vi.fn()}
+        onClose={onClose}
+        onAddProject={vi.fn()}
+        onNewSession={vi.fn()}
+        onSelectSession={vi.fn()}
+        onRenameProject={vi.fn()}
+        onRemoveProject={vi.fn()}
+        onTogglePin={vi.fn()}
+        onRenameSession={vi.fn()}
+        onDeleteSession={vi.fn()}
+        onArchiveProject={vi.fn()}
+        onReorderSession={vi.fn()}
+        onOpenSearch={vi.fn()}
+        onOpenSettings={vi.fn()}
+      />,
+    )
+
+    fireEvent.pointerDown(screen.getByRole('button', { name: 'Close sidebar' }))
+
+    expect(onClose).toHaveBeenCalledOnce()
+  })
+
+  it('reveals a collapsed sidebar only while the pointer is at the window edge', () => {
+    const { container } = render(
+      <Sidebar
+        projects={[]}
+        activeProjectPath={undefined}
+        activeSessionId={undefined}
+        account={undefined}
+        providerName="Codex"
+        collapsed
+        width={248}
+        onWidthChange={vi.fn()}
+        onClose={vi.fn()}
+        onAddProject={vi.fn()}
+        onNewSession={vi.fn()}
+        onSelectSession={vi.fn()}
+        onRenameProject={vi.fn()}
+        onRemoveProject={vi.fn()}
+        onTogglePin={vi.fn()}
+        onRenameSession={vi.fn()}
+        onDeleteSession={vi.fn()}
+        onArchiveProject={vi.fn()}
+        onReorderSession={vi.fn()}
+        onOpenSearch={vi.fn()}
+        onOpenSettings={vi.fn()}
+      />,
+    )
+
+    const slot = container.querySelector('.rail-slot')
+    const rail = container.querySelector('nav')
+    const edge = container.querySelector('.rail__edge')
+    expect(slot?.classList).toContain('is-collapsed')
+    expect(slot?.classList).not.toContain('is-revealed')
+    expect(rail?.hasAttribute('inert')).toBe(true)
+
+    fireEvent.mouseEnter(edge!)
+    expect(slot?.classList).toContain('is-revealed')
+    expect(rail?.hasAttribute('inert')).toBe(false)
+
+    // Leaving hides only after a grace period, so the pointer can travel to
+    // the title bar toggle without the flyout flickering away.
+    vi.useFakeTimers()
+    try {
+      // Coming to rest anywhere in the rail's column keeps it, however the
+      // pointer got there — this is the path to the title bar toggle.
+      fireEvent.mouseLeave(slot!)
+      act(() => {
+        vi.advanceTimersByTime(1_000)
+      })
+      expect(slot?.classList).toContain('is-revealed')
+
+      // Moving away arms the hide once. Carrying on moving must not postpone
+      // it, or the rail would stay out until the mouse came to a full stop.
+      fireEvent.mouseMove(window, { clientX: 900, clientY: 400 })
+      act(() => {
+        vi.advanceTimersByTime(60)
+      })
+      fireEvent.mouseMove(window, { clientX: 905, clientY: 405 })
+      fireEvent.mouseMove(window, { clientX: 910, clientY: 410 })
+      act(() => {
+        vi.advanceTimersByTime(80)
+      })
+      expect(slot?.classList).not.toContain('is-revealed')
+      expect(rail?.hasAttribute('inert')).toBe(true)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('reveals at the edge without re-rendering the sidebar tree', () => {
+    const phases: string[] = []
+    const { container } = render(
+      <Profiler id="sidebar" onRender={(_, phase) => phases.push(phase)}>
+        <Sidebar
+          projects={[]}
+          activeProjectPath={undefined}
+          activeSessionId={undefined}
+          account={undefined}
+          providerName="Codex"
+          collapsed
+          width={248}
+          onWidthChange={vi.fn()}
+          onClose={vi.fn()}
+          onAddProject={vi.fn()}
+          onNewSession={vi.fn()}
+          onSelectSession={vi.fn()}
+          onRenameProject={vi.fn()}
+          onRemoveProject={vi.fn()}
+          onTogglePin={vi.fn()}
+          onRenameSession={vi.fn()}
+          onDeleteSession={vi.fn()}
+          onArchiveProject={vi.fn()}
+          onReorderSession={vi.fn()}
+          onOpenSearch={vi.fn()}
+          onOpenSettings={vi.fn()}
+        />
+      </Profiler>,
+    )
+    phases.length = 0
+
+    fireEvent.mouseEnter(container.querySelector('.rail__edge')!)
+
+    expect(container.querySelector('.rail-slot')?.classList).toContain('is-revealed')
+    expect(phases).toEqual([])
+  })
+
+  it('keeps a revealed rail in place while the pointer travels to the toggle', () => {
+    const view = (collapsed: boolean) => (
+      <Sidebar
+        projects={[]}
+        activeProjectPath={undefined}
+        activeSessionId={undefined}
+        account={undefined}
+        providerName="Codex"
+        collapsed={collapsed}
+        width={240}
+        onWidthChange={vi.fn()}
+        onClose={vi.fn()}
+        onAddProject={vi.fn()}
+        onNewSession={vi.fn()}
+        onSelectSession={vi.fn()}
+        onRenameProject={vi.fn()}
+        onRemoveProject={vi.fn()}
+        onTogglePin={vi.fn()}
+        onRenameSession={vi.fn()}
+        onDeleteSession={vi.fn()}
+        onArchiveProject={vi.fn()}
+        onReorderSession={vi.fn()}
+        onOpenSearch={vi.fn()}
+        onOpenSettings={vi.fn()}
+      />
+    )
+    const { container, rerender } = render(view(true))
+    const slot = container.querySelector('.rail-slot')
+    fireEvent.mouseEnter(container.querySelector('.rail__edge')!)
+    expect(slot?.classList).toContain('is-revealed')
+
+    vi.useFakeTimers()
+    try {
+      // Aiming at the title bar toggle leaves the slot but stays at the rail.
+      fireEvent.mouseLeave(slot!)
+      fireEvent.mouseMove(window, { clientX: 300, clientY: 12 })
+      // And once it comes to rest there, with no further moves at all.
+      act(() => {
+        vi.advanceTimersByTime(1_000)
+      })
+      expect(slot?.classList).toContain('is-revealed')
+
+      // Pressing it docks the rail open for good: no collapsed flyout left.
+      rerender(view(false))
+      act(() => {
+        vi.advanceTimersByTime(1_000)
+      })
+      expect(slot?.classList).not.toContain('is-collapsed')
+      expect(slot?.classList).not.toContain('is-revealed')
+
+      // Well clear of the rail it retracts as before.
+      rerender(view(true))
+      fireEvent.mouseEnter(container.querySelector('.rail__edge')!)
+      expect(slot?.classList).toContain('is-revealed')
+      fireEvent.mouseMove(window, { clientX: 900, clientY: 400 })
+      act(() => {
+        vi.advanceTimersByTime(1_000)
+      })
+      expect(slot?.classList).not.toContain('is-revealed')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('a rail folded by dragging does not spring back out under the pointer', () => {
+    const onClose = vi.fn()
+    const view = (collapsed: boolean) => (
+      <Sidebar
+        projects={[]}
+        activeProjectPath={undefined}
+        activeSessionId={undefined}
+        account={undefined}
+        providerName="Codex"
+        collapsed={collapsed}
+        width={248}
+        onWidthChange={vi.fn()}
+        onClose={onClose}
+        onAddProject={vi.fn()}
+        onNewSession={vi.fn()}
+        onSelectSession={vi.fn()}
+        onRenameProject={vi.fn()}
+        onRemoveProject={vi.fn()}
+        onTogglePin={vi.fn()}
+        onRenameSession={vi.fn()}
+        onDeleteSession={vi.fn()}
+        onArchiveProject={vi.fn()}
+        onReorderSession={vi.fn()}
+        onOpenSearch={vi.fn()}
+        onOpenSettings={vi.fn()}
+      />
+    )
+    const { container, rerender } = render(view(false))
+    const handle = screen.getByRole('separator', { name: 'Resize sidebar' })
+
+    vi.useFakeTimers()
+    try {
+      // Fold it and let go with the pointer resting on the reveal strip.
+      fireEvent.pointerDown(handle, { clientX: 248, pointerId: 1 })
+      fireEvent.pointerMove(handle, { clientX: 80, pointerId: 1 })
+      fireEvent.pointerUp(handle, { clientX: 3, pointerId: 1 })
+      expect(onClose).toHaveBeenCalledOnce()
+      rerender(view(true))
+
+      const slot = container.querySelector('.rail-slot')
+      // Hovering the strip during the wait is ignored.
+      fireEvent.mouseEnter(container.querySelector('.rail__edge')!)
+      act(() => {
+        vi.advanceTimersByTime(600)
+      })
+      expect(slot?.classList).not.toContain('is-revealed')
+
+      // Once it passes, a pointer still parked there gets its reveal.
+      act(() => {
+        vi.advanceTimersByTime(1_000)
+      })
+      expect(slot?.classList).toContain('is-revealed')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('resizes a revealed rail without collapsing it', () => {
+    const onClose = vi.fn()
+    const onWidthChange = vi.fn()
+    const { container } = render(
+      <Sidebar
+        projects={[]}
+        activeProjectPath={undefined}
+        activeSessionId={undefined}
+        account={undefined}
+        providerName="Codex"
+        collapsed
+        width={248}
+        onWidthChange={onWidthChange}
+        onClose={onClose}
+        onAddProject={vi.fn()}
+        onNewSession={vi.fn()}
+        onSelectSession={vi.fn()}
+        onRenameProject={vi.fn()}
+        onRemoveProject={vi.fn()}
+        onTogglePin={vi.fn()}
+        onRenameSession={vi.fn()}
+        onDeleteSession={vi.fn()}
+        onArchiveProject={vi.fn()}
+        onReorderSession={vi.fn()}
+        onOpenSearch={vi.fn()}
+        onOpenSettings={vi.fn()}
+      />,
+    )
+
+    // A collapsed rail has no drag edge until it is revealed.
+    expect(screen.queryByRole('separator', { name: 'Resize sidebar' })).toBeNull()
+    fireEvent.mouseEnter(container.querySelector('.rail__edge')!)
+    const handle = screen.getByRole('separator', { name: 'Resize sidebar' })
+
+    // Dragging it narrow keeps the reveal: there is nothing left to collapse.
+    fireEvent.pointerDown(handle, { clientX: 248, pointerId: 1 })
+    fireEvent.pointerMove(handle, { clientX: 60, pointerId: 1 })
+    fireEvent.pointerUp(handle, { clientX: 60, pointerId: 1 })
+    expect(onClose).not.toHaveBeenCalled()
+    expect(onWidthChange).toHaveBeenCalledWith(240)
+
+    // Widening carries the pointer clear of the rail, which must not retract it.
+    vi.useFakeTimers()
+    try {
+      fireEvent.pointerDown(handle, { clientX: 248, pointerId: 2 })
+      fireEvent.pointerMove(handle, { clientX: 420, pointerId: 2 })
+      act(() => {
+        vi.advanceTimersByTime(1_000)
+      })
+      expect(container.querySelector('.rail-slot')?.classList).toContain('is-revealed')
+      fireEvent.pointerUp(handle, { clientX: 420, pointerId: 2 })
+      expect(onWidthChange).toHaveBeenCalledWith(420)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('resizes with pointer or keyboard and collapses below the threshold', () => {
+    const onClose = vi.fn()
+    const onWidthChange = vi.fn()
+    render(
+      <div className="shell">
+        <Sidebar
+          projects={[]}
+          activeProjectPath={undefined}
+          activeSessionId={undefined}
+          account={undefined}
+          providerName="Codex"
+          collapsed={false}
+          width={248}
+          onWidthChange={onWidthChange}
+          onClose={onClose}
+          onAddProject={vi.fn()}
+          onNewSession={vi.fn()}
+          onSelectSession={vi.fn()}
+          onRenameProject={vi.fn()}
+          onRemoveProject={vi.fn()}
+          onTogglePin={vi.fn()}
+          onRenameSession={vi.fn()}
+          onDeleteSession={vi.fn()}
+          onArchiveProject={vi.fn()}
+          onReorderSession={vi.fn()}
+          onOpenSearch={vi.fn()}
+          onOpenSettings={vi.fn()}
+        />
+      </div>,
+    )
+
+    const handle = screen.getByRole('separator', { name: 'Resize sidebar' })
+    const shell = handle.closest<HTMLElement>('.shell')
+    fireEvent.keyDown(handle, { key: 'ArrowRight' })
+    expect(onWidthChange).toHaveBeenCalledWith(256)
+
+    // Dragging a little past the stop clamps at the minimum instead of
+    // squeezing the content, and does not collapse.
+    fireEvent.pointerDown(handle, { clientX: 248, pointerId: 1 })
+    fireEvent.pointerMove(handle, { clientX: 200, pointerId: 1 })
+    fireEvent.pointerUp(handle, { clientX: 200, pointerId: 1 })
+    expect(onWidthChange).toHaveBeenCalledWith(240)
+    expect(onClose).not.toHaveBeenCalled()
+
+    // Far past the stop the rail folds as a preview; pulling back while still
+    // holding unfolds it again, and releasing keeps it open at that width.
+    fireEvent.pointerDown(handle, { clientX: 248, pointerId: 2 })
+    fireEvent.pointerMove(handle, { clientX: 80, pointerId: 2 })
+    expect(onClose).not.toHaveBeenCalled()
+    expect(shell?.hasAttribute('data-rail-fold-preview')).toBe(true)
+    expect(shell?.style.getPropertyValue('--rail-w')).not.toBe('0px')
+    fireEvent.pointerMove(handle, { clientX: 270, pointerId: 2 })
+    expect(shell?.hasAttribute('data-rail-fold-preview')).toBe(false)
+    fireEvent.pointerUp(handle, { clientX: 270, pointerId: 2 })
+    expect(onClose).not.toHaveBeenCalled()
+    expect(onWidthChange).toHaveBeenCalledWith(270)
+
+    // Releasing while folded makes the collapse real.
+    fireEvent.pointerDown(handle, { clientX: 248, pointerId: 3 })
+    fireEvent.pointerMove(handle, { clientX: 80, pointerId: 3 })
+    fireEvent.pointerUp(handle, { clientX: 80, pointerId: 3 })
+    expect(onClose).toHaveBeenCalledOnce()
+  })
+
+  it('releases a sidebar resize when native window movement cancels its pointer', () => {
+    const onWidthChange = vi.fn()
+    render(
+      <div className="shell">
+        <Sidebar
+          projects={[]}
+          activeProjectPath={undefined}
+          activeSessionId={undefined}
+          account={undefined}
+          providerName="Codex"
+          collapsed={false}
+          width={248}
+          onWidthChange={onWidthChange}
+          onClose={vi.fn()}
+          onAddProject={vi.fn()}
+          onNewSession={vi.fn()}
+          onSelectSession={vi.fn()}
+          onRenameProject={vi.fn()}
+          onRemoveProject={vi.fn()}
+          onTogglePin={vi.fn()}
+          onRenameSession={vi.fn()}
+          onDeleteSession={vi.fn()}
+          onArchiveProject={vi.fn()}
+          onReorderSession={vi.fn()}
+          onOpenSearch={vi.fn()}
+          onOpenSettings={vi.fn()}
+        />
+      </div>,
+    )
+    const handle = screen.getByRole('separator', { name: 'Resize sidebar' })
+    const shell = handle.closest('.shell')
+
+    fireEvent.pointerDown(handle, { clientX: 248, pointerId: 7 })
+    fireEvent.pointerMove(handle, { clientX: 320, pointerId: 7 })
+    expect(shell?.hasAttribute('data-resizing')).toBe(true)
+
+    fireEvent.pointerCancel(handle, { clientX: 320, pointerId: 7 })
+    expect(onWidthChange).toHaveBeenCalledWith(320)
+    expect(shell?.hasAttribute('data-resizing')).toBe(false)
+
+    fireEvent.pointerMove(handle, { clientX: 400, pointerId: 7 })
+    expect(onWidthChange).toHaveBeenCalledTimes(1)
+  })
+
+  it('clears an active resize when the sidebar closes before pointer release', () => {
+    const view = (collapsed: boolean) => (
+      <div className="shell">
+        <Sidebar
+          projects={[]}
+          activeProjectPath={undefined}
+          activeSessionId={undefined}
+          account={undefined}
+          providerName="Codex"
+          collapsed={collapsed}
+          width={248}
+          onWidthChange={vi.fn()}
+          onClose={vi.fn()}
+          onAddProject={vi.fn()}
+          onNewSession={vi.fn()}
+          onSelectSession={vi.fn()}
+          onRenameProject={vi.fn()}
+          onRemoveProject={vi.fn()}
+          onTogglePin={vi.fn()}
+          onRenameSession={vi.fn()}
+          onDeleteSession={vi.fn()}
+          onArchiveProject={vi.fn()}
+          onReorderSession={vi.fn()}
+          onOpenSearch={vi.fn()}
+          onOpenSettings={vi.fn()}
+        />
+      </div>
+    )
+    const { rerender } = render(view(false))
+    const handle = screen.getByRole('separator', { name: 'Resize sidebar' })
+    const shell = handle.closest('.shell')
+
+    fireEvent.pointerDown(handle, { clientX: 248, pointerId: 8 })
+    fireEvent.pointerMove(handle, { clientX: 80, pointerId: 8 })
+    expect(shell?.hasAttribute('data-rail-fold-preview')).toBe(true)
+
+    rerender(view(true))
+    expect(shell?.hasAttribute('data-rail-fold-preview')).toBe(false)
+    expect(shell?.hasAttribute('data-resizing')).toBe(false)
+  })
+})

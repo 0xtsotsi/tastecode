@@ -1,0 +1,870 @@
+import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { z } from 'zod'
+import {
+  IconArrowLeft as ArrowLeft,
+  IconArrowRight as ArrowRight,
+  IconExternalLink as ExternalLink,
+  IconWorld as Globe2,
+  IconLoader2 as LoaderCircle,
+  IconDeviceLaptop as Laptop,
+  IconDeviceDesktop as Monitor,
+  IconRefresh as RefreshCw,
+  IconDeviceMobile as Smartphone,
+  IconDeviceTablet as Tablet,
+  IconMessagePlus as MessagePlus,
+} from '@tabler/icons-react'
+import type { BrowserCommand, BrowserConsoleEntry, BrowserResult } from '@harness/contracts'
+import {
+  agentBrowserIsolated,
+  isDesktop,
+  canSavePastedFiles,
+  isMacOS,
+  onBrowserShortcut,
+  openExternalUrl,
+  setAgentBrowserGuest,
+  type BrowserShortcutAction,
+} from '../../bridge.js'
+import { BrowserAnnotations, type AnnotationGuest } from './BrowserAnnotations.js'
+import type { AnnotationDraft } from './browser-annotations.js'
+import { runAgentBrowserCommand } from './agent-browser-executor.js'
+import { errorMessage } from '../../boundary.js'
+import { IconMorph } from '../IconMorph.js'
+import { Skeleton, SkeletonLines, SkeletonStatus } from '../Skeleton.js'
+import { BrowserRecentPages } from './BrowserRecentPages.js'
+import { WorkspaceEmptyState } from './WorkspaceEmptyState.js'
+import {
+  browserLoadFailureView,
+  loadRejectionFailure,
+  type BrowserLoadFailureView,
+} from './browser-load-error.js'
+import { rememberBrowserVisit } from './browser-history.js'
+import type { BrowserPageInfo } from './browser-page.js'
+import { browserShortcut, browserShortcutHints } from './browser-shortcuts.js'
+import { browserAddress } from './browser-url.js'
+import { scalePng } from './white-ground.js'
+import {
+  BROWSER_VIEWPORTS,
+  fitBrowserViewport,
+  type BrowserViewportId,
+} from './browser-viewport.js'
+
+const VIEWPORT_ICONS = {
+  fluid: Monitor,
+  desktop: Laptop,
+  tablet: Tablet,
+  mobile: Smartphone,
+} satisfies Record<BrowserViewportId, typeof Monitor>
+const FIXED_VIEWPORT_GUTTER = 24
+
+type BrowserState = {
+  url: string
+  title: string
+  loading: boolean
+  canGoBack: boolean
+  canGoForward: boolean
+}
+
+type BrowserGuest = AnnotationGuest & {
+  canGoBack(): boolean
+  canGoForward(): boolean
+  getTitle(): string
+  getURL(): string
+  getWebContentsId(): number
+  goBack(): void
+  goForward(): void
+  isLoading(): boolean
+  loadURL(url: string): Promise<void>
+  reload(): void
+  reloadIgnoringCache(): void
+  stop(): void
+  executeJavaScript(code: string): Promise<unknown>
+  capturePage(): Promise<{ toDataURL(): string }>
+}
+
+/** The agent's hold on this tab: the command it runs now, and the Stop the user can press. */
+export type AgentBrowserLink = {
+  command: BrowserCommand | undefined
+  /** Shows "Agent is using the browser" with Stop. */
+  active: boolean
+  onResult: (result: BrowserResult) => void
+  onStop: () => void
+}
+
+/** The console an agent reads: the newest entries, as the page logged them. */
+const AGENT_CONSOLE_KEPT = 200
+const CONSOLE_LEVELS = ['debug', 'log', 'warn', 'error'] as const
+const ConsoleMessageEventSchema = z.object({
+  level: z.union([z.number(), z.string()]).optional(),
+  message: z.string().optional(),
+})
+
+declare global {
+  interface HTMLElementTagNameMap {
+    webview: BrowserGuest
+  }
+}
+
+/** The same document, ignoring the fragment, so a reload is not a move to another page. */
+function samePage(next: string | undefined, current: string): boolean {
+  if (!next) return false
+  try {
+    const [a, b] = [new URL(next), new URL(current)]
+    return a.origin === b.origin && a.pathname === b.pathname && a.search === b.search
+  } catch {
+    return false
+  }
+}
+
+const NavigationEventSchema = z.object({
+  isMainFrame: z.boolean().optional(),
+  isInPlace: z.boolean().optional(),
+  url: z.string().optional(),
+})
+const PageTitleEventSchema = z.object({ title: z.string() })
+const LoadFailureEventSchema = z.object({
+  errorCode: z.number().optional(),
+  errorDescription: z.string().optional(),
+  isMainFrame: z.boolean().optional(),
+  validatedURL: z.string().optional(),
+})
+const RendererGoneEventSchema = z.object({
+  details: z.object({ reason: z.string().optional() }).optional(),
+})
+
+const EMPTY_STATE: BrowserState = {
+  url: '',
+  title: '',
+  loading: false,
+  canGoBack: false,
+  canGoForward: false,
+}
+
+export type BrowserNavigationRequest = {
+  requestId: string
+  url: string
+}
+
+export const WorkspaceBrowser = memo(function WorkspaceBrowser({
+  active,
+  navigation,
+  focusAddressOnOpen,
+  keepHistory,
+  tabId,
+  onPageInfo,
+  onClose,
+  imagesSupported = false,
+  onAnnotationDraft,
+  agent,
+}: {
+  active: boolean
+  imagesSupported?: boolean | undefined
+  onAnnotationDraft?: ((draft: AnnotationDraft) => void) | undefined
+  navigation?: BrowserNavigationRequest | undefined
+  /** The user opened this tab to type a URL: focus the address once it mounts. */
+  focusAddressOnOpen?: boolean | undefined
+  /** Lists this tab's pages under Recently used: the user's own, not an agent's or a preview's. */
+  keepHistory?: boolean | undefined
+  /** Passed back to onPageInfo, so one stable owner callback serves every tab. */
+  tabId?: string | undefined
+  /** The page's URL and title whenever either changes, for the tab label. */
+  onPageInfo?: ((tabId: string, page: BrowserPageInfo) => void) | undefined
+  /** Closes this tab, for Ctrl+W pressed in the toolbar or inside the page. */
+  onClose?: ((tabId: string) => void) | undefined
+  /** Set on the chat's agent tab only: the agent's commands run here. */
+  agent?: AgentBrowserLink | undefined
+}) {
+  const agentConsole = useRef<BrowserConsoleEntry[]>([])
+  const agentLink = useRef(agent)
+  agentLink.current = agent
+  const canvas = useRef<HTMLDivElement>(null)
+  const host = useRef<HTMLDivElement>(null)
+  const guest = useRef<BrowserGuest | null>(null)
+  const readyGuest = useRef<BrowserGuest | null>(null)
+  const lastNavigationRequest = useRef<string | undefined>(undefined)
+  // Page navigation must not overwrite an address the user is still typing.
+  const editingAddress = useRef(false)
+  // A load that fails before it commits leaves the guest on the previous page;
+  // the address keeps the one that failed so the user can correct it.
+  const failedAddress = useRef<string | undefined>(undefined)
+  // did-fail-load already explained this navigation; its loadURL rejection repeats it.
+  const failureReported = useRef(false)
+  // Stop cancels the load on purpose: its failure is not an error to show.
+  const stopRequested = useRef(false)
+  const navigationSequence = useRef(0)
+  const [guestReadyRevision, setGuestReadyRevision] = useState(0)
+  const [address, setAddress] = useState('')
+  const [state, setState] = useState<BrowserState>(EMPTY_STATE)
+  const [hasRenderedPage, setHasRenderedPage] = useState(false)
+  const [annotating, setAnnotating] = useState(false)
+  const [annotationRevision, setAnnotationRevision] = useState(0)
+  const [viewport, setViewport] = useState<BrowserViewportId>('fluid')
+  // A notice about the toolbar: an address it refused, a native call that failed.
+  const [error, setError] = useState<string>()
+  // A page that failed to load or stopped; the canvas shows it instead of the guest.
+  const [failure, setFailure] = useState<BrowserLoadFailureView>()
+  const addressInput = useRef<HTMLInputElement>(null)
+  const focusedOnOpen = useRef(false)
+  // An address entered before the guest finished starting, loaded once it has.
+  const pendingAddress = useRef<string | undefined>(undefined)
+
+  // After any menu that opened the tab has handed focus back, which happens
+  // earlier in the same commit, so a typed URL lands in the address.
+  useLayoutEffect(() => {
+    if (!focusAddressOnOpen || focusedOnOpen.current) return
+    focusedOnOpen.current = true
+    addressInput.current?.focus()
+  }, [focusAddressOnOpen])
+
+  // Read through a ref: the report below runs when the page changes, never
+  // because the owner handed over a new function (#283).
+  const pageInfoListener = useRef(onPageInfo)
+  pageInfoListener.current = onPageInfo
+  const closeListener = useRef(onClose)
+  closeListener.current = onClose
+  // Escape threw an address edit away: select the restored address once it shows.
+  const selectRestoredAddress = useRef(false)
+
+  useEffect(() => {
+    if (tabId === undefined) return
+    pageInfoListener.current?.(tabId, { url: state.url, title: state.url ? state.title : '' })
+  }, [tabId, state.url, state.title])
+
+  // History records committed top-level navigations once each, when their load ends: a
+  // replaceState, an in-page route or a later title writes nothing, and an address that
+  // failed or was stopped is never listed.
+  const keepHistoryRef = useRef(keepHistory)
+  keepHistoryRef.current = keepHistory
+  const committedVisit = useRef(false)
+  const loadFailed = useRef(false)
+
+  const syncGuestState = useCallback((pageReady = false) => {
+    const view = guest.current
+    if (!view) return
+    try {
+      const currentUrl = webPageUrl(view.getURL())
+      setState({
+        url: currentUrl,
+        title: view.getTitle(),
+        loading: view.isLoading(),
+        canGoBack: view.canGoBack(),
+        canGoForward: view.canGoForward(),
+      })
+      const shownAddress = failedAddress.current ?? currentUrl
+      if (shownAddress && !editingAddress.current) setAddress(shownAddress)
+      if (currentUrl && pageReady) setHasRenderedPage(true)
+    } catch {
+      // The guest can detach between an event and this state read. Its next
+      // lifecycle event, or a remount, supplies the authoritative state.
+    }
+  }, [])
+
+  useLayoutEffect(() => {
+    const element = host.current
+    if (!element || !isDesktop) return
+
+    const view = document.createElement('webview')
+    view.className = 'workspace-browser__guest'
+    view.setAttribute('aria-label', 'Browser page')
+    view.setAttribute('partition', 'persist:harness-browser')
+    view.setAttribute(
+      'webpreferences',
+      'contextIsolation=yes, nodeIntegration=no, sandbox=yes, spellcheck=no',
+    )
+    view.setAttribute('src', 'about:blank')
+
+    const onAttach = () => syncGuestState()
+    const onReady = () => {
+      if (guest.current !== view) return
+      readyGuest.current = view
+      setGuestReadyRevision((revision) => revision + 1)
+      syncGuestState(true)
+    }
+    const onStart = () => {
+      loadFailed.current = false
+      stopRequested.current = false
+      setError(undefined)
+      setFailure(undefined)
+      setState((current) => ({ ...current, loading: true }))
+    }
+    const onStop = () => {
+      syncGuestState(true)
+      if (!committedVisit.current) return
+      committedVisit.current = false
+      if (!keepHistoryRef.current || loadFailed.current || stopRequested.current) return
+      try {
+        const url = webPageUrl(view.getURL())
+        if (url) rememberBrowserVisit(url, view.getTitle())
+      } catch {
+        // A guest detached between its event and this read records nothing.
+      }
+    }
+    const onNavigationStart = (event: Event) => {
+      const navigation = NavigationEventSchema.safeParse(event)
+      if (!navigation.success || navigation.data.isMainFrame === false) return
+      if (navigation.data.isInPlace) return
+      // A dev server reloads the page under an agent's edits: comments outlive that.
+      if (samePage(navigation.data.url, view.getURL())) return
+      setAnnotating(false)
+      setAnnotationRevision((revision) => revision + 1)
+    }
+    const onNavigate = (event: Event) => {
+      const navigation = NavigationEventSchema.safeParse(event)
+      const url = webPageUrl(navigation.success ? navigation.data.url : undefined)
+      if (url) {
+        failedAddress.current = undefined
+        if (!editingAddress.current) setAddress(url)
+        setState((current) => ({ ...current, url }))
+      }
+      syncGuestState()
+    }
+    const onCommit = (event: Event) => {
+      committedVisit.current = true
+      onNavigate(event)
+    }
+    const onNavigateInPage = (event: Event) => {
+      const navigation = NavigationEventSchema.safeParse(event)
+      if (!navigation.success || navigation.data.isMainFrame !== false) onNavigate(event)
+    }
+    const onTitle = (event: Event) => {
+      const title = PageTitleEventSchema.safeParse(event)
+      if (title.success) setState((current) => ({ ...current, title: title.data.title }))
+    }
+    const onFail = (event: Event) => {
+      const failure = LoadFailureEventSchema.safeParse(event)
+      if (failure.success && failure.data.isMainFrame !== false) loadFailed.current = true
+      if (failure.success && failure.data.isMainFrame !== false && !stopRequested.current) {
+        const url = webPageUrl(failure.data.validatedURL)
+        const failedView = browserLoadFailureView({
+          code: failure.data.errorCode,
+          name: failure.data.errorDescription,
+          url,
+        })
+        if (failedView) {
+          failureReported.current = true
+          if (url) failedAddress.current = url
+          setFailure(failedView)
+        }
+      }
+      syncGuestState()
+    }
+    const onRendererGone = (event: Event) => {
+      const stopped = RendererGoneEventSchema.safeParse(event)
+      const reason = stopped.success ? stopped.data.details?.reason : undefined
+      setFailure({
+        title: 'This page stopped',
+        detail: `Its renderer ended${reason ? ` (${reason})` : ''}. Retry to load it again.`,
+      })
+      syncGuestState()
+    }
+
+    view.addEventListener('did-start-navigation', onNavigationStart)
+    view.addEventListener('did-attach', onAttach)
+    view.addEventListener('dom-ready', onReady)
+    view.addEventListener('did-start-loading', onStart)
+    view.addEventListener('did-stop-loading', onStop)
+    view.addEventListener('did-navigate', onCommit)
+    view.addEventListener('did-navigate-in-page', onNavigateInPage)
+    view.addEventListener('page-title-updated', onTitle)
+    view.addEventListener('did-fail-load', onFail)
+    // Only the agent's tab keeps a console, and only the newest entries.
+    const onConsole = (event: Event) => {
+      if (!agentLink.current) return
+      const message = ConsoleMessageEventSchema.safeParse(event)
+      if (!message.success) return
+      const raw = message.data.level
+      const level =
+        typeof raw === 'number'
+          ? (CONSOLE_LEVELS[raw] ?? 'log')
+          : raw === 'warning'
+            ? 'warn'
+            : raw === 'error' || raw === 'debug' || raw === 'info'
+              ? raw
+              : 'log'
+      const entries = agentConsole.current
+      entries.push({ level, text: (message.data.message ?? '').slice(0, 2_000), at: Date.now() })
+      if (entries.length > AGENT_CONSOLE_KEPT)
+        entries.splice(0, entries.length - AGENT_CONSOLE_KEPT)
+    }
+    view.addEventListener('console-message', onConsole)
+    view.addEventListener('render-process-gone', onRendererGone)
+    element.append(view)
+    guest.current = view
+
+    if (typeof view.loadURL !== 'function') {
+      setError('The in-app browser is unavailable in this window.')
+    }
+
+    return () => {
+      guest.current = null
+      readyGuest.current = null
+      lastNavigationRequest.current = undefined
+      view.removeEventListener('did-start-navigation', onNavigationStart)
+      view.removeEventListener('did-attach', onAttach)
+      view.removeEventListener('dom-ready', onReady)
+      view.removeEventListener('did-start-loading', onStart)
+      view.removeEventListener('did-stop-loading', onStop)
+      view.removeEventListener('did-navigate', onCommit)
+      view.removeEventListener('did-navigate-in-page', onNavigateInPage)
+      view.removeEventListener('page-title-updated', onTitle)
+      view.removeEventListener('did-fail-load', onFail)
+      view.removeEventListener('console-message', onConsole)
+      view.removeEventListener('render-process-gone', onRendererGone)
+      view.remove()
+    }
+  }, [syncGuestState])
+
+  useLayoutEffect(() => {
+    const canvasElement = canvas.current
+    const hostElement = host.current
+    if (!canvasElement || !hostElement) return
+    const selected =
+      BROWSER_VIEWPORTS.find((option) => option.id === viewport) ?? BROWSER_VIEWPORTS[0]!
+
+    const layout = () => {
+      const gutter = selected.id === 'fluid' ? 0 : FIXED_VIEWPORT_GUTTER
+      const fitted = fitBrowserViewport(
+        canvasElement.clientWidth - gutter,
+        canvasElement.clientHeight - gutter,
+        selected,
+      )
+      hostElement.style.width = `${fitted.width}px`
+      hostElement.style.height = `${fitted.height}px`
+
+      const view = guest.current
+      if (!view) return
+      if (selected.width && selected.height) {
+        const scale = Math.min(fitted.width / selected.width, fitted.height / selected.height)
+        view.style.width = `${selected.width}px`
+        view.style.height = `${selected.height}px`
+        view.style.transform = `scale(${scale})`
+      } else {
+        view.style.width = '100%'
+        view.style.height = '100%'
+        view.style.transform = 'none'
+      }
+    }
+
+    const observer = new ResizeObserver(layout)
+    observer.observe(canvasElement)
+    layout()
+    return () => observer.disconnect()
+  }, [viewport])
+
+  const navigate = useCallback(
+    (value: string) => {
+      const { url, error: invalid } = browserAddress(value)
+      if (!url) {
+        setError(invalid)
+        return false
+      }
+      const view = guest.current
+      if (!view || typeof view.loadURL !== 'function') {
+        setError('The in-app browser is unavailable in this window.')
+        return false
+      }
+      if (readyGuest.current !== view) {
+        // Typed into a tab that opened a moment ago: load it as soon as the guest is ready.
+        pendingAddress.current = url
+        editingAddress.current = false
+        setAddress(url)
+        setError(undefined)
+        return true
+      }
+      pendingAddress.current = undefined
+
+      editingAddress.current = false
+      failedAddress.current = undefined
+      failureReported.current = false
+      stopRequested.current = false
+      const sequence = ++navigationSequence.current
+      setAddress(url)
+      setState((current) => ({ ...current, url, loading: true }))
+      setError(undefined)
+      setFailure(undefined)
+      void view.loadURL(url).catch((cause: unknown) => {
+        // A newer navigation replaced this one and reports for itself.
+        if (sequence !== navigationSequence.current) return
+        if (!failureReported.current && !stopRequested.current) {
+          const failedView = browserLoadFailureView(loadRejectionFailure(cause, url))
+          if (failedView) {
+            failedAddress.current = url
+            setFailure(failedView)
+          }
+        }
+        syncGuestState()
+      })
+      return true
+    },
+    [syncGuestState],
+  )
+
+  useLayoutEffect(() => {
+    const pending = pendingAddress.current
+    if (!pending || !guest.current || readyGuest.current !== guest.current) return
+    navigate(pending)
+  }, [guestReadyRevision, navigate])
+
+  useLayoutEffect(() => {
+    if (!navigation || lastNavigationRequest.current === navigation.requestId) return
+    if (!guest.current || readyGuest.current !== guest.current) return
+    if (navigate(navigation.url)) lastNavigationRequest.current = navigation.requestId
+  }, [guestReadyRevision, navigate, navigation])
+
+  const action = (nextAction: 'back' | 'forward' | 'reload' | 'hardReload' | 'stop') => {
+    const view = guest.current
+    if (!view) return
+    setError(undefined)
+    try {
+      if (nextAction === 'back' && view.canGoBack()) view.goBack()
+      else if (nextAction === 'forward' && view.canGoForward()) view.goForward()
+      // Reload retries the address that failed, not the page still shown under it.
+      else if ((nextAction === 'reload' || nextAction === 'hardReload') && failedAddress.current) {
+        navigate(failedAddress.current)
+        return
+      } else if (nextAction === 'reload' && state.url) view.reload()
+      else if (nextAction === 'hardReload' && state.url) view.reloadIgnoringCache()
+      else if (nextAction === 'stop') {
+        stopRequested.current = true
+        failedAddress.current = undefined
+        view.stop()
+      }
+      syncGuestState()
+    } catch (cause) {
+      setError(errorMessage(cause))
+    }
+  }
+
+  const editAddress = () => {
+    const input = addressInput.current
+    if (!input) return
+    input.focus()
+    input.select()
+  }
+
+  // Escape in the address puts back the page's address, like a browser does.
+  const revertAddress = () => {
+    editingAddress.current = false
+    const restored = failedAddress.current ?? state.url
+    if (restored === address) addressInput.current?.select()
+    else {
+      selectRestoredAddress.current = true
+      setAddress(restored)
+    }
+  }
+  useLayoutEffect(() => {
+    if (!selectRestoredAddress.current) return
+    selectRestoredAddress.current = false
+    addressInput.current?.select()
+  }, [address])
+
+  const runShortcut = (shortcut: BrowserShortcutAction) => {
+    if (shortcut === 'address') editAddress()
+    else if (shortcut === 'close') {
+      if (tabId !== undefined) closeListener.current?.(tabId)
+    } else action(shortcut)
+  }
+  // Keys pressed inside the page never reach this document; the desktop shell
+  // forwards them with the guest they came from. One subscription per tab,
+  // reading the latest runner through a ref (#283).
+  const shortcutRunner = useRef(runShortcut)
+  shortcutRunner.current = runShortcut
+  useEffect(
+    () =>
+      onBrowserShortcut((guestId, shortcut) => {
+        try {
+          if (guest.current?.getWebContentsId() !== guestId) return
+        } catch {
+          // A guest that is not attached yet cannot have sent the key.
+          return
+        }
+        shortcutRunner.current(shortcut)
+      }),
+    [],
+  )
+  const macOS = isMacOS()
+  const hints = browserShortcutHints(macOS)
+
+  const startBrowsing = (
+    <div className="workspace-browser__placeholder">
+      <WorkspaceEmptyState
+        kind="browser"
+        title={isDesktop ? 'Start browsing' : 'Desktop browser unavailable'}
+        detail={
+          isDesktop ? 'Enter a URL to open a page.' : 'The in-app browser runs in the desktop app.'
+        }
+      />
+    </div>
+  )
+
+  const loadingFirstPage = Boolean(state.url) && state.loading && !hasRenderedPage && !failure
+  // Later loads keep the current page visible under a thin progress line.
+  const loadingLaterPage = state.loading && hasRenderedPage && !failure
+
+  // The agent's command runs once on the ready guest; a later page load does not repeat it.
+  const agentCommand = agent?.command
+  const handledAgentCommand = useRef<string | undefined>(undefined)
+  useEffect(() => {
+    const view = readyGuest.current
+    if (!agentCommand || !view || view !== guest.current) return
+    if (handledAgentCommand.current === agentCommand.commandId) return
+    handledAgentCommand.current = agentCommand.commandId
+    const id = view.getWebContentsId()
+    void runAgentBrowserCommand(
+      agentCommand,
+      {
+        loadURL: (url) => view.loadURL(url),
+        getURL: () => view.getURL(),
+        getTitle: () => view.getTitle(),
+        executeJavaScript: (code) => view.executeJavaScript(code),
+        executeIsolated: (code) => agentBrowserIsolated(id, code),
+        capturePng: async () => (await view.capturePage()).toDataURL(),
+      },
+      () => agentConsole.current,
+      scalePng,
+    ).then((result) => {
+      // A Stop or a cancel may have ended the command meanwhile; its answer then goes nowhere.
+      if (agentLink.current?.command?.commandId === result.commandId)
+        agentLink.current.onResult(result)
+    })
+  }, [agentCommand, guestReadyRevision])
+
+  // The desktop app drops downloads from the tab while it is the agent's.
+  const agentTab = agent !== undefined
+  const drivenGuest = useRef<number | undefined>(undefined)
+  useEffect(() => {
+    const view = readyGuest.current
+    if (!agentTab || !view) return
+    const id = view.getWebContentsId()
+    if (drivenGuest.current === id) return
+    if (drivenGuest.current !== undefined)
+      void setAgentBrowserGuest(drivenGuest.current, false).catch(() => undefined)
+    drivenGuest.current = id
+    void setAgentBrowserGuest(id, true).catch(() => undefined)
+  }, [agentTab, guestReadyRevision])
+  useEffect(
+    () => () => {
+      if (drivenGuest.current !== undefined)
+        void setAgentBrowserGuest(drivenGuest.current, false).catch(() => undefined)
+    },
+    [],
+  )
+
+  return (
+    <div
+      className="workspace-browser"
+      // Browser keys while focus is anywhere in this tab, never in the chat.
+      onKeyDown={(event) => {
+        if (event.defaultPrevented || event.nativeEvent.isComposing) return
+        if (event.key === 'Escape') {
+          if (annotating) {
+            event.preventDefault()
+            setAnnotating(false)
+            return
+          }
+          if (event.target !== addressInput.current || !editingAddress.current) return
+          event.preventDefault()
+          revertAddress()
+          return
+        }
+        const shortcut = browserShortcut(event, macOS)
+        if (!shortcut) return
+        // Also keeps the key from the app's own shortcuts and the window menu.
+        event.preventDefault()
+        if (!event.repeat) runShortcut(shortcut)
+      }}
+    >
+      {agent?.active ? (
+        <div className="workspace-browser__agent" role="status">
+          <span>Agent is using the browser</span>
+          <button type="button" onClick={agent.onStop}>
+            Stop
+          </button>
+        </div>
+      ) : null}
+      <div className="workspace-browser__toolbar">
+        <button
+          type="button"
+          aria-label="Back"
+          aria-keyshortcuts={hints.back.aria}
+          title={`Back (${hints.back.label})`}
+          disabled={!state.canGoBack}
+          onClick={() => action('back')}
+        >
+          <ArrowLeft size={15} aria-hidden />
+        </button>
+        <button
+          type="button"
+          aria-label="Forward"
+          aria-keyshortcuts={hints.forward.aria}
+          title={`Forward (${hints.forward.label})`}
+          disabled={!state.canGoForward}
+          onClick={() => action('forward')}
+        >
+          <ArrowRight size={15} aria-hidden />
+        </button>
+        <button
+          type="button"
+          aria-label={state.loading ? 'Stop loading' : 'Reload'}
+          aria-keyshortcuts={state.loading ? undefined : hints.reload.aria}
+          title={state.loading ? 'Stop loading' : `Reload (${hints.reload.label})`}
+          disabled={!state.url}
+          onClick={() => action(state.loading ? 'stop' : 'reload')}
+        >
+          <IconMorph active={state.loading ? 1 : 0}>
+            <RefreshCw size={14} aria-hidden />
+            <LoaderCircle className="spinner" size={15} aria-hidden />
+          </IconMorph>
+        </button>
+        <form
+          className="workspace-browser__address"
+          onSubmit={(event) => {
+            event.preventDefault()
+            navigate(address)
+          }}
+        >
+          <Globe2 size={14} aria-hidden />
+          <input
+            ref={addressInput}
+            value={address}
+            placeholder="Enter a URL"
+            aria-label="Browser address"
+            aria-keyshortcuts={hints.address.aria}
+            spellCheck={false}
+            onChange={(event) => {
+              editingAddress.current = true
+              setAddress(event.target.value)
+            }}
+            onFocus={(event) => event.currentTarget.select()}
+            onBlur={() => {
+              editingAddress.current = false
+            }}
+          />
+          <button
+            type="button"
+            title="Open in system browser"
+            disabled={!state.url}
+            onClick={() =>
+              void openExternalUrl(state.url).catch((cause: unknown) =>
+                setError(errorMessage(cause)),
+              )
+            }
+          >
+            <ExternalLink size={14} aria-hidden />
+          </button>
+        </form>
+
+        {isDesktop && canSavePastedFiles && onAnnotationDraft ? (
+          <button
+            type="button"
+            aria-label="Annotate page"
+            title="Annotate page"
+            aria-pressed={annotating}
+            disabled={!state.url || state.loading || Boolean(failure)}
+            onClick={() => setAnnotating((value) => !value)}
+          >
+            <MessagePlus size={15} aria-hidden />
+          </button>
+        ) : null}
+        <div className="workspace-browser__viewports" aria-label="Preview size">
+          {BROWSER_VIEWPORTS.map((option) => {
+            const Icon = VIEWPORT_ICONS[option.id]
+            return (
+              <button
+                type="button"
+                key={option.id}
+                title={option.label}
+                aria-label={option.label}
+                aria-pressed={viewport === option.id}
+                onClick={() => setViewport(option.id)}
+              >
+                <Icon size={15} aria-hidden />
+              </button>
+            )
+          })}
+        </div>
+      </div>
+
+      <div
+        ref={canvas}
+        className="workspace-browser__canvas"
+        data-viewport={viewport}
+        aria-busy={state.loading && !failure}
+      >
+        {loadingLaterPage ? <div className="workspace-browser__progress" aria-hidden /> : null}
+        <div
+          ref={host}
+          className="workspace-browser__guest-host"
+          data-visible={Boolean(state.url) && !failure}
+          data-painted={hasRenderedPage}
+          aria-hidden={!active}
+        >
+          {guest.current && onAnnotationDraft ? (
+            <BrowserAnnotations
+              key={annotationRevision}
+              view={guest.current}
+              enabled={annotating && active}
+              imagesSupported={imagesSupported}
+              onDraft={onAnnotationDraft}
+              onExit={() => setAnnotating(false)}
+            />
+          ) : null}
+          {loadingFirstPage ? (
+            <SkeletonStatus label="Loading page…" className="workspace-browser__skeleton">
+              <div className="workspace-browser__skeleton-header">
+                <Skeleton width={72} height={11} />
+                <Skeleton width="26%" height={9} />
+              </div>
+              <div className="workspace-browser__skeleton-body">
+                <Skeleton width="58%" height={18} />
+                <SkeletonLines lines={3} widths={['94%', '88%', '64%']} />
+                <Skeleton className="skeleton--block workspace-browser__skeleton-media" />
+                <SkeletonLines lines={2} widths={['90%', '72%']} />
+              </div>
+            </SkeletonStatus>
+          ) : null}
+        </div>
+        {failure ? (
+          <div className="workspace-browser__failure" role="alert">
+            <WorkspaceEmptyState
+              kind="browser-failed"
+              title={failure.title}
+              detail={failure.detail}
+            >
+              <div className="workspace-browser__failure-actions">
+                <button type="button" className="btn" onClick={() => action('reload')}>
+                  Retry
+                </button>
+                <button type="button" className="ghost" onClick={editAddress}>
+                  Edit address
+                </button>
+              </div>
+            </WorkspaceEmptyState>
+          </div>
+        ) : !state.url ? (
+          // A row loads in this tab, so only the user's own tabs offer the list:
+          // never the agent's, and never where no page can load.
+          keepHistory && isDesktop ? (
+            <BrowserRecentPages onOpen={navigate}>{startBrowsing}</BrowserRecentPages>
+          ) : (
+            startBrowsing
+          )
+        ) : null}
+        {error ? (
+          <div className="workspace-browser__error" role="alert">
+            {error}
+          </div>
+        ) : null}
+      </div>
+    </div>
+  )
+})
+
+function webPageUrl(value: unknown): string {
+  if (typeof value !== 'string') return ''
+  try {
+    const url = new URL(value)
+    return url.protocol === 'https:' || url.protocol === 'http:' ? value : ''
+  } catch {
+    return ''
+  }
+}

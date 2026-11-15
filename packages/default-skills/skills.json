@@ -1,0 +1,78 @@
+{
+  "plugin": {
+    "name": "tastecode",
+    "description": "Agent Skills that ship with TasteCode.",
+    "author": {
+      "name": "TasteCode"
+    }
+  },
+  "skills": [
+    {
+      "folder": "cinetic",
+      "summary": "cinematic videos and motion design made in code",
+      "repository": "Leonxlnx/cinetic",
+      "ref": "main",
+      "commit": "ecfa6605de1adb9345ce937724810dc32267d068",
+      "path": "skills/cinetic",
+      "license": "MIT",
+      "licenseFile": "LICENSE",
+      "archiveSha256": "c613676f9adbf163ff3cb1c88ab597eac7fd67c884e3d0fcc5348507f1ff0cca",
+      "treeSha256": "f935393e436ca7bba81bd1b2da5de72a47236ee9b9e3e44129f271e3327cc82e",
+      "files": 147,
+      "bytes": 2749108
+    },
+    {
+      "folder": "design-taste-frontend",
+      "summary": "art direction for websites and app screens (tasteskill)",
+      "repository": "Leonxlnx/taste-skill",
+      "ref": "v2.5.0",
+      "commit": "822e0b9d872e10deb931afad2c6c2bd943cf4c7b",
+      "path": "skills/taste-skill",
+      "license": "MIT",
+      "licenseFile": "LICENSE",
+      "archiveSha256": "f7995b87905c1881e48fad6aa0c6ba4ad871bded5e673ecc455a085f922da2e5",
+      "treeSha256": "68c80a9007a7d14fe435d373cf3f2eda245840dd96d8be424e44efba3915537a",
+      "files": 496,
+      "bytes": 5611599,
+      "omit": {
+        "about": "Never bundled and never fetched: the photo library, the sample photographs of the demos and hero templates, the demo icon sets, the objects kit's sample posters and sample product specs, and their credits files. TasteCode gives no default images (Leon, 2026-11-05).",
+        "paths": [
+          "assets/photos/",
+          "assets/layout/img/",
+          "assets/icons/demo/",
+          "assets/ui/icons/",
+          "assets/moments/_demo/",
+          "assets/scenes/_demo/",
+          "assets/objects/photo-kit/photos/",
+          "assets/objects/photo-kit/photos.json",
+          "assets/components/fx-photo/meeting-room.jpg",
+          "assets/objects/*/fallback*.png",
+          "assets/objects/product-render/specs/"
+        ]
+      },
+      "patch": {
+        "about": "TasteCode copies in patches/design-taste-frontend/ that point the skill at the user's own pictures; each value is the sha256 of the upstream file the copy was written against.",
+        "files": {
+          "SKILL.md": "c16f47478c2da4911232de8210c938cb6efe41a78ae24bfdcc502d8336f2303b",
+          "references/photos.md": "cd7fd222a950c6a44159cf1679fe502ad897798f72a14968aae1cc73ce225d3f",
+          "scripts/photos.mjs": "a28a0b72af753e74f7a8f5f28fb83666e233662a6655227d130b80894086c223"
+        }
+      }
+    },
+    {
+      "folder": "cook",
+      "summary": "long reference-matching loops for ambitious visual builds",
+      "repository": "Leonxlnx/cook",
+      "ref": "main",
+      "commit": "b23cac6fd9439dfddcab61b14808e7bf72549b46",
+      "path": "",
+      "license": "MIT",
+      "licenseFile": "LICENSE",
+      "exclude": [".gitignore", "README.md"],
+      "archiveSha256": "da47160d18e41b31863a33ef74f72a8e3505ec38b9c926cce8dcb441d46ff708",
+      "treeSha256": "51681e41a3e59d2e4646e84d54d71499773f939025f63afead18277a33c7f0f4",
+      "files": 10,
+      "bytes": 44021
+    }
+  ]
+}

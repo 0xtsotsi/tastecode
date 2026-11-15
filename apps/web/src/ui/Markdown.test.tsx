@@ -1,0 +1,728 @@
+// @vitest-environment happy-dom
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { revealProjectFile } from '../bridge.js'
+import { preserveProjectFileLinks } from '../project-file-link.js'
+import { CompletedMarkdown } from './CompletedMarkdown.js'
+import { Markdown } from './Markdown.js'
+import { createRevealClock, replaceRevealClock } from './reveal-clock.js'
+import { fakeRevealEnvironment, visibleText } from './reveal-clock.fixture.js'
+
+vi.mock('../bridge.js', () => ({
+  canRevealProjectFile: true,
+  revealProjectFile: vi.fn(() => Promise.resolve()),
+}))
+
+vi.mock('../project-file-link.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../project-file-link.js')>()
+  return { ...actual, preserveProjectFileLinks: vi.fn(actual.preserveProjectFileLinks) }
+})
+
+afterEach(cleanup)
+
+/** happy-dom's emulated device: a live reply paces its text only when motion is allowed. */
+const device = (
+  window as unknown as { happyDOM: { settings: { device: { prefersReducedMotion: string } } } }
+).happyDOM.settings.device
+
+describe('Markdown plain fast path', () => {
+  it.each([
+    'Issue #123 keeps user_profile_1 unchanged.',
+    'Open C:\\workspace\\project and inspect [ready].',
+    'Compare x < y and y > z.',
+  ])('matches the full renderer for %s', (text) => {
+    const full = render(<CompletedMarkdown text={text} />)
+    const fast = render(<Markdown text={text} />)
+    const paragraphs = (container: HTMLElement) =>
+      [...container.querySelectorAll('p')].map((paragraph) => paragraph.textContent)
+
+    expect(paragraphs(fast.container)).toEqual(paragraphs(full.container))
+    expect(fast.container.textContent).toBe(full.container.textContent)
+    expect(full.container.querySelector('a, code, em, strong, blockquote, table')).toBeNull()
+    expect(fast.container.querySelector('a, code, em, strong, blockquote, table')).toBeNull()
+  })
+  it.each([
+    'Docs are at www.example.com now.',
+    'Write to someone@example.com today.',
+    'This is ~struck~ text.',
+  ])('keeps GFM autolinks and strikethrough for %s', async (text) => {
+    const full = render(<CompletedMarkdown text={text} />)
+    const fast = render(<Markdown text={text} />)
+    const element = (container: HTMLElement) => container.querySelector('a, del')?.outerHTML
+
+    await waitFor(() => expect(element(fast.container)).toBeDefined())
+    expect(element(fast.container)).toBe(element(full.container))
+  })
+})
+
+describe('Markdown inline references', () => {
+  it('renders file references with file-type icons instead of code pills', async () => {
+    const { container } = render(
+      <Markdown text={'Updated `Sidebar.tsx`, `app.css`, and ran `pnpm typecheck`.'} />,
+    )
+
+    const component = await screen.findByText('Sidebar.tsx')
+    const stylesheet = screen.getByText('app.css')
+    const command = screen.getByText('pnpm typecheck')
+
+    expect(component.tagName).toBe('SPAN')
+    expect(component.className).toBe('md-file-ref')
+    expect(component.classList.contains('md-file-ref')).toBe(true)
+    expect(
+      component.querySelector('[data-file-icon="react"] .tabler-icon-brand-react'),
+    ).toBeTruthy()
+    expect(stylesheet.classList.contains('md-file-ref')).toBe(true)
+    expect(
+      stylesheet.querySelector('[data-file-icon="style"] .tabler-icon-brand-css3'),
+    ).toBeTruthy()
+    expect(command.classList.contains('md-file-ref')).toBe(false)
+    expect(container.querySelectorAll('.md-file-ref')).toHaveLength(2)
+  })
+
+  it('chooses icons from the file extension', async () => {
+    const { container } = render(
+      <Markdown
+        text={
+          '`types.ts` `script.js` `index.html` `data.json` `README.md` `schema.sql` `run.sh` `main.rs` `logo.png`'
+        }
+      />,
+    )
+
+    await waitFor(() =>
+      expect(container.querySelector('[data-file-icon="typescript"]')).toBeTruthy(),
+    )
+    for (const kind of [
+      'typescript',
+      'javascript',
+      'markup',
+      'data',
+      'markdown',
+      'database',
+      'shell',
+      'rust',
+      'image',
+    ]) {
+      expect(container.querySelector(`[data-file-icon="${kind}"]`)).toBeTruthy()
+    }
+    expect(screen.getByText('README.md').querySelector('.tabler-icon-markdown')).toBeTruthy()
+  })
+
+  it('keeps linked local files out of the external-link warning flow', async () => {
+    render(
+      <Markdown
+        text={
+          'Updated [Sidebar.tsx](/Users/blueemi/Developer/harness/apps/web/src/ui/Sidebar.tsx:119).'
+        }
+        projectPath="/Users/blueemi/Developer/harness"
+      />,
+    )
+
+    const reference = await screen.findByText('Sidebar.tsx')
+    fireEvent.click(reference)
+
+    expect(reference.closest('.md-file-link')).toBeTruthy()
+    expect(reference.closest('a')).toBeNull()
+    expect(
+      reference.closest('.md-file-link')?.querySelector('.tabler-icon-brand-react'),
+    ).toBeTruthy()
+    expect(screen.queryByText('Open external link?')).toBeNull()
+  })
+
+  it('preserves a cross-drive Windows file URL for project-aware rendering', async () => {
+    const { container } = render(
+      <Markdown
+        text={'Updated [index.html](file:///E:/randomtesting/A_personalharness/site/index.html).'}
+        projectPath="E:\randomtesting\A_personalharness\site"
+      />,
+    )
+
+    expect(container.textContent).not.toContain('[blocked]')
+    const action = await screen.findByRole('button', { name: 'index.html' })
+    expect(action.getAttribute('title')).toContain(
+      'E:\\randomtesting\\A_personalharness\\site\\index.html',
+    )
+    fireEvent.click(action)
+    expect(revealProjectFile).toHaveBeenCalledWith(
+      'E:\\randomtesting\\A_personalharness\\site\\index.html',
+      'E:\\randomtesting\\A_personalharness\\site',
+    )
+  })
+
+  it('keeps preserved files with unknown extensions inside the project action flow', async () => {
+    render(
+      <Markdown
+        text={'Saved [artifact.log](file:///E:/randomtesting/A_personalharness/site/artifact.log).'}
+        projectPath="E:\randomtesting\A_personalharness\site"
+      />,
+    )
+
+    const action = await screen.findByRole('button', { name: 'artifact.log' })
+    fireEvent.click(action)
+    expect(revealProjectFile).toHaveBeenCalledWith(
+      'E:\\randomtesting\\A_personalharness\\site\\artifact.log',
+      'E:\\randomtesting\\A_personalharness\\site',
+    )
+  })
+
+  it('reveals the completed page from a slash-prefixed Windows drive link', async () => {
+    const project = 'E:/randomtesting/A_personalharness/AAAA/test24'
+    render(
+      <Markdown
+        text={`[Open the completed page](/${project}/dist/index.html).`}
+        projectPath={project}
+      />,
+    )
+    fireEvent.click(await screen.findByRole('button', { name: 'Open the completed page' }))
+    expect(revealProjectFile).toHaveBeenCalledWith(
+      'E:\\randomtesting\\A_personalharness\\AAAA\\test24\\dist\\index.html',
+      project,
+    )
+    expect(screen.queryByText('This file is outside the selected project')).toBeNull()
+  })
+
+  it.each([
+    ['file:///C:/src/C%23App/Program.cs', 'C:/src', 'C:\\src\\C#App\\Program.cs', 'C:/src'],
+    ['file:///home/u/C%23App/Program.cs', '/home/u', '/home/u/C#App/Program.cs', '/home/u'],
+    ['/home/u/proj/issue%231.md', '/home/u/proj', '/home/u/proj/issue#1.md', '/home/u/proj'],
+    ['file:///home/u/proj/a.ts#L10', '/home/u/proj', '/home/u/proj/a.ts', '/home/u/proj'],
+  ])('reveals %s with an encoded # kept in the file name', async (href, project, path) => {
+    vi.mocked(revealProjectFile).mockClear()
+    render(<Markdown text={`See [the file](${href}).`} projectPath={project} />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'the file' }))
+    expect(revealProjectFile).toHaveBeenCalledWith(path, project)
+  })
+
+  it('resolves relative links against the project instead of the app origin', async () => {
+    vi.mocked(revealProjectFile).mockClear()
+    const { container } = render(
+      <Markdown
+        text={
+          'See [a.ts](./src/a.ts), [b.ts](src/b.ts#L4), [docs](//example.com/docs), [up](../secret.ts) and [bad](javascript:alert(1)).'
+        }
+        projectPath="/home/u/project"
+      />,
+    )
+
+    fireEvent.click(await screen.findByRole('button', { name: 'a.ts' }))
+    fireEvent.click(screen.getByRole('button', { name: 'b.ts' }))
+    expect(vi.mocked(revealProjectFile).mock.calls).toEqual([
+      ['/home/u/project/src/a.ts', '/home/u/project'],
+      ['/home/u/project/src/b.ts', '/home/u/project'],
+    ])
+    expect(screen.getByRole('link', { name: 'docs' }).getAttribute('href')).toBe(
+      'https://example.com/docs',
+    )
+    expect(screen.getByText('This file is outside the selected project')).toBeTruthy()
+    expect(container.querySelector('a[href^="javascript:"]')).toBeNull()
+  })
+
+  it('reveals file and folder paths a reply names in inline code', async () => {
+    vi.mocked(revealProjectFile).mockClear()
+    render(
+      <Markdown
+        text={
+          'Changed `src/ui/Sidebar.tsx:42` in `src/ui/`, not `../secret.ts` or `../`; ran `pnpm test`.'
+        }
+        projectPath="/home/u/project"
+      />,
+    )
+
+    fireEvent.click(await screen.findByRole('button', { name: 'src/ui/Sidebar.tsx:42' }))
+    const folder = screen.getByRole('button', { name: 'src/ui/' })
+    expect(folder.querySelector('[data-file-icon="folder"]')).toBeTruthy()
+    fireEvent.click(folder)
+    expect(vi.mocked(revealProjectFile).mock.calls).toEqual([
+      ['/home/u/project/src/ui/Sidebar.tsx', '/home/u/project'],
+      ['/home/u/project/src/ui', '/home/u/project'],
+    ])
+    expect(screen.queryByRole('button', { name: '../secret.ts' })).toBeNull()
+    expect(screen.getByText('../').tagName).toBe('CODE')
+    expect(screen.getByText('pnpm test').tagName).toBe('CODE')
+  })
+
+  it('reveals a Windows path named in inline code inside a Windows project', async () => {
+    vi.mocked(revealProjectFile).mockClear()
+    render(<Markdown text={'Edited `apps\\web\\main.ts`.'} projectPath="E:\work\site" />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'apps\\web\\main.ts' }))
+    expect(revealProjectFile).toHaveBeenCalledWith(
+      'E:\\work\\site\\apps\\web\\main.ts',
+      'E:\\work\\site',
+    )
+  })
+
+  it('shows a retryable error when the native reveal request fails', async () => {
+    vi.mocked(revealProjectFile).mockRejectedValueOnce(new Error('reveal failed'))
+    render(
+      <Markdown
+        text={'Saved [artifact.bin](file:///E:/randomtesting/A_personalharness/site/artifact.bin).'}
+        projectPath="E:\randomtesting\A_personalharness\site"
+      />,
+    )
+
+    fireEvent.click(await screen.findByRole('button', { name: 'artifact.bin' }))
+    expect((await screen.findByRole('alert')).textContent).toContain('Could not show file')
+    expect(screen.getByRole('button', { name: /artifact.bin/i }).getAttribute('title')).toContain(
+      'Try showing',
+    )
+  })
+
+  it('explains why a local file link outside the project is unavailable', async () => {
+    const { container } = render(
+      <Markdown
+        text={'See [secret.txt](file:///E:/randomtesting/A_personalharness/secret.txt).'}
+        projectPath="E:\randomtesting\A_personalharness\site"
+      />,
+    )
+
+    expect(container.textContent).not.toContain('[blocked]')
+    const reason = await screen.findByText('This file is outside the selected project')
+    expect(screen.queryByRole('button', { name: 'secret.txt' })).toBeNull()
+    // Screen readers and the hover tooltip keep the reason; the layout does not repeat it.
+    expect(reason.className).toBe('visually-hidden')
+    expect(reason.closest('.md-file-link--blocked')?.getAttribute('title')).toBe(
+      'This file is outside the selected project',
+    )
+  })
+
+  it('keeps the outside-project reason out of the layout for every cited file', async () => {
+    const files = ['a.ts', 'b.ts', 'c.ts']
+    render(
+      <Markdown
+        text={`Changed ${files.map((name) => `[${name}](file:///E:/elsewhere/${name})`).join(', ')}.`}
+        projectPath="E:\randomtesting\A_personalharness\site"
+      />,
+    )
+
+    const reasons = await screen.findAllByText('This file is outside the selected project')
+    expect(reasons).toHaveLength(files.length)
+    expect(reasons.every((reason) => reason.className === 'visually-hidden')).toBe(true)
+  })
+
+  it('explains why network file links are unavailable', async () => {
+    render(
+      <Markdown
+        text={'See [secret.txt](file://server/share/secret.txt).'}
+        projectPath="E:\randomtesting\A_personalharness\site"
+      />,
+    )
+
+    expect((await screen.findByText('Network file links are not allowed')).className).toBe(
+      'visually-hidden',
+    )
+  })
+})
+
+describe('Completed Markdown', () => {
+  it('renders bold text as a strong element', async () => {
+    const { container } = render(<Markdown text="Use **bold** here" />)
+
+    await waitFor(() => expect(container.querySelector('[data-streaming-markdown]')).toBeNull())
+    expect(container.querySelector('strong')?.textContent).toBe('bold')
+    expect(container.querySelector('span[data-streamdown="strong"]')).toBeNull()
+  })
+
+  it.each(['Match files with **/*.ts in the repo.', 'Hold ^_foo to repeat.', 'Press the ` key.'])(
+    'does not repair finished text as if it were cut off: %s',
+    (text) => {
+      const { container } = render(<CompletedMarkdown text={`${text}\n\nZZEND`} />)
+
+      expect([...container.querySelectorAll('p')].at(-1)?.textContent).toBe('ZZEND')
+    },
+  )
+
+  it('resolves reference-style links against definitions in other blocks', () => {
+    render(
+      <CompletedMarkdown
+        text={
+          'See [the docs][docs] first.\n\n- then [the guide]\n\n[docs]: https://example.com/docs\n[the guide]: https://example.com/guide "Guide"'
+        }
+      />,
+    )
+
+    expect(screen.getByRole('link', { name: 'the docs' }).getAttribute('href')).toBe(
+      'https://example.com/docs',
+    )
+    expect(screen.getByRole('link', { name: 'the guide' }).getAttribute('href')).toBe(
+      'https://example.com/guide',
+    )
+  })
+})
+
+describe('Markdown raw HTML', () => {
+  /** Renders completed text and waits for the rich renderer to replace the live parser's DOM. */
+  async function completed(text: string, literalHtml?: boolean) {
+    const view = render(<Markdown text={text} projectPath="/project" literalHtml={literalHtml} />)
+    await waitFor(() =>
+      expect(view.container.querySelector('[data-streaming-markdown]')).toBeNull(),
+    )
+    return view.container
+  }
+
+  it('shows inline HTML in a chat reply as its source text', async () => {
+    const reply = 'SEE <script>alert(1)</script> <img src=x onerror=alert(1)>'
+    const container = await completed(reply, true)
+
+    expect(container.querySelector('p')?.textContent).toBe(reply)
+    expect(container.querySelector('script, img')).toBeNull()
+    expect(container.textContent).not.toContain('Image blocked')
+  })
+
+  it('keeps tag names a chat reply mentions outside code', async () => {
+    const container = await completed('use a <div> wrapper', true)
+
+    expect(container.querySelector('p')?.textContent).toBe('use a <div> wrapper')
+  })
+
+  it('shows block HTML in a chat reply as its source text', async () => {
+    const container = await completed(
+      '<details>\n<summary>More</summary>\nBody\n</details>\n\nAfter',
+      true,
+    )
+
+    expect([...container.querySelectorAll('p')].map((paragraph) => paragraph.textContent)).toEqual([
+      '<details>\n<summary>More</summary>\nBody\n</details>',
+      'After',
+    ])
+    expect(container.querySelector('details, summary')).toBeNull()
+  })
+
+  it('keeps autolinks and code in a chat reply', async () => {
+    const container = await completed(
+      'Open <https://example.com/docs> and wrap it in `<div>`.\n\n```html\n<p>hi</p>\n```',
+      true,
+    )
+
+    const link = screen.getByRole('link', { name: 'https://example.com/docs' })
+    expect(link.getAttribute('href')).toBe('https://example.com/docs')
+    expect(container.querySelector('p code')?.textContent).toBe('<div>')
+    expect(container.querySelector('pre')?.textContent).toBe('<p>hi</p>')
+  })
+
+  it('still renders HTML in pull request text', async () => {
+    const container = await completed('<img src="https://example.com/a.png" alt="a">')
+
+    const image = screen.getByAltText('a')
+    expect(image.tagName).toBe('IMG')
+    expect(image.getAttribute('src')).toBe('https://example.com/a.png')
+    expect(container.textContent).not.toContain('<img')
+  })
+})
+
+describe('Markdown streaming motion', () => {
+  // These read the DOM right after each append. The reveal has its own tests below.
+  beforeEach(() => {
+    device.prefersReducedMotion = 'reduce'
+  })
+  afterEach(() => {
+    device.prefersReducedMotion = 'no-preference'
+  })
+
+  it('defers full project-file parsing until the streamed message completes', async () => {
+    const preserve = vi.mocked(preserveProjectFileLinks)
+    preserve.mockClear()
+    const text = 'Updated [index.html](file:///E:/project/index.html).'
+    const { rerender } = render(<Markdown text={text} streaming projectPath="E:\project" />)
+
+    expect(preserve).not.toHaveBeenCalled()
+    rerender(<Markdown text={text} projectPath="E:\project" />)
+    await waitFor(() => expect(preserve).toHaveBeenCalledOnce())
+  })
+
+  it('keeps a local destination readable and inert while streaming', () => {
+    const text = 'Updated [index.html](file:///E:/project/index.html).'
+    const rendered = render(<Markdown text={text} streaming projectPath="E:\project" />)
+
+    expect(rendered.container.textContent).toContain('index.html')
+    expect(rendered.container.textContent).not.toContain('[blocked]')
+    expect(rendered.container.querySelector('a, button')).toBeNull()
+  })
+
+  it('keeps common Markdown styled while appending safely', () => {
+    const rendered = render(<Markdown text={'## Title\n\n- one\n\n```ts\nconst a ='} streaming />)
+    const heading = rendered.container.querySelector('h2')
+    rendered.rerender(
+      <Markdown
+        text={'## Title\n\n- one\n\n```ts\nconst a = 1'}
+        streaming
+        liveUpdate={{ kind: 'append', text: ' 1' }}
+        updateVersion={1}
+      />,
+    )
+
+    expect(rendered.container.querySelector('h2')).toBe(heading)
+    expect(heading?.textContent).toBe('Title')
+    expect(rendered.container.querySelector('li')?.textContent).toBe('one')
+    expect(rendered.container.querySelector('pre')?.textContent).toContain('const a = 1')
+    expect(rendered.container.querySelector('[data-live-markdown-leaf]')).toBeTruthy()
+    // No per-append animation nodes: motion is the reveal clock's, not the DOM's.
+    expect(rendered.container.querySelector('[style*="animation"]')).toBeNull()
+  })
+
+  it('keeps rich structure in a large non-animated provider burst', () => {
+    const paragraph = 'x'.repeat(8 * 1024)
+    const text = `## Large answer\n\n${paragraph} **done**\n\n\`\`\`ts\nconst value = 1\n\`\`\``
+    const rendered = render(<Markdown text={text} streaming />)
+
+    expect(rendered.container.querySelector('h2')?.textContent).toBe('Large answer')
+    expect(rendered.container.querySelector('p')?.textContent?.trim()).toBe(`${paragraph} done`)
+    expect(rendered.container.querySelector('strong')?.textContent).toBe('done')
+    expect(rendered.container.querySelector('pre')?.textContent).toContain('const value = 1')
+    expect(rendered.container.querySelector('[style*="animation"]')).toBeNull()
+  })
+
+  it('keeps a streamed leaf in one text node', () => {
+    let text = 'start'
+    const rendered = render(<Markdown text={text} streaming />)
+
+    for (let version = 1; version <= 50; version += 1) {
+      text += 'x'
+      rendered.rerender(
+        <Markdown
+          text={text}
+          streaming
+          liveUpdate={{ kind: 'append', text: 'x' }}
+          updateVersion={version}
+        />,
+      )
+    }
+
+    const leaf = rendered.container.querySelector('[data-live-markdown-leaf]')
+    expect(leaf?.textContent).toBe(text)
+    expect(leaf?.childNodes).toHaveLength(1)
+    expect(rendered.container.querySelector('[style*="animation"]')).toBeNull()
+  })
+
+  it('does not replay streaming motion for an initial or reset document', () => {
+    const text = 'x'.repeat(4_096)
+    const rendered = render(<Markdown text={text} streaming />)
+
+    expect(rendered.container.querySelector('[style*="animation"]')).toBeNull()
+    rendered.rerender(
+      <Markdown
+        text="replacement"
+        streaming
+        liveUpdate={{ kind: 'reset', text: 'replacement' }}
+        updateVersion={1}
+      />,
+    )
+    expect(rendered.container.querySelector('[style*="animation"]')).toBeNull()
+  })
+
+  it('skips temporary animation nodes for a very large provider burst', () => {
+    const rendered = render(<Markdown text="start" streaming />)
+    const addition = 'x'.repeat(4 * 1024 + 1)
+
+    rendered.rerender(
+      <Markdown
+        text={`start${addition}`}
+        streaming
+        liveUpdate={{ kind: 'append', text: addition }}
+        updateVersion={1}
+      />,
+    )
+
+    expect(rendered.container.querySelector('[style*="animation"]')).toBeNull()
+    expect(rendered.container.textContent).toBe(`start${addition}`)
+  })
+
+  it('compacts sealed leaves on one long streamed code line', () => {
+    const source = `\`\`\`ts\n${'x'.repeat(300)}`
+    const { container } = render(<Markdown text={source} streaming />)
+    const leaves = [...container.querySelectorAll('pre code > [data-live-markdown-leaf]')]
+
+    expect(leaves).toHaveLength(1)
+    expect(leaves.every((leaf) => (leaf as HTMLElement).style.display === 'inline')).toBe(true)
+    expect(leaves.every((leaf) => (leaf as HTMLElement).style.minHeight === '0')).toBe(true)
+    expect(container.querySelector('pre')?.textContent).toBe('x'.repeat(300))
+  })
+})
+
+describe('Markdown streaming reveal', () => {
+  let fake: ReturnType<typeof fakeRevealEnvironment>
+  beforeEach(() => {
+    fake = fakeRevealEnvironment()
+    replaceRevealClock(createRevealClock(fake.env))
+  })
+  afterEach(() => {
+    replaceRevealClock(undefined)
+  })
+
+  const burst = ' and then a whole burst of words lands at once from the provider.'
+  const live = (container: HTMLElement) =>
+    container.querySelector<HTMLElement>('[data-streaming-markdown]')!
+  const shown = (container: HTMLElement) => visibleText(live(container), fake.ranges())
+  const frames = (count: number) =>
+    act(() => {
+      for (let frame = 0; frame < count; frame += 1) fake.frame(16)
+    })
+
+  function streamBurst() {
+    const rendered = render(<Markdown text="It starts" streaming />)
+    frames(30)
+    rendered.rerender(
+      <Markdown
+        text={`It starts${burst}`}
+        streaming
+        liveUpdate={{ kind: 'append', text: burst }}
+        updateVersion={1}
+      />,
+    )
+    return rendered
+  }
+
+  it('lays a burst out at once and reveals it character by character', () => {
+    const { container } = streamBurst()
+    // Laid out in full, so its line breaks are final; shown a little later.
+    expect(live(container).textContent).toBe(`It starts${burst}`)
+    expect(shown(container)).toBe('It starts')
+
+    const lengths: number[] = []
+    for (let frame = 0; frame < 40; frame += 1) {
+      frames(1)
+      lengths.push(shown(container).length)
+    }
+    expect(lengths[0]).toBeLessThan(`It starts${burst}`.length)
+    expect(lengths.at(-1)).toBe(`It starts${burst}`.length)
+    const steps = lengths.slice(1).map((length, index) => length - lengths[index]!)
+    // An isolated burst is shown within about 150 ms: a few characters a
+    // frame, speeding up and slowing down gradually instead of in word jumps.
+    const growing = steps.slice(
+      0,
+      steps.findLastIndex((step) => step > 0),
+    )
+    expect(Math.max(...growing)).toBeLessThanOrEqual(10)
+    expect(growing.every((step) => step > 0)).toBe(true)
+    const changes = growing.slice(1).map((step, index) => Math.abs(step - growing[index]!))
+    expect(Math.max(...changes)).toBeLessThanOrEqual(3)
+    expect(fake.pendingFrames()).toBe(0)
+  })
+
+  it('reveals the first words of a new reply too', () => {
+    const { container } = render(<Markdown text="Hello there" streaming />)
+    expect(live(container).textContent).toBe('Hello there')
+    expect(shown(container)).toBe('')
+    frames(30)
+    expect(shown(container)).toBe('Hello there')
+  })
+
+  it('shows a code chip once the reveal reaches it, not ahead of its text', () => {
+    const { container } = render(<Markdown text="Now run `pnpm test` again" streaming />)
+    const code = () => container.querySelector('code')!
+    expect(code().hasAttribute('data-reveal-pending')).toBe(true)
+    frames(40)
+    expect(shown(container)).toBe('Now run pnpm test again')
+    expect(code().hasAttribute('data-reveal-pending')).toBe(false)
+  })
+
+  it('shows a list bullet once the reveal reaches its item', () => {
+    const { container } = render(<Markdown text={'Steps:\n\n- read\n- test'} streaming />)
+    const items = () => [...container.querySelectorAll('li')]
+    expect(items().every((item) => item.hasAttribute('data-reveal-pending'))).toBe(true)
+    let heldSecond = 0
+    for (let frame = 0; frame < 40; frame += 1) {
+      frames(1)
+      if (items()[1]!.hasAttribute('data-reveal-pending')) {
+        heldSecond += 1
+        expect(shown(container).length).toBeLessThanOrEqual('Steps:\nread'.length)
+      }
+    }
+    expect(heldSecond).toBeGreaterThan(0)
+    expect(shown(container)).toBe('Steps:\nreadtest')
+    expect(items().some((item) => item.hasAttribute('data-reveal-pending'))).toBe(false)
+  })
+
+  it('shows a file reference icon once the reveal reaches its name', () => {
+    const { container } = render(<Markdown text="Open `src/handler.ts` next" streaming />)
+    const reference = () => container.querySelector('.md-file-ref')!
+    expect(reference().hasAttribute('data-reveal-pending')).toBe(true)
+    let held = 0
+    for (let frame = 0; frame < 40; frame += 1) {
+      frames(1)
+      const visible = shown(container)
+      if (reference().hasAttribute('data-reveal-pending')) {
+        held += 1
+        expect(visible.length).toBeLessThanOrEqual('Open '.length)
+      }
+    }
+    expect(held).toBeGreaterThan(0)
+    expect(shown(container)).toBe('Open src/handler.ts next')
+    expect(reference().hasAttribute('data-reveal-pending')).toBe(false)
+  })
+
+  it('shows a reply opened mid-stream at once', () => {
+    const text = 'Opened later. '.repeat(40)
+    const { container } = render(<Markdown text={text} streaming />)
+    expect(fake.ranges()).toHaveLength(0)
+    expect(shown(container)).toBe(text)
+  })
+
+  it('keeps text nodes in place while the reveal holds a position in them', () => {
+    let text = 'start '
+    const rendered = render(<Markdown text={text} streaming />)
+    for (let version = 1; version <= 6; version += 1) {
+      const delta = 'word '.repeat(20)
+      text += delta
+      rendered.rerender(
+        <Markdown
+          text={text}
+          streaming
+          liveUpdate={{ kind: 'append', text: delta }}
+          updateVersion={version}
+        />,
+      )
+      frames(2)
+    }
+    // Sealed 256-character leaves stay spans instead of folding into one node.
+    expect(rendered.container.querySelectorAll('p > [data-live-markdown-leaf]').length).toBe(3)
+    frames(80)
+    expect(shown(rendered.container)).toBe(text)
+  })
+
+  it('hands over to the finished renderer only once the reveal has drained', () => {
+    const { container, rerender } = streamBurst()
+    const element = live(container)
+    rerender(<Markdown text={`It starts${burst} Done.`} />)
+
+    // The live DOM stays while the rest drains, the final words included.
+    expect(live(container)).toBe(element)
+    expect(element.getAttribute('aria-busy')).toBe('false')
+    expect(element.textContent).toBe(`It starts${burst} Done.`)
+    expect(shown(container).length).toBeLessThan(element.textContent!.length)
+
+    frames(20)
+    expect(container.querySelector('[data-streaming-markdown]')).toBeNull()
+    expect(container.querySelector('[data-plain-markdown]')?.textContent).toBe(
+      `It starts${burst} Done.`,
+    )
+    expect(fake.ranges()).toHaveLength(0)
+  })
+
+  it('shows text as it lands when the reader asks for reduced motion', () => {
+    fake.setMotion(false)
+    const { container, rerender } = streamBurst()
+    expect(fake.ranges()).toHaveLength(0)
+    expect(live(container).textContent).toBe(`It starts${burst}`)
+    expect(fake.pendingFrames()).toBe(0)
+
+    rerender(<Markdown text={`It starts${burst}`} />)
+    expect(container.querySelector('[data-plain-markdown]')?.textContent).toBe(`It starts${burst}`)
+  })
+
+  it('keeps a reply that finished without a reveal finished when motion comes back', () => {
+    const clock = createRevealClock(fake.env)
+    replaceRevealClock(clock)
+    const { container, rerender } = streamBurst()
+    // The window is hidden when the reply finishes.
+    fake.setMotion(false)
+    rerender(<Markdown text={`It starts${burst}`} />)
+    expect(container.querySelector('[data-plain-markdown]')).toBeTruthy()
+
+    const attach = vi.spyOn(clock, 'attach')
+    fake.setMotion(true)
+    rerender(<Markdown text={`It starts${burst}`} projectPath="E:\project" />)
+    expect(attach).not.toHaveBeenCalled()
+    expect(container.querySelector('[data-plain-markdown]')?.textContent).toBe(`It starts${burst}`)
+  })
+})

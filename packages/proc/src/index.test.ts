@@ -1,0 +1,385 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { captureCli } from './cli.js'
+import { setTaskkillLauncherForTests } from './kill.js'
+import { EventEmitter } from 'node:events'
+import {
+  chmodSync,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { PassThrough } from 'node:stream'
+import {
+  killTree,
+  commandVersion,
+  isInstalled,
+  readNdjson,
+  runCli,
+  spawnCli,
+  StdioJsonRpc,
+  type StdioJsonRpcProcess,
+} from './index.js'
+
+describe('command discovery', () => {
+  it.skipIf(process.platform === 'win32')(
+    'reads an exact version from an executable link without launching it',
+    async () => {
+      const directory = mkdtempSync(path.join(os.tmpdir(), 'harness-command-version-'))
+      const target = path.join(directory, '2.3.4')
+      const command = path.join(directory, 'fake-agent')
+      const previousPath = process.env['PATH']
+      try {
+        writeFileSync(target, '')
+        chmodSync(target, 0o755)
+        symlinkSync(target, command)
+        process.env['PATH'] = `${directory}${path.delimiter}${previousPath ?? ''}`
+
+        await expect(isInstalled('fake-agent')).resolves.toBe(true)
+        await expect(commandVersion('fake-agent')).resolves.toBe('2.3.4')
+      } finally {
+        process.env['PATH'] = previousPath
+        rmSync(directory, { recursive: true, force: true })
+      }
+    },
+  )
+
+  it('closes stdin so a version probe that reads until EOF can answer', async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'harness-command-version-'))
+    try {
+      const command = writeFakeCli(
+        directory,
+        "process.stdin.resume(); process.stdin.on('end', () => process.stdout.write('fake-agent 1.2.3\\n'))",
+      )
+
+      await expect(commandVersion(command, 2_000)).resolves.toBe('fake-agent 1.2.3')
+    } finally {
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+})
+
+/** A CLI on disk that runs `script` under this Node, launched the way a vendor shim would be. */
+function writeFakeCli(directory: string, script: string): string {
+  writeFileSync(path.join(directory, 'fake-agent.cjs'), script)
+  if (process.platform === 'win32') {
+    const command = path.join(directory, 'fake-agent.cmd')
+    writeFileSync(command, `@echo off\r\n"${process.execPath}" "%~dp0fake-agent.cjs" %*\r\n`)
+    return command
+  }
+  const command = path.join(directory, 'fake-agent')
+  writeFileSync(
+    command,
+    `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(path.join(directory, 'fake-agent.cjs'))} "$@"\n`,
+  )
+  chmodSync(command, 0o755)
+  return command
+}
+
+describe('StdioJsonRpc', () => {
+  it('forgets a timed-out request and still accepts the next reply', async () => {
+    vi.useFakeTimers()
+    try {
+      const child = Object.assign(new EventEmitter(), {
+        stdin: new PassThrough(),
+        stdout: new PassThrough(),
+        stderr: new PassThrough(),
+        exitCode: null,
+        signalCode: null,
+        kill: vi.fn(() => true),
+      }) satisfies StdioJsonRpcProcess
+      const rpc = new StdioJsonRpc(child, 'test agent')
+
+      const timedOut = rpc.request('slow', {}, { timeoutMs: 10 })
+      const rejection = expect(timedOut).rejects.toThrow('test agent request timed out: slow')
+      await vi.advanceTimersByTimeAsync(10)
+      await rejection
+
+      const next = rpc.request('fast')
+      child.stdout.write('{"jsonrpc":"2.0","id":1,"result":"late"}\n')
+      child.stdout.write('{"jsonrpc":"2.0","id":2,"result":"ready"}\n')
+      await expect(next).resolves.toBe('ready')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
+describe('runCli', () => {
+  it.each(['stdout', 'stderr'] as const)(
+    'rejects an endless %s flood without disclosing output and stops the child',
+    async (stream) => {
+      const script = `setInterval(() => process.${stream}.write('private-fixture'.repeat(8192)), 1)`
+      const child = spawnCli(process.execPath, ['-e', script])
+      const result = captureCli(child, 2000, 1024)
+      await expect(result).rejects.toThrow(
+        'CLI output exceeded the size limit. Reduce command output and retry.',
+      )
+      expect(child.exitCode !== null || child.signalCode !== null).toBe(true)
+    },
+  )
+
+  it('names the command and the limit when a short command times out', async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'harness-cli-timeout-'))
+    try {
+      // Slow, not stuck: a command that misses the limit is left to finish.
+      const command = writeFakeCli(directory, 'setTimeout(() => {}, 3000)')
+      await expect(runCli(command, ['status'], 1_000)).rejects.toThrow(
+        'fake-agent did not answer within 1 second.',
+      )
+    } finally {
+      rmSync(directory, { recursive: true, force: true, maxRetries: 10 })
+    }
+  })
+
+  it('leaves a short command that missed its limit to finish by itself', async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'harness-cli-slow-'))
+    const done = path.join(directory, 'done')
+    const launches: number[] = []
+    setTaskkillLauncherForTests((pid) => {
+      launches.push(pid)
+      return { exit: Promise.resolve(0), release: () => undefined }
+    })
+    try {
+      const command = writeFakeCli(
+        directory,
+        `setTimeout(() => require('node:fs').writeFileSync(${JSON.stringify(done)}, 'done'), 2500)`,
+      )
+      await expect(runCli(command, ['status'], 500)).rejects.toThrow(
+        'fake-agent did not answer within 500 ms.',
+      )
+      const deadline = Date.now() + 20_000
+      while (!existsSync(done) && Date.now() < deadline) await sleep(100)
+      expect(existsSync(done)).toBe(true)
+      // No taskkill: on a loaded PC each one holds the event loop.
+      expect(launches).toEqual([])
+    } finally {
+      setTaskkillLauncherForTests()
+      rmSync(directory, { recursive: true, force: true, maxRetries: 10 })
+    }
+  }, 30_000)
+
+  it('says which limit an unnamed capture missed', async () => {
+    const child = spawnCli(process.execPath, ['-e', 'setInterval(() => {}, 1000)'])
+    await expect(captureCli(child, 50)).rejects.toThrow('The CLI did not answer within 50 ms.')
+  })
+
+  it('counts UTF-8 bytes across both pipes before retaining output', async () => {
+    const child = spawnCli(process.execPath, [
+      '-e',
+      "process.stdout.write('é'.repeat(200)); process.stderr.write('é'.repeat(200))",
+    ])
+    await expect(captureCli(child, 2000, 700)).rejects.toThrow('output exceeded the size limit')
+  })
+
+  it('drains stderr when probing a version and reports no version after overflow', async () => {
+    // A fake process verifies the same capture path used by version probes without
+    // relying on platform-specific executable scripts.
+    const child = spawnCli(process.execPath, ['-e', "process.stderr.write('x'.repeat(65537))"])
+    await expect(captureCli(child, 2000, 65536)).rejects.toThrow('output exceeded the size limit')
+    await expect(commandVersion(process.execPath)).resolves.toMatch(/^v\d+\./)
+  })
+
+  it('captures a short command without invoking a platform shell directly', async () => {
+    const result = await runCli('node', ['--version'])
+    expect(result.code).toBe(0)
+    expect(result.stdout).toMatch(/^v\d+\./)
+  })
+
+  it('waits for inherited output pipes to drain before returning', async () => {
+    const lateOutput = "setTimeout(() => process.stdout.write('late'), 50)"
+    const script = [
+      "const { spawn } = require('node:child_process')",
+      `const child = spawn(process.execPath, ['-e', ${JSON.stringify(lateOutput)}], { detached: true, stdio: ['ignore', 'inherit', 'inherit'] })`,
+      'child.unref()',
+      "process.stdout.write('early-')",
+    ].join(';')
+
+    const result = await runCli(process.execPath, ['-e', script], 2_000)
+
+    expect(result).toEqual({ code: 0, signal: null, stdout: 'early-late', stderr: '' })
+  })
+
+  it('lays an extra environment over the inherited one and keeps the desktop PATH', async () => {
+    const script =
+      'process.stdout.write(JSON.stringify([process.env.HARNESS_RUNCLI_HOME, process.env.PATH]))'
+    const result = await runCli(process.execPath, ['-e', script], 10_000, {
+      env: { HARNESS_RUNCLI_HOME: 'account-home' },
+    })
+
+    expect(result.code).toBe(0)
+    const [home, childPath] = JSON.parse(result.stdout) as [string, string]
+    expect(home).toBe('account-home')
+    const same = (left: string, right: string) =>
+      process.platform === 'win32' ? left.toLowerCase() === right.toLowerCase() : left === right
+    const userBin = path.join(os.homedir(), '.local', 'bin')
+    expect(childPath.split(path.delimiter).some((entry) => same(entry, userBin))).toBe(true)
+  })
+
+  it('captures provider status text written to stderr', async () => {
+    const result = await runCli(process.execPath, ['-e', "process.stderr.write('provider status')"])
+
+    expect(result).toEqual({ code: 0, signal: null, stdout: '', stderr: 'provider status' })
+  })
+
+  it('closes stdin so a command that reads until EOF can finish', async () => {
+    const script =
+      "process.stdin.resume(); process.stdin.on('end', () => process.stdout.write('eof'))"
+
+    const result = await runCli(process.execPath, ['-e', script], 2_000)
+
+    expect(result).toEqual({ code: 0, signal: null, stdout: 'eof', stderr: '' })
+  })
+
+  it('leaves stdin to a captureCli caller that sends a request body', async () => {
+    const script = [
+      "let body = ''",
+      "process.stdin.setEncoding('utf8')",
+      "process.stdin.on('data', (chunk) => (body += chunk))",
+      "process.stdin.on('end', () => process.stdout.write(body))",
+    ].join(';')
+    const child = spawnCli(process.execPath, ['-e', script])
+    const captured = captureCli(child, 2_000)
+    child.stdin.end('request body')
+
+    await expect(captured).resolves.toMatchObject({ code: 0, stdout: 'request body' })
+  })
+})
+
+describe('spawnCli', () => {
+  it('runs an absolute Windows executable whose path contains spaces', async () => {
+    const child = spawnCli(process.execPath, ['-e', 'process.stdout.write("ready")'])
+    let output = ''
+    child.stdout.setEncoding('utf8')
+    child.stdout.on('data', (chunk: string) => (output += chunk))
+    const code = await new Promise<number | null>((resolve, reject) => {
+      child.on('error', reject)
+      child.on('exit', resolve)
+    })
+    expect(code).toBe(0)
+    expect(output).toBe('ready')
+  })
+
+  it('can replace the inherited environment for untrusted commands', async () => {
+    process.env['HARNESS_HIDDEN'] = 'secret'
+    try {
+      const child = spawnCli(
+        'node',
+        [
+          '-e',
+          'process.stdout.write(`${process.env.HARNESS_VISIBLE}|${process.env.HARNESS_HIDDEN ?? ""}`)',
+        ],
+        {
+          replaceEnv: true,
+          env: {
+            PATH: process.env['PATH'],
+            PATHEXT: process.env['PATHEXT'],
+            SYSTEMROOT: process.env['SYSTEMROOT'],
+            COMSPEC: process.env['COMSPEC'],
+            HARNESS_VISIBLE: 'yes',
+          },
+        },
+      )
+      let output = ''
+      child.stdout.setEncoding('utf8')
+      child.stdout.on('data', (chunk: string) => (output += chunk))
+      const code = await new Promise<number | null>((resolve, reject) => {
+        child.on('error', reject)
+        child.on('exit', resolve)
+      })
+      expect(code).toBe(0)
+      expect(output).toBe('yes|')
+    } finally {
+      delete process.env['HARNESS_HIDDEN']
+    }
+  })
+})
+
+describe('readNdjson', () => {
+  it('parses a final line that has no trailing newline once the stream ends', async () => {
+    // CLIs that die right after their last write often leave it unterminated;
+    // dropping it deterministically lost the result of the whole run.
+    const stream = new PassThrough()
+    const values: unknown[] = []
+    readNdjson(stream, (value) => values.push(value))
+    stream.write('{"first":1}\n{"seco')
+    stream.end('nd":2}')
+    await new Promise((resolve) => stream.on('end', resolve))
+    expect(values).toEqual([{ first: 1 }, { second: 2 }])
+  })
+
+  it('reports a throwing handler as an error and keeps reading', async () => {
+    const stream = new PassThrough()
+    const values: unknown[] = []
+    const unparsable: string[] = []
+    const errors: Error[] = []
+    readNdjson(
+      stream,
+      (value) => {
+        values.push(value)
+        if (values.length === 1) throw new Error('listener failed')
+      },
+      (line) => unparsable.push(line),
+      { onError: (error) => errors.push(error) },
+    )
+    stream.end('{"first":1}\n{"second":2}\n')
+    await new Promise((resolve) => stream.on('end', resolve))
+    expect(values).toEqual([{ first: 1 }, { second: 2 }])
+    expect(unparsable).toEqual([])
+    expect(errors.map(({ message }) => message)).toEqual(['listener failed'])
+  })
+})
+
+describe('killTree', () => {
+  let child: ReturnType<typeof spawnCli> | undefined
+  let workspace: string | undefined
+  let beat: string
+
+  beforeEach(async () => {
+    workspace = mkdtempSync(path.join(os.tmpdir(), 'harness-killtree-'))
+    beat = path.join(workspace, 'heartbeat.txt')
+    const heartbeat = `const fs=require('fs');setInterval(()=>fs.writeFileSync(${JSON.stringify(
+      beat,
+    )},String(Date.now())),150)`
+    // A real grandchild is required even when spawnCli resolves node.exe directly.
+    const wrapper = `require('node:child_process').spawn(process.execPath,['-e',${JSON.stringify(
+      heartbeat,
+    )}],{stdio:'ignore',windowsHide:true})`
+    child = spawnCli(process.execPath, ['-e', wrapper])
+    await waitFor(() => existsSync(beat), 5_000)
+  })
+
+  afterEach(async () => {
+    try {
+      if (child) await killTree(child)
+    } finally {
+      child = undefined
+      if (workspace) rmSync(workspace, { recursive: true, force: true })
+      workspace = undefined
+    }
+  })
+
+  it('kills the heartbeat grandchild, not only its parent', async () => {
+    await killTree(child!)
+    expect(child!.exitCode !== null || child!.signalCode !== null).toBe(true)
+    const afterKill = readFileSync(beat, 'utf8')
+    await sleep(700)
+    expect(readFileSync(beat, 'utf8')).toBe(afterKill)
+  })
+})
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+async function waitFor(check: () => boolean, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (!check()) {
+    if (Date.now() > deadline) throw new Error('condition never became true')
+    await sleep(100)
+  }
+}

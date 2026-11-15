@@ -1,0 +1,1172 @@
+import type { ClaudeCodeAdapter } from '@harness/adapter-claude-code'
+import { isClaudeRuntime } from '@harness/adapter-claude-code/capabilities'
+import type { GrokAdapter } from '@harness/adapter-grok'
+import type {
+  ApprovalDecision,
+  ApprovalMode,
+  Capabilities,
+  CustomHarness,
+  CustomHarnessVerification,
+  CustomHarnessVerificationCheck,
+  DomainEvent,
+  McpServer,
+  McpServerConfig,
+  Model,
+  ProviderCommand,
+  ProviderContextSettings,
+  ProviderId,
+  ProviderLimit,
+  Thread,
+} from '@harness/contracts'
+import {
+  actionableLaunchError,
+  customHarnessRun,
+  customHarnessSpawn,
+  resolveCustomHarnessLaunch,
+  runCustomHarness,
+} from './custom-harness-launch.js'
+import type { ModelListRead } from './model-list-cache.js'
+import { retryableLazy } from './retryable-lazy.js'
+import { mapProviderSession, StartupCleanupError } from './provider-session.js'
+
+const loadAcpAdapter = retryableLazy(() => import('@harness/adapter-acp'))
+const loadAntigravityAdapter = retryableLazy(() => import('@harness/adapter-antigravity'))
+const loadClaudeAdapter = retryableLazy(() => import('@harness/adapter-claude-code'))
+const loadCodexAdapter = retryableLazy(() => import('@harness/adapter-codex'))
+const loadCursorAdapter = retryableLazy(() => import('@harness/adapter-cursor'))
+const loadGrokAdapter = retryableLazy(() => import('@harness/adapter-grok'))
+const loadGrokAccountHome = retryableLazy(() => import('@harness/adapter-grok/account-home'))
+const loadOpenCodeAdapter = retryableLazy(() => import('@harness/adapter-opencode'))
+const loadPiAdapter = retryableLazy(() => import('@harness/adapter-pi'))
+
+/**
+ * One shape every engine is driven through.
+ *
+ * The orchestrator above this never learns which provider it is talking to.
+ * That is the whole point of the layer: adding an engine is a new case here,
+ * not a change to session handling, and capabilities tell the UI what to hide
+ * rather than letting it guess.
+ */
+export type StartOptions = {
+  instructions?: string | undefined
+  model?: string | undefined
+  serviceTier?: string | undefined
+  effort?: string | undefined
+  approval?: ApprovalMode | undefined
+  /** Built-in ACP agent or user-owned harness source to launch. */
+  agent?: string | undefined
+  /** Provider-owned history should not retain product-internal background work. */
+  ephemeral?: boolean | undefined
+  /**
+   * Run this session in a private git worktree rather than in the project
+   * folder itself, so two agents cannot overwrite each other.
+   */
+  isolate?: boolean | undefined
+  baseRef?: string | undefined
+  /** The user's context settings, already narrowed to what this engine declared. */
+  context?: ProviderContextSettings | undefined
+  /** One of the engine's declared runtimes, chosen by the user; absent, its default. */
+  runtime?: string | undefined
+  /** Internal project overrides and their already-resolved OS credentials. */
+  mcpServers?: McpServerConfig[] | undefined
+  mcpCredentials?: Record<string, string> | undefined
+  /**
+   * Server-owned, opaque provider resume identity. It is intentionally
+   * separate from the stable TasteCode thread id passed to `resume`.
+   */
+  providerSessionId?: string | undefined
+  /** Opaque local state, validated only by the adapter that owns it. */
+  resumeState?: unknown
+  /**
+   * The folder of the skills that ship with TasteCode, laid out as a Claude
+   * Code plugin. Passed only to providers that declare `defaultSkillsPlugin`.
+   */
+  skillPlugin?: string | undefined
+}
+
+export type TurnOptions = Pick<StartOptions, 'model' | 'serviceTier' | 'effort'>
+
+export interface AgentSession {
+  /** Credential-free adapter state persisted at completed-turn boundaries, never per delta. */
+  snapshot?(): unknown
+  readonly capabilities: Capabilities
+  /**
+   * The longest prompt, in UTF-16 code units, one turn can carry. Set by an
+   * engine that passes its prompt on a command line, which the system limits;
+   * absent when the prompt travels where length does not matter.
+   */
+  readonly promptLimit?: number
+  /**
+   * How many tokens a model's context holds, for an engine that knows it per
+   * model rather than declaring one window in its capabilities.
+   */
+  modelContextWindow?(model: string | undefined): Promise<number | undefined>
+  sendTurn(
+    threadId: string,
+    text: string,
+    attachments?: string[],
+    options?: TurnOptions,
+  ): Promise<string>
+  steer?(threadId: string, text: string, attachments?: string[]): Promise<void>
+  interrupt(threadId: string): Promise<void>
+  listMcpServers?(threadId?: string): Promise<McpServer[]>
+  /** The MCP answer still holds only configured servers; a change event follows. */
+  isMcpLoading?(threadId?: string): boolean
+  reloadMcpServers?(
+    threadId: string,
+    servers: McpServerConfig[],
+    credentials: Record<string, string>,
+  ): Promise<void>
+  startMcpOAuth?(serverId: string, threadId: string): Promise<{ loginId: string; authUrl: string }>
+  onMcpOAuth?(
+    listener: (result: {
+      serverId: string
+      loginId: string
+      success: boolean
+      error: string | null
+    }) => void,
+  ): void
+  /** Provider-owned subscription usage changed; the server should refetch. */
+  onUsageChanged?(listener: () => void): void
+  /**
+   * Plan-limit windows the live session reported, each with a stable `id`.
+   * Sparse: windows it does not name keep their held values.
+   */
+  onLimitsUpdated?(listener: (limits: ProviderLimit[]) => void): void
+  /** Provider MCP discovery changed; the project inventory should be refreshed. */
+  onMcpChanged?(listener: () => void): (() => void) | void
+  /** Slash commands and skills the provider runs itself when a message starts with them. */
+  listCommands?(threadId?: string): Promise<ProviderCommand[]>
+  /** The provider reported a new command list for this session. */
+  onCommandsChanged?(listener: () => void): (() => void) | void
+  /**
+   * False when the live session negotiated no way to reload it, so releasing an
+   * idle runtime would lose it. Absent means the runtime's `resume` decides.
+   */
+  readonly resumable?: boolean
+  /**
+   * Work a turn started still runs in the background of the agent's process, and the
+   * agent starts a turn of its own when it ends. Releasing the idle runtime would end
+   * both. Absent: the agent runs nothing between turns.
+   */
+  hasBackgroundWork?(): boolean
+  /** The answer of `hasBackgroundWork` may have changed. */
+  onBackgroundWorkChanged?(listener: () => void): (() => void) | void
+  /** The session cannot accept more work; its terminal events have already been emitted. */
+  onDisconnected?(listener: () => void): () => void
+  /** Provider reported or rotated the opaque identity needed after a restart. */
+  onProviderSessionId?(listener: (providerSessionId: string) => void): void
+  respondToApproval(approvalId: string, decision: ApprovalDecision): void
+  respondToUserInput?(requestId: string, answers: Record<string, string[]>): void
+  /**
+   * Apply an access-level change to the attached session, at least for its
+   * next turn. An already running turn may retain its launch policy.
+   * Sessions without this method must be replaced before their next turn.
+   */
+  setApproval?(approval: ApprovalMode): void | Promise<void>
+  dispose(): void | Promise<void>
+  on(event: 'event', listener: (event: DomainEvent) => void): void
+  on(event: 'log', listener: (line: string) => void): void
+}
+
+/** A provider session as the provider saved it, in the folder of the account it ran as. */
+export type SavedSession = {
+  providerSessionId: string
+  /** That account's folder; absent for the default account. */
+  accountHome?: string | undefined
+}
+
+export type ProviderRuntime = {
+  start(
+    workspacePath: string,
+    options: StartOptions,
+  ): Promise<{ thread: Thread; session: AgentSession }>
+  /**
+   * Rejects with `code: 'provider_session_missing'` (isProviderSessionMissing) when the provider
+   * has no saved conversation for the chat's session, so the server can continue it elsewhere.
+   */
+  resume?(
+    threadId: string,
+    workspacePath: string,
+    options: StartOptions,
+  ): Promise<{ thread: Thread; session: AgentSession }>
+  /**
+   * Starts a new session that already holds the conversation of a saved one
+   * of this provider. Absent where the provider cannot carry a session on.
+   */
+  fork?(
+    workspacePath: string,
+    from: SavedSession,
+    options: StartOptions,
+  ): Promise<{ thread: Thread; session: AgentSession }>
+  /**
+   * `read.refresh`: the caller keeps an earlier list if this read fails.
+   * `launch` starts the engine the way the user's sessions start.
+   */
+  listModels(
+    agent?: string,
+    read?: ModelListRead,
+    launch?: Pick<StartOptions, 'runtime'>,
+  ): Promise<Model[]>
+}
+
+/**
+ * `accountHome` is the config folder of the provider account the sessions run
+ * as; absent, the default account. Only providers that declare
+ * `multipleAccounts` are ever given one, and never for a custom harness, which
+ * runs with its own sign-in.
+ */
+export function providerRuntime(
+  provider: ProviderId,
+  onLog: (line: string) => void,
+  resolveHarness: (id: string) => CustomHarness | undefined = () => undefined,
+  accountHome?: string,
+): ProviderRuntime {
+  switch (provider) {
+    case 'codex':
+      return codexRuntime(onLog, resolveHarness, accountHome)
+    case 'claude-code':
+      return claudeRuntime(onLog, resolveHarness, accountHome)
+    case 'acp':
+      return acpRuntime(onLog, resolveHarness)
+    case 'cursor':
+      return cursorRuntime(onLog, resolveHarness)
+    case 'opencode':
+      return openCodeRuntime(onLog, resolveHarness)
+    case 'antigravity':
+      return antigravityRuntime(onLog, resolveHarness)
+    case 'grok':
+      return grokRuntime(onLog, resolveHarness, accountHome)
+    case 'pi':
+      return piRuntime(onLog, resolveHarness)
+    default:
+      throw new Error(`provider "${provider}" is not implemented yet`)
+  }
+}
+
+function harnessFor(
+  provider: ProviderId,
+  id: string | undefined,
+  resolveHarness: (id: string) => CustomHarness | undefined,
+): CustomHarness | undefined {
+  if (!id) return undefined
+  const harness = resolveHarness(id)
+  // ACP also has built-in agent IDs. Every other non-empty source is a
+  // persisted custom harness and must fail loudly if it was removed.
+  if (!harness) {
+    if (provider === 'acp') return undefined
+    throw new Error(`custom harness "${id}" no longer exists`)
+  }
+  if (harness.provider !== provider) {
+    throw new Error(`custom harness "${harness.displayName}" is configured for ${harness.provider}`)
+  }
+  return harness
+}
+
+const CUSTOM_HARNESS_PROTOCOL_LABELS = {
+  codex: 'Codex app-server',
+  'claude-code': 'Claude Code stream JSON',
+  grok: 'Grok streaming JSON',
+  cursor: 'Cursor stream JSON',
+  opencode: 'OpenCode HTTP server',
+  antigravity: 'Antigravity stream JSON',
+  pi: 'Pi RPC',
+  acp: 'ACP',
+} satisfies Record<CustomHarness['provider'], string>
+
+/**
+ * Side-effect-bounded compatibility check. Native/ACP integrations complete a
+ * real handshake; one-shot CLIs run only their free discovery/help command,
+ * never a model prompt.
+ */
+export async function verifyCustomHarness(
+  harness: CustomHarness,
+  workspacePath = process.cwd(),
+  onLog: (line: string) => void = () => {},
+): Promise<CustomHarnessVerification> {
+  const checks: CustomHarnessVerificationCheck[] = []
+  const checkedAt = Date.now()
+  let resolvedCommand: string | undefined
+  try {
+    const launch = resolveCustomHarnessLaunch(harness, workspacePath)
+    resolvedCommand = launch.command
+    checks.push({
+      label: 'Executable',
+      status: 'passed',
+      detail: `Resolved ${harness.command} to ${launch.command}`,
+    })
+    checks.push({
+      label: 'Launch context',
+      status: 'passed',
+      detail:
+        launch.cwd === launch.workspacePath
+          ? `Runs in the active workspace at ${launch.workspacePath}`
+          : `Boots in ${launch.cwd}; active workspace is exported as HARNESS_WORKSPACE_PATH`,
+    })
+  } catch (cause) {
+    const error = actionableLaunchError(harness, cause)
+    checks.push({ label: 'Executable', status: 'failed', detail: error.message })
+    return {
+      status: 'error',
+      summary: `${harness.displayName} cannot start`,
+      checkedAt,
+      checks,
+    }
+  }
+
+  try {
+    const protocol = await probeCustomHarnessProtocol(harness, workspacePath, onLog)
+    checks.push(protocol)
+    return {
+      status: protocol.status === 'warning' ? 'warning' : 'ready',
+      summary:
+        protocol.status === 'warning'
+          ? `${harness.displayName} launches, with a compatibility warning`
+          : `${harness.displayName} is compatible`,
+      checkedAt,
+      ...(resolvedCommand ? { resolvedCommand } : {}),
+      checks,
+    }
+  } catch (cause) {
+    const error = actionableLaunchError(harness, cause)
+    checks.push({
+      label: CUSTOM_HARNESS_PROTOCOL_LABELS[harness.provider],
+      status: 'failed',
+      detail: error.message,
+    })
+    return {
+      status: 'error',
+      summary: `${harness.displayName} did not pass its protocol check`,
+      checkedAt,
+      ...(resolvedCommand ? { resolvedCommand } : {}),
+      checks,
+    }
+  }
+}
+
+async function probeCustomHarnessProtocol(
+  harness: CustomHarness,
+  workspacePath: string,
+  onLog: (line: string) => void,
+): Promise<CustomHarnessVerificationCheck> {
+  const spawn = customHarnessSpawn(harness, workspacePath)
+  const label = CUSTOM_HARNESS_PROTOCOL_LABELS[harness.provider]
+  switch (harness.provider) {
+    case 'codex': {
+      const { CodexAdapter } = await loadCodexAdapter()
+      const adapter = new CodexAdapter({ spawn })
+      adapter.on('log', onLog)
+      try {
+        await customHarnessDeadline(harness, 'initialize', adapter.start())
+        return { label, status: 'passed', detail: 'Initialize handshake completed.' }
+      } finally {
+        await adapter.dispose()
+      }
+    }
+    case 'opencode': {
+      const { OpenCodeAdapter } = await loadOpenCodeAdapter()
+      const adapter = new OpenCodeAdapter({ spawn })
+      adapter.on('log', onLog)
+      try {
+        await customHarnessDeadline(harness, 'start its HTTP server', adapter.start())
+        const models = await customHarnessDeadline(harness, 'list models', adapter.listModels())
+        return modelProbeCheck(label, models, 'HTTP protocol detected')
+      } finally {
+        await adapter.dispose()
+      }
+    }
+    case 'pi': {
+      const { PiAdapter } = await loadPiAdapter()
+      const adapter = new PiAdapter({
+        command: harness.command,
+        args: [],
+        displayName: harness.displayName,
+        spawn,
+        workspacePath,
+      })
+      adapter.on('log', onLog)
+      try {
+        const models = await customHarnessDeadline(harness, 'complete Pi RPC', adapter.listModels())
+        return modelProbeCheck(label, models, 'RPC handshake completed')
+      } finally {
+        await adapter.dispose()
+      }
+    }
+    case 'acp': {
+      const { AcpAdapter } = await loadAcpAdapter()
+      const adapter = new AcpAdapter(harness.id, {
+        name: harness.displayName,
+        command: harness.command,
+        args: [],
+        spawn,
+      })
+      adapter.on('log', onLog)
+      try {
+        const result = await customHarnessDeadline(
+          harness,
+          'complete the ACP handshake',
+          adapter.verifyCompatibility(workspacePath),
+        )
+        const agent = [result.agentName, result.agentVersion].filter(Boolean).join(' ')
+        return {
+          label,
+          status: 'passed',
+          detail: `Initialize handshake completed${agent ? ` with ${agent}` : ''}.`,
+        }
+      } finally {
+        await adapter.dispose()
+      }
+    }
+    case 'claude-code': {
+      const result = await runCustomHarness(harness, workspacePath, ['--help'])
+      const advertisesStreaming = /stream-json/i.test(result.stdout)
+      return {
+        label,
+        status: advertisesStreaming ? 'passed' : 'warning',
+        detail: advertisesStreaming
+          ? 'The CLI advertises the stream-json transport TasteCode uses.'
+          : 'The CLI runs, but its help does not advertise stream-json; the first turn may still fail.',
+      }
+    }
+    case 'grok': {
+      const { GrokAdapter } = await loadGrokAdapter()
+      const adapter = new GrokAdapter({ spawn })
+      adapter.on('log', onLog)
+      try {
+        const models = await customHarnessDeadline(harness, 'list models', adapter.listModels())
+        return modelProbeCheck(label, models, 'Streaming CLI model command responded')
+      } finally {
+        await adapter.dispose()
+      }
+    }
+    case 'cursor': {
+      const { CursorAdapter } = await loadCursorAdapter()
+      const adapter = new CursorAdapter({
+        spawn,
+        run: customHarnessRun(harness, workspacePath),
+      })
+      adapter.on('log', onLog)
+      try {
+        const models = await customHarnessDeadline(harness, 'list models', adapter.listModels())
+        return modelProbeCheck(label, models, 'Stream-json CLI model command responded')
+      } finally {
+        await adapter.dispose()
+      }
+    }
+    case 'antigravity': {
+      const { AntigravityAdapter } = await loadAntigravityAdapter()
+      const adapter = new AntigravityAdapter({ spawn })
+      adapter.on('log', onLog)
+      try {
+        const models = await customHarnessDeadline(harness, 'list models', adapter.listModels())
+        return modelProbeCheck(label, models, 'Streaming CLI model command responded')
+      } finally {
+        await adapter.dispose()
+      }
+    }
+  }
+}
+
+function modelProbeCheck(
+  label: string,
+  models: Model[],
+  success: string,
+): CustomHarnessVerificationCheck {
+  return models.length > 0
+    ? { label, status: 'passed', detail: `${success}; found ${models.length} model(s).` }
+    : {
+        label,
+        status: 'warning',
+        detail: `${success}, but no models were reported. TasteCode will use the provider default.`,
+      }
+}
+
+function customHarnessDeadline<T>(
+  harness: CustomHarness,
+  phase: string,
+  operation: Promise<T>,
+  timeoutMs = 25_000,
+): Promise<T> {
+  let timer: NodeJS.Timeout | undefined
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`${harness.displayName} timed out while trying to ${phase}`)),
+      timeoutMs,
+    )
+  })
+  return Promise.race([operation, timeout]).finally(() => {
+    if (timer) clearTimeout(timer)
+  })
+}
+
+async function customHarnessOperation<T>(
+  harness: CustomHarness,
+  phase: string,
+  operation: Promise<T>,
+): Promise<T> {
+  try {
+    return await customHarnessDeadline(harness, phase, operation)
+  } catch (cause) {
+    const error = actionableLaunchError(harness, cause)
+    throw new Error(`${harness.displayName} could not ${phase}: ${error.message}`)
+  }
+}
+
+async function startedSession<TSession extends { dispose(): void | Promise<void> }>(
+  session: TSession,
+  start: () => Promise<Thread>,
+): Promise<{ thread: Thread; session: TSession }> {
+  try {
+    return { thread: await start(), session }
+  } catch (error) {
+    try {
+      await session.dispose()
+    } catch (cleanup) {
+      throw new StartupCleanupError(error, cleanup, session)
+    }
+    throw error
+  }
+}
+
+function grokRuntime(
+  onLog: (line: string) => void,
+  resolveHarness: (id: string) => CustomHarness | undefined,
+  accountHome: string | undefined,
+): ProviderRuntime {
+  // A custom harness runs with its own sign-in; every other Grok process runs as
+  // the account, in its GROK_HOME.
+  const grokAdapterOptions = (harness: CustomHarness | undefined) =>
+    harness ? { spawn: customHarnessSpawn(harness) } : accountOption(accountHome)
+  const acpAdapterFor = async (harness: CustomHarness | undefined, options: StartOptions) => {
+    const [{ AcpAdapter, prepareAcpMcpServers }, { grokCommand, grokContextEnvironment }] =
+      await Promise.all([loadAcpAdapter(), loadGrokAdapter()])
+    const { grokAccountEnvironment } = await loadGrokAccountHome()
+    return new AcpAdapter('grok', {
+      name: harness?.displayName ?? 'Grok',
+      command: grokCommand(),
+      // Grok takes model and effort only as launch switches; the adapter
+      // relaunches and reloads the session when a turn changes them.
+      argsFor: ({ model, effort }) => [
+        'agent',
+        ...(model ? ['--model', model] : []),
+        ...(effort ? ['--reasoning-effort', effort] : []),
+        'stdio',
+      ],
+      settings: { model: options.model, effort: options.effort },
+      provider: 'grok',
+      mcpServers: prepareAcpMcpServers(options.mcpServers ?? [], options.mcpCredentials ?? {}),
+      env: {
+        ...(harness ? {} : grokAccountEnvironment(accountHome)),
+        ...grokContextEnvironment(options.context),
+      },
+      ...(harness ? { spawn: customHarnessSpawn(harness) } : {}),
+    })
+  }
+
+  const printSessionFor = (adapter: GrokAdapter): AgentSession => ({
+    capabilities: adapter.capabilities,
+    sendTurn: (threadId, text, attachments, turnOptions) =>
+      adapter.sendTurn(threadId, text, attachments, turnOptions),
+    interrupt: () => adapter.interrupt(),
+    // Print mode decides permissions from the launch switches; there is no
+    // mid-turn callback to answer.
+    respondToApproval: () => {},
+    setApproval: (approval) => adapter.setApproval(approval),
+    onProviderSessionId: (listener) => {
+      adapter.on('providerSessionId', listener)
+      // The UUID is chosen at startThread, before this listener exists.
+      // Replay it so the server can persist resume identity before the first
+      // turn ends — Stop otherwise leaves no native id to continue.
+      if (adapter.providerSessionId) listener(adapter.providerSessionId)
+    },
+    dispose: () => adapter.dispose(),
+    on: (event: 'event' | 'log', listener: never) => adapter.on(event, listener),
+  })
+
+  return {
+    async start(workspacePath, options) {
+      const harness = harnessFor('grok', options.agent, resolveHarness)
+      const projectMcp = options.mcpServers?.some((server) => server.enabled) ?? false
+      if (projectMcp) {
+        const adapter = await acpAdapterFor(harness, options)
+        adapter.on('log', onLog)
+        return startedSession(adapter, async () => {
+          const starting = adapter.startThread(workspacePath, {
+            model: options.model,
+            approval: options.approval,
+            instructions: options.instructions,
+          })
+          return harness
+            ? await customHarnessOperation(harness, 'start an MCP-enabled ACP session', starting)
+            : await starting
+        })
+      }
+      const { GrokAdapter } = await loadGrokAdapter()
+      const adapter = new GrokAdapter(grokAdapterOptions(harness))
+      adapter.on('log', onLog)
+      const thread = await adapter.startThread(workspacePath, {
+        model: options.model,
+        effort: options.effort,
+        approval: options.approval,
+        instructions: options.instructions,
+        context: options.context,
+        ...(options.ephemeral ? { ephemeral: true } : {}),
+      })
+      return { thread, session: printSessionFor(adapter) }
+    },
+    async resume(threadId, workspacePath, options) {
+      const harness = harnessFor('grok', options.agent, resolveHarness)
+      // MCP-enabled Grok runs over ACP. Its provider session id is encoded in
+      // the `acp-grok-*` thread id it started with, which is the chat's own id
+      // unless the chat moved here from another provider; AcpAdapter performs
+      // the protocol capability check before loading it.
+      const acpThreadId = options.providerSessionId ?? threadId
+      if (acpThreadId.startsWith('acp-grok-')) {
+        const adapter = await acpAdapterFor(harness, options)
+        adapter.on('log', onLog)
+        return mapProviderSession(
+          threadId,
+          await startedSession(adapter, async () => {
+            const resuming = adapter.resumeThread(acpThreadId, workspacePath, {
+              model: options.model,
+              approval: options.approval,
+              instructions: options.instructions,
+            })
+            return harness
+              ? await customHarnessOperation(harness, 'resume an MCP-enabled ACP session', resuming)
+              : await resuming
+          }),
+        )
+      }
+      if (!options.providerSessionId) {
+        throw new Error(
+          'This Grok chat cannot resume because TasteCode restarted before Grok returned a native session id. Start a new Grok chat; the local history of this chat is still available.',
+        )
+      }
+      const { GrokAdapter } = await loadGrokAdapter()
+      const adapter = new GrokAdapter(grokAdapterOptions(harness))
+      adapter.on('log', onLog)
+      const thread = await adapter.resumeThread(
+        threadId,
+        options.providerSessionId,
+        workspacePath,
+        {
+          model: options.model,
+          effort: options.effort,
+          approval: options.approval,
+          instructions: options.instructions,
+          context: options.context,
+          ...(options.ephemeral ? { ephemeral: true } : {}),
+        },
+      )
+      return { thread, session: printSessionFor(adapter) }
+    },
+    async listModels(agent) {
+      const harness = harnessFor('grok', agent, resolveHarness)
+      const { GrokAdapter } = await loadGrokAdapter()
+      return new GrokAdapter(grokAdapterOptions(harness)).listModels()
+    },
+  }
+}
+
+function antigravityRuntime(
+  onLog: (line: string) => void,
+  resolveHarness: (id: string) => CustomHarness | undefined,
+): ProviderRuntime {
+  return {
+    async start(workspacePath, options) {
+      const harness = harnessFor('antigravity', options.agent, resolveHarness)
+      const { AntigravityAdapter } = await loadAntigravityAdapter()
+      const adapter = new AntigravityAdapter(harness ? { spawn: customHarnessSpawn(harness) } : {})
+      adapter.on('log', onLog)
+      const thread = await adapter.startThread(workspacePath, {
+        model: options.model,
+        effort: options.effort,
+        approval: options.approval,
+        instructions: options.instructions,
+      })
+      return {
+        thread,
+        session: {
+          capabilities: adapter.capabilities,
+          promptLimit: adapter.promptLimit,
+          sendTurn: (threadId, text, attachments, turnOptions) =>
+            adapter.sendTurn(threadId, text, attachments, turnOptions),
+          interrupt: () => adapter.interrupt(),
+          // Print mode decides permissions from the launch switches; there is
+          // no mid-turn callback to answer.
+          respondToApproval: () => {},
+          dispose: () => adapter.dispose(),
+          on: (event: 'event' | 'log', listener: never) => adapter.on(event, listener),
+        },
+      }
+    },
+    async listModels(agent) {
+      const harness = harnessFor('antigravity', agent, resolveHarness)
+      const { AntigravityAdapter } = await loadAntigravityAdapter()
+      return new AntigravityAdapter(
+        harness ? { spawn: customHarnessSpawn(harness) } : {},
+      ).listModels()
+    },
+  }
+}
+
+function cursorRuntime(
+  onLog: (line: string) => void,
+  resolveHarness: (id: string) => CustomHarness | undefined,
+): ProviderRuntime {
+  const open = async (workspacePath: string, options: StartOptions, threadId?: string) => {
+    const harness = harnessFor('cursor', options.agent, resolveHarness)
+    const { CursorAdapter } = await loadCursorAdapter()
+    const adapter = new CursorAdapter(
+      harness ? { spawn: customHarnessSpawn(harness), run: customHarnessRun(harness) } : {},
+    )
+    adapter.on('log', onLog)
+    const selection = {
+      ...(options.model ? { model: options.model } : {}),
+      ...(options.effort ? { effort: options.effort } : {}),
+      ...(options.serviceTier ? { serviceTier: options.serviceTier } : {}),
+      ...(options.approval ? { approval: options.approval } : {}),
+      ...(options.instructions ? { instructions: options.instructions } : {}),
+    }
+    const thread =
+      threadId === undefined
+        ? await adapter.startThread(workspacePath, selection)
+        : await adapter.resumeThread(threadId, workspacePath, selection)
+    return { thread, session: adapter }
+  }
+  return {
+    start: open,
+    resume: async (threadId, workspacePath, options) =>
+      mapProviderSession(
+        threadId,
+        await open(workspacePath, options, options.providerSessionId ?? threadId),
+      ),
+    async listModels(agent) {
+      const harness = harnessFor('cursor', agent, resolveHarness)
+      const { CursorAdapter } = await loadCursorAdapter()
+      return new CursorAdapter(
+        harness ? { spawn: customHarnessSpawn(harness), run: customHarnessRun(harness) } : {},
+      ).listModels()
+    },
+  }
+}
+
+function openCodeRuntime(
+  onLog: (line: string) => void,
+  resolveHarness: (id: string) => CustomHarness | undefined,
+): ProviderRuntime {
+  const open = async (workspacePath: string, options: StartOptions, threadId?: string) => {
+    const harness = harnessFor('opencode', options.agent, resolveHarness)
+    const { OpenCodeAdapter } = await loadOpenCodeAdapter()
+    const adapter = new OpenCodeAdapter({
+      ...(options.mcpServers ? { mcpServers: options.mcpServers } : {}),
+      ...(options.mcpCredentials ? { mcpCredentials: options.mcpCredentials } : {}),
+      ...(harness ? { spawn: customHarnessSpawn(harness) } : {}),
+    })
+    adapter.on('log', onLog)
+    return startedSession(adapter, async () => {
+      if (harness) {
+        await customHarnessOperation(harness, 'start its server', adapter.start())
+      } else {
+        await adapter.start()
+      }
+      const selection = {
+        ...(options.model ? { model: options.model } : {}),
+        ...(options.effort ? { effort: options.effort } : {}),
+        ...(options.approval ? { approval: options.approval } : {}),
+        ...(options.instructions ? { instructions: options.instructions } : {}),
+      }
+      const opening =
+        threadId === undefined
+          ? adapter.startThread(workspacePath, selection)
+          : adapter.resumeThread(threadId, workspacePath, selection)
+      return harness
+        ? await customHarnessOperation(
+            harness,
+            threadId === undefined ? 'create a session' : 'resume its session',
+            opening,
+          )
+        : await opening
+    })
+  }
+  return {
+    start: open,
+    resume: async (threadId, workspacePath, options) =>
+      mapProviderSession(
+        threadId,
+        await open(workspacePath, options, options.providerSessionId ?? threadId),
+      ),
+    async listModels(agent) {
+      return listOpenCodeModels(harnessFor('opencode', agent, resolveHarness))
+    },
+  }
+}
+
+/**
+ * Single-flight: every OpenCode model listing spawns a real `opencode serve`
+ * process for its lifetime, so concurrent or rapid-fire requests must share
+ * one run instead of forking one process each. A renderer refresh loop once
+ * held ~170 of these processes alive at the same time — the server, not the
+ * client, is where that has to be impossible.
+ */
+const openCodeModelListings = new Map<string, Promise<Model[]>>()
+/** Listings whose process is running; a closing server stops them. */
+const runningListings = new Set<{ dispose(): Promise<void> }>()
+
+/**
+ * Stops model listings that are still running. Their processes belong to no
+ * session, so without this a server that closes while one starts (an OpenCode
+ * serve can take 30 s) exits and leaves it running.
+ */
+export async function stopModelListings(): Promise<void> {
+  await Promise.allSettled([...runningListings].map((listing) => listing.dispose()))
+}
+
+function listOpenCodeModels(harness?: CustomHarness): Promise<Model[]> {
+  const key = harness?.id ?? 'default'
+  const existing = openCodeModelListings.get(key)
+  if (existing) return existing
+  const listing = (async () => {
+    const { OpenCodeAdapter } = await loadOpenCodeAdapter()
+    const adapter = new OpenCodeAdapter(harness ? { spawn: customHarnessSpawn(harness) } : {})
+    runningListings.add(adapter)
+    try {
+      const listing = adapter.listModels()
+      return harness ? await customHarnessOperation(harness, 'list models', listing) : await listing
+    } finally {
+      runningListings.delete(adapter)
+      await adapter.dispose()
+    }
+  })().finally(() => {
+    openCodeModelListings.delete(key)
+  })
+  openCodeModelListings.set(key, listing)
+  return listing
+}
+
+/** The default account's adapters get exactly the options they always had. */
+function accountOption(accountHome: string | undefined): { accountHome?: string } {
+  return accountHome === undefined ? {} : { accountHome }
+}
+
+function codexRuntime(
+  onLog: (line: string) => void,
+  resolveHarness: (id: string) => CustomHarness | undefined,
+  accountHome: string | undefined,
+): ProviderRuntime {
+  const open = async (
+    workspacePath: string,
+    options: StartOptions,
+    threadId?: string,
+    from?: SavedSession,
+  ) => {
+    const harness = harnessFor('codex', options.agent, resolveHarness)
+    // A harness runs with a sign-in of its own, apart from the account folders.
+    if (harness && from) throw new Error(`${harness.displayName} cannot carry a session on.`)
+    const { CodexAdapter } = await loadCodexAdapter()
+    const adapter = new CodexAdapter({
+      ...(options.mcpServers ? { mcpServers: options.mcpServers } : {}),
+      ...(options.mcpCredentials ? { mcpCredentials: options.mcpCredentials } : {}),
+      // Codex spawns its app-server without a cwd; the wrapper resolves from the project.
+      // A wrapper may run another account, whose limit windows are not the default account's.
+      ...(harness
+        ? { spawn: customHarnessSpawn(harness, workspacePath), liveLimits: false }
+        : accountOption(accountHome)),
+    })
+    adapter.on('log', onLog)
+    return startedSession(adapter, async () => {
+      if (harness) {
+        await customHarnessOperation(harness, 'initialize app-server', adapter.start())
+      } else {
+        await adapter.start()
+      }
+      if (from) {
+        return adapter.forkThread(
+          workspacePath,
+          { threadId: from.providerSessionId, accountHome: from.accountHome },
+          options,
+        )
+      }
+      if (threadId === undefined) return adapter.startThread(workspacePath, options)
+      return adapter.resumeThread(options.providerSessionId ?? threadId, workspacePath, {
+        ...(options.instructions ? { instructions: options.instructions } : {}),
+        ...(options.approval ? { approval: options.approval } : {}),
+        ...(options.context ? { context: options.context } : {}),
+      })
+    })
+  }
+  return {
+    start: open,
+    resume: async (threadId, workspacePath, options) =>
+      mapProviderSession(threadId, await open(workspacePath, options, threadId)),
+    fork: (workspacePath, from, options) => open(workspacePath, options, undefined, from),
+    async listModels(agent) {
+      const harness = harnessFor('codex', agent, resolveHarness)
+      const { CodexAdapter } = await loadCodexAdapter()
+      const adapter = new CodexAdapter(
+        harness ? { spawn: customHarnessSpawn(harness) } : accountOption(accountHome),
+      )
+      try {
+        if (harness) {
+          await customHarnessOperation(harness, 'initialize app-server', adapter.start())
+          return await customHarnessOperation(harness, 'list models', adapter.listModels())
+        }
+        await adapter.start()
+        return await adapter.listModels()
+      } finally {
+        await adapter.dispose()
+      }
+    },
+  }
+}
+
+function acpRuntime(
+  onLog: (line: string) => void,
+  resolveHarness: (id: string) => CustomHarness | undefined,
+): ProviderRuntime {
+  const open = async (workspacePath: string, options: StartOptions, threadId?: string) => {
+    if (!options.agent) throw new Error('no ACP agent chosen')
+    const harness = harnessFor('acp', options.agent, resolveHarness)
+    const { AcpAdapter, prepareAcpMcpServers } = await loadAcpAdapter()
+    const adapter = new AcpAdapter(
+      options.agent,
+      harness
+        ? {
+            name: harness.displayName,
+            command: harness.command,
+            args: [],
+            spawn: customHarnessSpawn(harness),
+          }
+        : undefined,
+      {
+        servers: prepareAcpMcpServers(options.mcpServers ?? [], options.mcpCredentials ?? {}),
+      },
+    )
+    adapter.on('log', onLog)
+    return startedSession(adapter, async () => {
+      const selection = {
+        approval: options.approval,
+        model: options.model,
+        instructions: options.instructions,
+      }
+      const opening =
+        threadId === undefined
+          ? adapter.startThread(workspacePath, selection)
+          : adapter.resumeThread(threadId, workspacePath, selection)
+      return harness
+        ? await customHarnessOperation(
+            harness,
+            threadId === undefined
+              ? 'complete the ACP session handshake'
+              : 'resume the ACP session',
+            opening,
+          )
+        : await opening
+    })
+  }
+  return {
+    start: open,
+    resume: async (threadId, workspacePath, options) =>
+      mapProviderSession(
+        threadId,
+        await open(workspacePath, options, options.providerSessionId ?? threadId),
+      ),
+    async listModels(agent) {
+      if (!agent) return []
+      const harness = harnessFor('acp', agent, resolveHarness)
+      const { AcpAdapter } = await loadAcpAdapter()
+      return new AcpAdapter(
+        agent,
+        harness
+          ? {
+              name: harness.displayName,
+              command: harness.command,
+              args: [],
+              spawn: customHarnessSpawn(harness),
+            }
+          : undefined,
+      ).listModels()
+    },
+  }
+}
+
+function claudeRuntime(
+  onLog: (line: string) => void,
+  resolveHarness: (id: string) => CustomHarness | undefined,
+  accountHome: string | undefined,
+): ProviderRuntime {
+  const adapterFor = async (
+    agent: string | undefined,
+    workspacePath?: string,
+    runtime?: string | undefined,
+  ) => {
+    const harness = harnessFor('claude-code', agent, resolveHarness)
+    const launch = harness
+      ? resolveCustomHarnessLaunch(harness, workspacePath ?? process.cwd())
+      : undefined
+    const { ClaudeCodeAdapter } = await loadClaudeAdapter()
+    const adapter = new ClaudeCodeAdapter({
+      ...(harness
+        ? {
+            spawn: customHarnessSpawn(harness, workspacePath),
+            environment: launch!.environment,
+          }
+        : accountOption(accountHome)),
+      ...(isClaudeRuntime(runtime) ? { runtime } : {}),
+    })
+    adapter.on('log', onLog)
+    return adapter
+  }
+
+  // A custom harness may run another account, whose limit windows are not the default account's.
+  const sessionFor = (adapter: ClaudeCodeAdapter, agent: string | undefined): AgentSession => ({
+    capabilities: adapter.capabilities,
+    sendTurn: (threadId, text, attachments, turnOptions) =>
+      adapter.sendTurn(threadId, text, attachments, turnOptions),
+    steer: (threadId, text, attachments) => adapter.steer(threadId, text, attachments),
+    interrupt: () => adapter.interrupt(),
+    respondToApproval: (id, decision) => adapter.respondToApproval(id, decision),
+    respondToUserInput: (id, answers) => adapter.respondToUserInput(id, answers),
+    setApproval: (approval) => adapter.setApproval(approval),
+    ...(agent ? {} : { onLimitsUpdated: (listener) => adapter.on('limitsUpdated', listener) }),
+    listMcpServers: (threadId) => adapter.listMcpServers(threadId),
+    isMcpLoading: () => adapter.isMcpLoading(),
+    onMcpChanged: (listener) => {
+      adapter.on('mcpChanged', listener)
+      return () => adapter.off('mcpChanged', listener)
+    },
+    listCommands: (threadId) => adapter.listCommands(threadId),
+    onCommandsChanged: (listener) => {
+      adapter.on('commandsChanged', listener)
+      return () => adapter.off('commandsChanged', listener)
+    },
+    hasBackgroundWork: () => adapter.hasBackgroundWork(),
+    onBackgroundWorkChanged: (listener) => {
+      adapter.on('backgroundWorkChanged', listener)
+      return () => adapter.off('backgroundWorkChanged', listener)
+    },
+    onDisconnected: (listener) => adapter.onDisconnected(listener),
+    dispose: () => adapter.dispose(),
+    on: (event: 'event' | 'log', listener: never) => adapter.on(event, listener),
+  })
+
+  return {
+    async start(workspacePath, options) {
+      const adapter = await adapterFor(options.agent, workspacePath, options.runtime)
+      return startedSession(sessionFor(adapter, options.agent), () =>
+        adapter.startThread(workspacePath, {
+          model: options.model,
+          effort: options.effort,
+          approval: options.approval,
+          instructions: options.instructions,
+          ephemeral: options.ephemeral,
+          mcpServers: options.mcpServers,
+          mcpCredentials: options.mcpCredentials,
+          context: options.context,
+          plugins: options.skillPlugin ? [options.skillPlugin] : undefined,
+        }),
+      )
+    },
+    async fork(workspacePath, from, options) {
+      // A harness runs with a sign-in of its own, apart from the account folders.
+      const harness = harnessFor('claude-code', options.agent, resolveHarness)
+      if (harness) throw new Error(`${harness.displayName} cannot carry a session on.`)
+      const adapter = await adapterFor(undefined, workspacePath, options.runtime)
+      return startedSession(sessionFor(adapter, undefined), () =>
+        adapter.forkThread(
+          workspacePath,
+          { threadId: from.providerSessionId, accountHome: from.accountHome },
+          {
+            model: options.model,
+            effort: options.effort,
+            approval: options.approval,
+            instructions: options.instructions,
+            mcpServers: options.mcpServers,
+            mcpCredentials: options.mcpCredentials,
+            context: options.context,
+            plugins: options.skillPlugin ? [options.skillPlugin] : undefined,
+          },
+        ),
+      )
+    },
+    async resume(threadId, workspacePath, options) {
+      const adapter = await adapterFor(options.agent, workspacePath, options.runtime)
+      return mapProviderSession(
+        threadId,
+        await startedSession(sessionFor(adapter, options.agent), () =>
+          adapter.resumeThread(options.providerSessionId ?? threadId, workspacePath, {
+            model: options.model,
+            effort: options.effort,
+            approval: options.approval,
+            instructions: options.instructions,
+            mcpServers: options.mcpServers,
+            mcpCredentials: options.mcpCredentials,
+            context: options.context,
+            plugins: options.skillPlugin ? [options.skillPlugin] : undefined,
+          }),
+        ),
+      )
+    },
+    async listModels(agent, read, launch) {
+      const adapter = await adapterFor(agent, undefined, launch?.runtime)
+      try {
+        return await adapter.listModels({ refresh: read?.refresh === true })
+      } finally {
+        await adapter.dispose()
+      }
+    },
+  }
+}
+
+function piRuntime(
+  onLog: (line: string) => void,
+  resolveHarness: (id: string) => CustomHarness | undefined,
+): ProviderRuntime {
+  const adapterFor = async (agent: string | undefined, workspacePath?: string) => {
+    const harness = harnessFor('pi', agent, resolveHarness)
+    const { PiAdapter } = await loadPiAdapter()
+    const adapter = new PiAdapter({
+      ...(harness
+        ? {
+            command: harness.command,
+            args: [],
+            displayName: harness.displayName,
+            spawn: customHarnessSpawn(harness, workspacePath),
+          }
+        : { command: 'pi' }),
+      ...(workspacePath ? { workspacePath } : {}),
+    })
+    adapter.on('log', onLog)
+    return adapter
+  }
+  return {
+    async start(workspacePath, options) {
+      const harness = harnessFor('pi', options.agent, resolveHarness)
+      const adapter = await adapterFor(options.agent, workspacePath)
+      return startedSession(adapter, async () => {
+        const starting = adapter.startThread(workspacePath, {
+          model: options.model,
+          effort: options.effort,
+          approval: options.approval,
+          instructions: options.instructions,
+        })
+        return harness
+          ? customHarnessOperation(harness, 'complete the Pi RPC handshake', starting)
+          : starting
+      })
+    },
+    async listModels(agent) {
+      const harness = harnessFor('pi', agent, resolveHarness)
+      const adapter = await adapterFor(agent)
+      try {
+        const listing = adapter.listModels()
+        return harness
+          ? await customHarnessOperation(harness, 'list Pi models', listing)
+          : await listing
+      } finally {
+        await adapter.dispose()
+      }
+    },
+  }
+}

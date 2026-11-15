@@ -1,0 +1,315 @@
+// @vitest-environment happy-dom
+import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { PanelToggles, StageHeader } from './StageHeader.js'
+
+afterEach(cleanup)
+
+function props() {
+  return {
+    sessionId: 'thread-1',
+    title: 'Build the landing page',
+    pinned: false,
+    projectPath: 'C:\\workspace',
+    checkpointCount: 2,
+    worktreeBranch: 'codex/landing',
+    menuActions: {
+      commandPalette: vi.fn(),
+      keybindings: vi.fn(),
+      newChat: vi.fn(),
+      openPullRequests: vi.fn(),
+      searchSessions: vi.fn(),
+      settings: vi.fn(),
+      toggleSidebar: vi.fn(),
+      toggleTerminal: vi.fn(),
+      toggleWorkspace: vi.fn(),
+    },
+    onOpenRollback: vi.fn(),
+    onRenameSession: vi.fn(),
+    onToggleSessionPin: vi.fn(),
+    onArchiveSession: vi.fn(),
+  }
+}
+
+function panelProps() {
+  return {
+    projectPath: 'C:\\workspace',
+    terminalOpen: false,
+    workspacePanelOpen: false,
+    onPrepareTerminal: vi.fn(),
+    onToggleWorkspace: vi.fn(),
+    onToggleTerminal: vi.fn(),
+  }
+}
+
+describe('StageHeader', () => {
+  it('shares chat actions and supports inline rename', () => {
+    const stage = props()
+    render(<StageHeader {...stage} />)
+
+    expect(screen.getByText('Build the landing page')).toBeTruthy()
+    expect(document.querySelector('.stagehead__drag-region')?.getAttribute('aria-hidden')).toBe(
+      'true',
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Options for Build the landing page' }))
+    expect(screen.getByRole('menu').classList.contains('menu--compact')).toBe(true)
+    for (const item of screen.getAllByRole('menuitem')) {
+      expect(item.querySelector('svg')).not.toBeNull()
+    }
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Pin chat' }))
+    expect(stage.onToggleSessionPin).toHaveBeenCalledWith('thread-1')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Options for Build the landing page' }))
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Rename chat' }))
+    const rename = screen.getByRole('textbox', { name: 'Rename chat' })
+    // The shared .rename field box makes editing visible; the title text is selected.
+    expect(rename.classList.contains('rename')).toBe(true)
+    expect(rename.classList.contains('rename--chat')).toBe(true)
+    fireEvent.change(rename, { target: { value: 'Polished landing page' } })
+    fireEvent.keyDown(rename, { key: 'Enter', isComposing: true })
+    expect(stage.onRenameSession).not.toHaveBeenCalled()
+    fireEvent.keyDown(rename, { key: 'Enter' })
+    expect(stage.onRenameSession).toHaveBeenCalledWith('thread-1', 'Polished landing page')
+  })
+
+  it('returns focus to the chat menu when Enter or Escape ends a rename', () => {
+    const stage = props()
+    render(<StageHeader {...stage} />)
+    const menu = screen.getByRole('button', { name: 'Options for Build the landing page' })
+
+    for (const key of ['Escape', 'Enter']) {
+      fireEvent.click(menu)
+      fireEvent.click(screen.getByRole('menuitem', { name: 'Rename chat' }))
+      const rename = screen.getByRole('textbox', { name: 'Rename chat' }) as HTMLInputElement
+      // happy-dom runs the closing menu's focus return after the field took
+      // focus; a browser leaves the field focused. The title is selected either way.
+      rename.focus()
+      expect(rename.selectionStart).toBe(0)
+      expect(rename.selectionEnd).toBe('Build the landing page'.length)
+      fireEvent.change(rename, { target: { value: `Renamed with ${key}` } })
+      // A cancelled key is not followed by a keypress that would open the menu again.
+      expect(fireEvent.keyDown(rename, { key })).toBe(false)
+      expect(screen.queryByRole('textbox', { name: 'Rename chat' })).toBeNull()
+      expect(document.activeElement).toBe(menu)
+    }
+    expect(stage.onRenameSession).toHaveBeenCalledOnce()
+    expect(stage.onRenameSession).toHaveBeenCalledWith('thread-1', 'Renamed with Enter')
+  })
+
+  it('leaves focus where the user went when a rename ends on blur', () => {
+    const stage = props()
+    render(
+      <>
+        <StageHeader {...stage} />
+        <button type="button">Elsewhere</button>
+      </>,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Options for Build the landing page' }))
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Rename chat' }))
+    const rename = screen.getByRole('textbox', { name: 'Rename chat' })
+    fireEvent.change(rename, { target: { value: 'Saved on blur' } })
+    const elsewhere = screen.getByRole('button', { name: 'Elsewhere' })
+    elsewhere.focus()
+    fireEvent.blur(rename)
+    expect(stage.onRenameSession).toHaveBeenCalledWith('thread-1', 'Saved on blur')
+    expect(document.activeElement).toBe(elsewhere)
+  })
+
+  it('saves a rename to the chat it was typed for when a shortcut switches chats', () => {
+    const stage = props()
+    const view = render(<StageHeader {...stage} sessionId="thread-a" title="Chat A" />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Options for Chat A' }))
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Rename chat' }))
+    fireEvent.change(screen.getByRole('textbox', { name: 'Rename chat' }), {
+      target: { value: 'Draft typed for A' },
+    })
+
+    view.rerender(<StageHeader {...stage} sessionId="thread-b" title="Chat B" />)
+
+    expect(stage.onRenameSession).toHaveBeenCalledOnce()
+    expect(stage.onRenameSession).toHaveBeenCalledWith('thread-a', 'Draft typed for A')
+    expect(screen.queryByRole('textbox', { name: 'Rename chat' })).toBeNull()
+    expect(screen.getByText('Chat B')).toBeTruthy()
+  })
+
+  it('keeps renaming a new chat when its thread starts', () => {
+    const stage = props()
+    const view = render(<StageHeader {...stage} sessionId="pending:new" title="New chat" />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Options for New chat' }))
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Rename chat' }))
+    const rename = screen.getByRole('textbox', { name: 'Rename chat' })
+    fireEvent.change(rename, { target: { value: 'Landing' } })
+
+    view.rerender(<StageHeader {...stage} sessionId="thread-started" title="New chat" />)
+
+    expect(stage.onRenameSession).not.toHaveBeenCalled()
+    expect(screen.getByRole('textbox', { name: 'Rename chat' })).toBe(rename)
+    fireEvent.change(rename, { target: { value: 'Landing page' } })
+    fireEvent.keyDown(rename, { key: 'Enter' })
+    expect(stage.onRenameSession).toHaveBeenCalledOnce()
+    expect(stage.onRenameSession).toHaveBeenCalledWith('thread-started', 'Landing page')
+  })
+
+  it('saves a new chat rename there when a shortcut switches away before it starts', () => {
+    const stage = props()
+    const view = render(<StageHeader {...stage} sessionId="pending:new" title="Fix login" />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Options for Fix login' }))
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Rename chat' }))
+    fireEvent.change(screen.getByRole('textbox', { name: 'Rename chat' }), {
+      target: { value: 'Login fix' },
+    })
+
+    view.rerender(<StageHeader {...stage} sessionId="thread-b" title="Chat B" />)
+
+    expect(stage.onRenameSession).toHaveBeenCalledOnce()
+    expect(stage.onRenameSession).toHaveBeenCalledWith('pending:new', 'Login fix')
+    expect(screen.queryByRole('textbox', { name: 'Rename chat' })).toBeNull()
+  })
+
+  it('keeps useful app options available on New chat', () => {
+    const stage = props()
+    render(
+      <StageHeader {...stage} sessionId={undefined} title={undefined} projectPath={undefined} />,
+    )
+
+    expect(screen.getByText('New chat')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Options for New chat' }))
+    expect(screen.getByRole('menuitem', { name: 'Toggle sidebar' })).toBeTruthy()
+    expect(
+      (screen.getByRole('menuitem', { name: /Toggle terminal/ }) as HTMLButtonElement).disabled,
+    ).toBe(true)
+    expect(screen.getByRole('menuitem', { name: 'New chat' })).toBeTruthy()
+    expect(screen.getByRole('menuitem', { name: 'Search chats' })).toBeTruthy()
+    expect(screen.getByRole('menuitem', { name: 'Command palette' })).toBeTruthy()
+    expect(screen.getByRole('menuitem', { name: 'Settings' })).toBeTruthy()
+
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Toggle sidebar' }))
+    expect(stage.menuActions.toggleSidebar).toHaveBeenCalledOnce()
+    expect(screen.queryByRole('button', { name: 'Show bottom panel' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Show workspace tools' })).toBeNull()
+  })
+
+  it('runs terminal and workspace actions from the top-bar menu', () => {
+    const stage = props()
+    render(<StageHeader {...stage} />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Options for Build the landing page' }))
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Toggle terminal' }))
+    expect(stage.menuActions.toggleTerminal).toHaveBeenCalledOnce()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Options for Build the landing page' }))
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Toggle workspace tools' }))
+    expect(stage.menuActions.toggleWorkspace).toHaveBeenCalledOnce()
+  })
+})
+
+describe('StageHeader pull request chip', () => {
+  const pullRequest = {
+    repository: 'Leonxlnx/tastecode',
+    number: 1778,
+    title: "feat(server): find the pull request for a chat's checkout",
+    url: 'https://github.com/Leonxlnx/tastecode/pull/1778',
+    state: 'OPEN' as const,
+    isDraft: false,
+    checks: 'passing' as const,
+    headRefName: 'n16/agents-j3-pr-for-checkout',
+  }
+
+  it('names the pull request, its state and checks, and opens it', () => {
+    const onOpenPullRequest = vi.fn()
+    render(
+      <StageHeader {...props()} pullRequest={pullRequest} onOpenPullRequest={onOpenPullRequest} />,
+    )
+    const chip = screen.getByRole('button', {
+      name: 'Pull request #1778: Open, Checks passing. Show in Pull requests',
+    })
+    expect(chip.textContent).toBe('#1778Open')
+    expect(chip.classList.contains('is-open')).toBe(true)
+    expect(chip.querySelector('.stagehead__pr-checks.is-passing')).not.toBeNull()
+    expect(chip.getAttribute('title')).toBe(`${pullRequest.title}\n#1778 · Open, Checks passing`)
+
+    fireEvent.click(chip)
+    expect(onOpenPullRequest).toHaveBeenCalledWith({
+      repository: 'Leonxlnx/tastecode',
+      number: 1778,
+    })
+  })
+
+  it.each([
+    [{ isDraft: true, checks: 'failing' as const }, 'Draft, Checks failing', 'is-draft'],
+    [{ checks: 'pending' as const }, 'Open, Checks running', 'is-open'],
+    [{ checks: 'none' as const }, 'Open', 'is-open'],
+    [{ state: 'MERGED' as const }, 'Merged', 'is-merged'],
+    [{ state: 'CLOSED' as const, checks: 'failing' as const }, 'Closed', 'is-closed'],
+  ])('reads %o as "%s"', (change, summary, tone) => {
+    render(
+      <StageHeader
+        {...props()}
+        pullRequest={{ ...pullRequest, ...change }}
+        onOpenPullRequest={vi.fn()}
+      />,
+    )
+    const chip = screen.getByRole('button', {
+      name: `Pull request #1778: ${summary}. Show in Pull requests`,
+    })
+    expect(chip.classList.contains(tone)).toBe(true)
+  })
+
+  it('is absent without a pull request', () => {
+    render(<StageHeader {...props()} onOpenPullRequest={vi.fn()} />)
+    expect(screen.queryByRole('button', { name: /^Pull request #/ })).toBeNull()
+  })
+})
+
+describe('PanelToggles', () => {
+  it('keeps both controls mounted while their open state changes', () => {
+    const panels = panelProps()
+    const { rerender } = render(<PanelToggles {...panels} />)
+    const terminal = screen.getByRole('button', { name: 'Show bottom panel' })
+    const workspace = screen.getByRole('button', { name: 'Show workspace tools' })
+
+    expect(panels.onPrepareTerminal).not.toHaveBeenCalled()
+    fireEvent.pointerEnter(terminal)
+    expect(panels.onPrepareTerminal).toHaveBeenCalledOnce()
+    expect(terminal.querySelector('.tabler-icon-layout-bottombar')).not.toBeNull()
+    expect(terminal.classList).toContain('panel-toggles__terminal')
+    expect(workspace.querySelector('.tabler-icon-layout-sidebar-right-expand')).not.toBeNull()
+    const workspaceLayers = workspace.querySelectorAll('.icon-morph__layer')
+    expect(workspaceLayers).toHaveLength(2)
+    expect(workspaceLayers[0]?.hasAttribute('data-active')).toBe(true)
+    fireEvent.click(terminal)
+    fireEvent.click(workspace)
+    expect(panels.onToggleTerminal).toHaveBeenCalledOnce()
+    expect(panels.onToggleWorkspace).toHaveBeenCalledOnce()
+
+    rerender(<PanelToggles {...panels} terminalOpen workspacePanelOpen />)
+
+    expect(screen.getByRole('button', { name: 'Hide bottom panel' })).toBe(terminal)
+    expect(screen.getByRole('button', { name: 'Hide workspace tools' })).toBe(workspace)
+    expect(terminal.querySelector('.tabler-icon-layout-bottombar')).not.toBeNull()
+    expect(workspace.querySelector('.tabler-icon-layout-sidebar-right-collapse')).not.toBeNull()
+    expect(workspaceLayers[0]?.hasAttribute('data-active')).toBe(false)
+    expect(workspaceLayers[1]?.hasAttribute('data-active')).toBe(true)
+    expect(workspace.closest('.panel-toggles')?.classList).toContain('is-workspace-open')
+  })
+
+  it('only advertises the terminal shortcut on its selected surface', () => {
+    const panels = panelProps()
+    const { rerender } = render(<PanelToggles {...panels} />)
+    const terminal = screen.getByRole('button', { name: 'Show bottom panel' })
+
+    expect(terminal.getAttribute('aria-keyshortcuts')).toBe('Meta+J Control+J')
+    rerender(<PanelToggles {...panels} terminalShortcutActive={false} />)
+    expect(terminal.getAttribute('aria-keyshortcuts')).toBeNull()
+  })
+
+  it('keeps workspace controls available without a selected project', () => {
+    render(<PanelToggles {...panelProps()} projectPath={undefined} />)
+
+    expect(screen.queryByRole('button', { name: 'Show bottom panel' })).toBeNull()
+    expect(screen.getByRole('button', { name: 'Show workspace tools' })).toBeTruthy()
+  })
+})

@@ -1,0 +1,56 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "ignorePatterns": [
+    "packages/default-skills/bundle/**",
+    ".agent/**",
+    ".agents/**",
+    ".claude/**",
+    ".codex/**",
+    ".continue/**",
+    ".cursor/**",
+    ".gemini/**",
+    ".harness/**",
+    ".opencode/**",
+    ".osaku/**",
+    ".pi/**",
+    ".pnpm-store/**",
+    ".roo/**",
+    ".windsurf/**",
+    "build/**",
+    "coverage/**",
+    "dist/**",
+    "dist-electron/**",
+    "logs/**",
+    "out/**",
+    "packages/adapter-codex/src/generated/**",
+    "packages/design-agent/references/app-screens/charts.js",
+    "apps/mobile/ios/**",
+    "apps/mobile/android/**",
+    "apps/mobile/.expo/**",
+    "playwright-report/**",
+    "release/**",
+    "scratch/**",
+    "target/**",
+    "test-results/**",
+    "tools/oxlint/anti-slop/**"
+  ],
+  "jsPlugins": [
+    {
+      "name": "anti-slop",
+      "specifier": "./tools/oxlint/anti-slop/index.ts"
+    }
+  ],
+  "overrides": [
+    {
+      "files": ["**/*.test.ts", "**/*.test.tsx"],
+      "rules": {
+        "anti-slop/no-chained-type-assertions": "off"
+      }
+    }
+  ],
+  "rules": {
+    "anti-slop/no-chained-type-assertions": "error",
+    "anti-slop/no-known-value-widening": "error",
+    "anti-slop/no-widen-then-assert": "error"
+  }
+}

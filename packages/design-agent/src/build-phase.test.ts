@@ -1,0 +1,758 @@
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { describe, expect, it, vi } from 'vitest'
+import type { AssetManifest } from './assets.js'
+import type { BrandSystem } from './brand.js'
+import type { DesignBrief } from './brief.js'
+import {
+  DesignSourceQualityError,
+  designBuildCorrectionPrompt,
+  designBuildPrompt,
+  designSourceQualityBaseline,
+  designSourceQualityCorrectionPrompt,
+  designWorkspaceFileBaseline,
+  parseBuildPhaseOutput,
+  validateDesignSourceQuality,
+  validateExactBuildFiles,
+} from './build-phase.js'
+import type { PageBlueprint } from './page.js'
+
+// Dashboards are parked behind DASHBOARD_REFERENCES_ENABLED; these tests keep that path working.
+vi.mock('./dashboard-references.js', () => ({ DASHBOARD_REFERENCES_ENABLED: true }))
+
+const artifacts: [DesignBrief, BrandSystem, PageBlueprint, AssetManifest] = [
+  {
+    originalRequest: 'Build a page.',
+    subject: 'Coffee',
+    pageType: 'Landing page',
+    scope: 'One page',
+    primaryGoal: 'Sell coffee',
+    audience: 'Home brewers',
+    offer: 'Fresh coffee',
+    primaryAction: 'Buy',
+    requiredContent: [],
+    constraints: [],
+    brandInputs: [],
+    creativeControl: 'Agent decides',
+    explicitAnswers: [],
+    assumptions: [],
+    unresolved: [],
+  },
+  {
+    version: 1,
+    foundation: {
+      strategy: 'extend',
+      existingAssets: ['public/logo.svg'],
+      assetActions: [
+        { asset: 'public/logo.svg', action: 'protect', reason: 'Supplied official mark.' },
+      ],
+      lockedDecisions: ['Keep the supplied logo.'],
+      assumptions: [],
+    },
+    creativeDirection: {
+      summary: 'Warm.',
+      traits: [{ quality: 'tactile', boundary: 'not rustic' }],
+      productiveTension: 'Warm craft with precise utility.',
+      signatureDevice: {
+        description: 'A cropped circular roast mark.',
+        status: 'existing',
+        invariants: ['Circular silhouette'],
+      },
+      restraint: 'Use the roast mark once per major surface.',
+      avoid: [],
+    },
+    colorPalette: [{ name: 'Ink', value: '#111', usage: 'Text' }],
+    typefaces: [{ family: 'Geist', source: 'Project', roles: ['UI'], weights: [500] }],
+    interfaceDirection: 'Editorial.',
+    imageDirection: { summary: 'Product.', subjects: [], treatment: 'Warm.', avoid: [] },
+    motionDirection: { summary: 'Tactile.', principles: [], avoid: [] },
+    voice: { summary: 'Direct.', avoid: [] },
+  },
+  {
+    version: 1,
+    page: { title: 'Coffee', route: '/', description: 'Fresh coffee.' },
+    architecture: {
+      contract: 'Help home brewers choose a subscription.',
+      mode: 'persuade_convert',
+      novelty: 'medium',
+      grid: 'Reading rail with product breakouts.',
+      signatureRule: 'Product evidence breaks the right edge.',
+      rhythm: 'Explanation alternates with proof.',
+    },
+    navigation: [],
+    sections: [
+      {
+        id: 'hero',
+        purpose: 'Lead.',
+        userQuestion: 'What can I order?',
+        stage: 'orient',
+        dependencies: [],
+        evidence: [],
+        copy: { heading: 'Fresh.', body: [], callsToAction: [] },
+        layout: 'Split.',
+        componentNeeds: [],
+        assetNeeds: [],
+        transformation: { compact: 'Stack.', medium: 'Split.', expanded: 'Split.' },
+      },
+    ],
+    responsive: [],
+    interactions: [],
+    acceptanceCriteria: [],
+  },
+  { version: 1, assets: [] },
+]
+
+describe('build phase', () => {
+  it('builds dashboard interactions without injecting marketing reveal code', () => {
+    const prompt = designBuildPrompt(
+      { ...artifacts[0], pageType: 'dashboard', originalRequest: 'Build a finance dashboard.' },
+      artifacts[1],
+      artifacts[2],
+      artifacts[3],
+    )
+    expect(prompt).toContain('DASHBOARD INTERACTION AND MOTION')
+    expect(prompt).toContain('working components with consistent sample data')
+    expect(prompt).not.toContain('<reference-reveal-source>')
+    expect(prompt).not.toContain('installReferenceReveals')
+    expect(prompt).not.toContain('Verify an actual hero animation')
+    expect(designBuildPrompt(...artifacts)).not.toContain('<reference-reveal-source>')
+    expect(prompt).not.toContain('TASTESKILL WEBSITE RULES')
+  })
+
+  it('requires the existing architecture and leaves preview to the harness', () => {
+    const prompt = designBuildPrompt(...artifacts)
+    expect(prompt).toContain(
+      'Do not add scroll reveals, a reveal helper or an entrance to any other section',
+    )
+    expect(prompt).toContain(
+      'that the hover layer answers on a button, a linked card and a linked photograph',
+    )
+    expect(prompt).toContain('## 4. Equal edges and the grid')
+    expect(prompt).toContain('Build and Review must preserve it')
+    expect(prompt).toContain('only fulfilled image needs may reach Build')
+    expect(prompt).toContain('Do not scaffold a second app')
+    expect(prompt).toContain('TasteCode owns Preview next')
+    // A real Codex run without a browser host stopped on the font check it could not run.
+    expect(prompt).toContain(
+      'Where no browser can launch, check instead that every approved family',
+    )
+    expect(prompt).toContain('A local browser that cannot launch is not a blocker')
+    expect(prompt).toContain('The reference is the primary hard composition requirement')
+    expect(prompt).toContain(
+      "Implement the hover layer on every interactive element, the hero's one load motion, the one creative moment",
+    )
+    expect(prompt).toContain('never use transition: all')
+    expect(prompt).toContain('replace the reference with a generic centered heading')
+    expect(prompt).toContain(
+      'Derive heading placement, line count and text block width from the selected reference at each viewport, and set its size with the brand type-scale step',
+    )
+    expect(prompt).toContain(
+      'Take spacing, radii, borders, rules and surfaces from the design tokens and the brand',
+    )
+    expect(prompt).toContain('open columns remain open')
+    expect(prompt).toContain('finished page must not become generic gray')
+    expect(prompt).toContain('never leave a browser-default control')
+    expect(prompt).toContain('at least 44 by 44 CSS pixels')
+    expect(prompt).toContain('A successful production build with a blank runtime is a failed Build')
+    expect(prompt).toContain('Record every invented value in a Build summary')
+    expect(prompt).toContain('Never stretch images')
+    expect(prompt).toContain('Preserve intentional large media, asymmetry')
+    expect(prompt).toContain('<brand-gradient-recipes>')
+    expect(prompt).toContain("recipe's opaque contentSurface")
+    expect(prompt).toContain('Set summary to "Verify before publishing: ..."')
+    expect(prompt).toContain('It may not replace photography, product imagery')
+    expect(prompt).toContain('SVG is limited to an explicit functional icon, logo')
+    // Codex's sandbox could not launch Chromium in a real run and failed a finished Build.
+    expect(prompt).toContain('A local browser that cannot launch is not a blocker')
+    expect(designBuildCorrectionPrompt('missing files: index.html')).toContain(
+      'A local browser that cannot launch is not a blocker',
+    )
+  })
+
+  it('builds every section from one tokens block and the approved font families', () => {
+    const designTokens = {
+      typeScale: {
+        display: 'clamp(3.5rem, 8vw, 7rem)',
+        h1: '4rem',
+        h2: '3rem',
+        h3: '2rem',
+        body: '1rem',
+        small: '0.875rem',
+        label: '0.75rem',
+      },
+      radius: { scale: ['4px', '12px', '24px'], pill: '999px' },
+      spacing: { section: 'clamp(4rem, 10vw, 9rem)', gutter: '1.5rem', stack: '1rem' },
+      buttons: { primary: 'Solid accent pill.', secondary: 'Underlined text link.' },
+      surfaces: 'Paper canvas; one dark band before the footer.',
+    }
+    const brand = {
+      ...artifacts[1],
+      typefaces: [
+        { family: 'Fraunces', source: 'Google Fonts', roles: ['display'], weights: [600] },
+        { family: 'Hanken Grotesk', source: 'Google Fonts', roles: ['body'], weights: [400] },
+      ],
+      designTokens,
+    }
+    const prompt = designBuildPrompt(artifacts[0], brand, artifacts[2], artifacts[3])
+    expect(prompt).toContain('ONE DESIGN LANGUAGE')
+    expect(prompt).toContain('DESIGN TOKENS — one tokens block for the whole page')
+    expect(prompt).toContain(
+      'the approved font families, and the designTokens type scale, radius family and spacing scale',
+    )
+    expect(prompt).toContain(
+      'Every section reads colors, font families, font sizes, radii and section spacing only through these variables',
+    )
+    expect(prompt).toContain(
+      'The only permitted font families are "Fraunces" and "Hanken Grotesk". Load them only from their font files in the project: link the stylesheet the asset manifest records for them, or write @font-face rules pointing at those files. Do not add a font-family or @font-face for any other family, a Google Fonts or Fontsource import',
+    )
+    expect(prompt).toContain('an icon font required by the project')
+    expect(prompt).toContain('exactly one primary and one secondary button style from designTokens')
+    expect(prompt).not.toContain('This brand predates structured tokens')
+    const variables = JSON.parse(
+      /<design-token-variables>(\{.*?\})<\/design-token-variables>/su.exec(prompt)?.[1] ?? '{}',
+    )
+    expect(variables.root).toMatchObject({
+      '--color-ink': '#111',
+      '--font-primary': '"Fraunces", serif',
+      '--font-secondary': '"Hanken Grotesk", sans-serif',
+      '--text-display': 'clamp(3.5rem, 8vw, 7rem)',
+      '--radius-3': '24px',
+      '--radius-pill': '999px',
+      '--space-section': 'clamp(4rem, 10vw, 9rem)',
+    })
+
+    const partial = designBuildPrompt(
+      artifacts[0],
+      { ...brand, designTokens: { radius: designTokens.radius } },
+      artifacts[2],
+      artifacts[3],
+    )
+    expect(partial).toContain('the approved font families, and the designTokens radius family.')
+    expect(partial).toContain(
+      "This brand's designTokens have no usable type scale and spacing scale: derive one type scale (--text-display",
+    )
+    expect(partial).toContain('one spacing scale (--space-section, --space-gutter, --space-stack)')
+    expect(partial).not.toContain('from designTokens.buttons')
+    expect(partial).not.toContain('This brand predates structured tokens')
+
+    const legacy = designBuildPrompt(...artifacts)
+    expect(legacy).toContain('This brand predates structured tokens')
+    expect(legacy).toContain(
+      'derive one type scale (--text-display, --text-h1, --text-h2, --text-h3, --text-body, --text-small, --text-label), one radius family (--radius-1 to --radius-3 plus --radius-pill) and one spacing scale (--space-section, --space-gutter, --space-stack) from interfaceDirection and the anchor reference, and add them to the same block.',
+    )
+    expect(legacy).toContain('The only permitted font families are "Geist".')
+    expect(legacy).not.toContain('Reproduce reference spacing, rules, borders, radii and surfaces')
+    expect(legacy).not.toContain('Preserve reference labels, type contrast and case')
+  })
+
+  it('parses a completed implementation report', () => {
+    expect(
+      parseBuildPhaseOutput(
+        JSON.stringify({
+          status: 'complete',
+          summary: 'Implemented the landing page.',
+          files: ['src/App.tsx'],
+          checks: ['pnpm build — passed'],
+        }),
+      ),
+    ).toMatchObject({ status: 'complete', files: ['src/App.tsx'] })
+  })
+
+  it('reads a failed Build that names its blocker as summary, as Codex answered', () => {
+    const failed = (fields: Record<string, string>) =>
+      parseBuildPhaseOutput(
+        JSON.stringify({ status: 'failed', ...fields, files: ['.taste/assets.json'], checks: [] }),
+      )
+    expect(failed({ summary: 'Syne remains unavailable.' })).toMatchObject({
+      status: 'failed',
+      error: 'Syne remains unavailable.',
+    })
+    expect(failed({ error: 'Port in use.', summary: 'Other.' })).toMatchObject({
+      error: 'Port in use.',
+    })
+    expect(() => failed({})).toThrow('build error must be a non-empty string')
+  })
+
+  it('accepts reported folders, as Codex lists generated output', () => {
+    const report = (files: string[]) =>
+      JSON.stringify({ status: 'complete', summary: 'Built.', files, checks: [] })
+    const output = parseBuildPhaseOutput(report(['index.html', 'dist/', '.taste\\evidence\\']))
+    expect(output.files).toEqual(['index.html', 'dist', '.taste\\evidence'])
+    expect(() => parseBuildPhaseOutput(report(['../outside/']))).toThrow('relative paths')
+    expect(() => parseBuildPhaseOutput(report(['/']))).toThrow('relative paths')
+
+    const workspace = mkdtempSync(path.join(os.tmpdir(), 'harness-design-reported-folder-'))
+    try {
+      mkdirSync(path.join(workspace, 'dist'))
+      writeFileSync(path.join(workspace, 'dist', 'index.html'), '<main>Roastery</main>')
+      expect(() => validateDesignSourceQuality(workspace, output.files.slice(1, 2))).not.toThrow()
+      expect(() => validateDesignSourceQuality(workspace, ['missing'])).toThrow('does not exist')
+    } finally {
+      rmSync(workspace, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects generated one-sided card rails before Preview', () => {
+    const workspace = mkdtempSync(path.join(os.tmpdir(), 'harness-design-source-quality-'))
+    try {
+      writeFileSync(
+        path.join(workspace, 'styles.css'),
+        '.feature-card { border-left: 3px solid #f40; padding: 1rem; }',
+      )
+      expect(() => validateDesignSourceQuality(workspace, [])).toThrow(DesignSourceQualityError)
+      const referencePage = {
+        ...artifacts[2],
+        sections: artifacts[2].sections.map((section) => ({
+          ...section,
+          referenceDirectionId: 'reference-hero',
+        })),
+      }
+      expect(() =>
+        validateDesignSourceQuality(workspace, [], [], undefined, referencePage),
+      ).not.toThrow()
+      writeFileSync(path.join(workspace, 'filler.svg'), '<svg><path d="M0 0"/></svg>')
+      expect(() =>
+        validateDesignSourceQuality(workspace, [], [], undefined, referencePage),
+      ).toThrow('SVG substitute')
+      rmSync(path.join(workspace, 'filler.svg'))
+      expect(() => validateDesignSourceQuality(workspace, ['styles.css'])).toThrow(
+        'remove newly introduced card rails or unmanifested SVG substitutes',
+      )
+
+      writeFileSync(
+        path.join(workspace, 'styles.css'),
+        '.feature-card { background: linear-gradient(90deg, #f40 0 4px, transparent 4px); }',
+      )
+      expect(() => validateDesignSourceQuality(workspace, [])).toThrow(
+        'narrow card-edge gradient rail',
+      )
+
+      writeFileSync(
+        path.join(workspace, 'styles.css'),
+        '.feature-card > .accent { inline-size: 3px; align-self: stretch; }',
+      )
+      expect(() => validateDesignSourceQuality(workspace, [])).toThrow(
+        'full-height narrow card-edge strip',
+      )
+
+      writeFileSync(
+        path.join(workspace, 'Card.tsx'),
+        'const FeatureCard = styled.div`border-left: 3px solid #f40; padding: 1rem;`',
+      )
+      writeFileSync(path.join(workspace, 'styles.css'), '.feature-card { padding: 1rem; }')
+      expect(() => validateDesignSourceQuality(workspace, [])).toThrow(
+        'uses a one-sided card-edge border',
+      )
+
+      writeFileSync(
+        path.join(workspace, 'Card.tsx'),
+        '<article className="feature-card"><span className="absolute inset-y-0 left-0 w-[3px]" /></article>',
+      )
+      writeFileSync(path.join(workspace, 'styles.css'), '.feature-card { padding: 1rem; }')
+      expect(() => validateDesignSourceQuality(workspace, [])).toThrow(
+        'card markup contains a full-height narrow edge strip',
+      )
+
+      writeFileSync(
+        path.join(workspace, 'styles.css'),
+        '.feature-card { border: 1px solid #ddd; padding: 1rem; background: linear-gradient(to right, #fff 0%, #eee 100%); } .feature-card-atmosphere { background: linear-gradient(135deg, #fff, #eee); } .feature-card .divider { width: 40px; height: 2px; }',
+      )
+      rmSync(path.join(workspace, 'Card.tsx'))
+      mkdirSync(path.join(workspace, 'node_modules'), { recursive: true })
+      writeFileSync(
+        path.join(workspace, 'node_modules', 'vendor.css'),
+        '.feature-card { border-left: 3px solid red; }',
+      )
+      expect(() => validateDesignSourceQuality(workspace, [])).not.toThrow()
+    } finally {
+      rmSync(workspace, { recursive: true, force: true })
+    }
+  })
+
+  it('allows a source-quality correction to edit the offending implementation', () => {
+    const prompt = designSourceQualityCorrectionPrompt('src/Card.css contains a rail')
+    expect(prompt).toContain('Make one bounded edit pass')
+    expect(prompt).toContain('Remove every newly introduced prohibited source pattern')
+    expect(prompt).toContain('raw or standalone SVG substitutes')
+    expect(prompt).not.toContain('Do not repeat tool work')
+  })
+
+  it('asks a Repair correction for the failure shape the Repair parser reads', () => {
+    for (const prompt of [
+      designBuildCorrectionPrompt('unexpected files: helper.js', 'repair'),
+      designSourceQualityCorrectionPrompt('src/Card.css contains a rail', 'repair'),
+    ]) {
+      expect(prompt).toContain('{"status":"failed","summary":"specific recoverable blocker"')
+      expect(prompt).not.toContain('"error"')
+    }
+    expect(designBuildCorrectionPrompt('unexpected files: helper.js')).toContain(
+      '{"status":"failed","error":"specific recoverable blocker"',
+    )
+    expect(designSourceQualityCorrectionPrompt('rail')).toContain('Verify before publishing:')
+  })
+
+  it('rejects only source-quality violations introduced after the Build baseline', () => {
+    const workspace = mkdtempSync(path.join(os.tmpdir(), 'harness-design-source-baseline-'))
+    try {
+      writeFileSync(path.join(workspace, 'legacy.css'), '.legacy-card { border-left: 2px solid; }')
+      const baseline = designSourceQualityBaseline(workspace)
+      expect(() => validateDesignSourceQuality(workspace, [], baseline)).not.toThrow()
+
+      writeFileSync(path.join(workspace, 'new.css'), '.proof-card { border-left: 3px solid; }')
+      expect(() => validateDesignSourceQuality(workspace, [], baseline)).toThrow(
+        'new.css: .proof-card uses a one-sided card-edge border',
+      )
+    } finally {
+      rmSync(workspace, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects new SVG substitutes unless assets.json explicitly approves their functional role', () => {
+    const workspace = mkdtempSync(path.join(os.tmpdir(), 'harness-design-svg-source-'))
+    const emptyAssets = { version: 1 as const, assets: [] }
+    try {
+      writeFileSync(path.join(workspace, 'legacy.svg'), '<svg viewBox="0 0 10 10"></svg>')
+      const baseline = designSourceQualityBaseline(workspace, emptyAssets)
+      expect(() => validateDesignSourceQuality(workspace, [], baseline, emptyAssets)).not.toThrow()
+
+      writeFileSync(path.join(workspace, 'brand-shape.svg'), '<svg viewBox="0 0 40 40"></svg>')
+      expect(() => validateDesignSourceQuality(workspace, [], baseline, emptyAssets)).toThrow(
+        'unmanifested standalone SVG substitute',
+      )
+
+      const deceptiveNeededAssets = {
+        version: 1 as const,
+        assets: [
+          {
+            id: 'brand-mark',
+            kind: 'icon' as const,
+            status: 'needed' as const,
+            purpose: 'Unresolved mark.',
+            requirements: [],
+            role: 'logo' as const,
+            sectionIds: ['hero'],
+            destination: 'brand-shape.svg',
+          },
+        ],
+      }
+      expect(() =>
+        validateDesignSourceQuality(workspace, [], baseline, deceptiveNeededAssets),
+      ).toThrow('unmanifested standalone SVG substitute')
+
+      const approvedAssets = {
+        version: 1 as const,
+        assets: [
+          {
+            id: 'brand-mark',
+            kind: 'icon' as const,
+            status: 'ready' as const,
+            purpose: 'Existing functional brand mark.',
+            requirements: [],
+            role: 'logo' as const,
+            sectionIds: ['hero'],
+            source: { kind: 'project' as const, reference: 'brand-shape.svg' },
+            destination: 'brand-shape.svg',
+          },
+        ],
+      }
+      expect(() =>
+        validateDesignSourceQuality(workspace, [], baseline, approvedAssets),
+      ).not.toThrow()
+
+      writeFileSync(
+        path.join(workspace, 'App.tsx'),
+        'export const Art = () => <svg viewBox="0 0 800 600"><path d="M0 0h800v600z" /></svg>',
+      )
+      expect(() => validateDesignSourceQuality(workspace, [], baseline, approvedAssets)).toThrow(
+        'unmanifested inline SVG substitute',
+      )
+      writeFileSync(
+        path.join(workspace, 'ActionIcon.tsx'),
+        'export const Icon = () => <svg viewBox="0 0 24 24"><path d="M4 12h16" /></svg>',
+      )
+      const inlineApproval = {
+        ...approvedAssets,
+        assets: [
+          ...approvedAssets.assets,
+          {
+            ...approvedAssets.assets[0]!,
+            id: 'action-icon',
+            role: 'functional_icon' as const,
+            source: { kind: 'project' as const, reference: 'ActionIcon.tsx' },
+            destination: 'ActionIcon.tsx',
+          },
+        ],
+      }
+      expect(() => validateDesignSourceQuality(workspace, [], baseline, inlineApproval)).toThrow(
+        'unmanifested inline SVG substitute',
+      )
+      rmSync(path.join(workspace, 'App.tsx'))
+      expect(() =>
+        validateDesignSourceQuality(workspace, [], baseline, inlineApproval),
+      ).not.toThrow()
+    } finally {
+      rmSync(workspace, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects workspace extras when the brief requires an exact file set', () => {
+    const workspace = mkdtempSync(path.join(os.tmpdir(), 'harness-design-exact-files-'))
+    const brief = {
+      ...artifacts[0],
+      originalRequest:
+        'Create exactly index.html, styles.css, and app.js in the current directory; do not create other files.',
+    }
+    try {
+      writeFileSync(path.join(workspace, 'README.md'), 'pre-existing user file')
+      const baseline = designWorkspaceFileBaseline(workspace)
+      for (const file of [
+        'index.html',
+        'styles.css',
+        'app.js',
+        'preview-server.js',
+        'extra.json',
+      ]) {
+        writeFileSync(path.join(workspace, file), file)
+      }
+      mkdirSync(path.join(workspace, 'node_modules', 'package'), { recursive: true })
+      writeFileSync(path.join(workspace, 'node_modules', 'package', 'index.js'), 'ignored depth')
+
+      expect(() => validateExactBuildFiles(workspace, brief, baseline)).toThrow(
+        'unexpected files: extra.json, node_modules/, preview-server.js',
+      )
+      rmSync(path.join(workspace, 'README.md'))
+      expect(() => validateExactBuildFiles(workspace, brief, baseline)).toThrow(
+        'restore pre-existing files: README.md',
+      )
+    } finally {
+      rmSync(workspace, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects new files inside pre-existing normal directories', () => {
+    const workspace = mkdtempSync(path.join(os.tmpdir(), 'harness-design-exact-nested-extra-'))
+    const brief = {
+      ...artifacts[0],
+      originalRequest: 'Create exactly index.html; do not create other files.',
+    }
+    try {
+      mkdirSync(path.join(workspace, 'src'))
+      writeFileSync(path.join(workspace, 'src', 'existing.ts'), 'pre-existing user file')
+      const baseline = designWorkspaceFileBaseline(workspace)
+
+      writeFileSync(path.join(workspace, 'index.html'), '<main></main>')
+      writeFileSync(path.join(workspace, 'src', 'unexpected.ts'), 'new file')
+
+      expect(() => validateExactBuildFiles(workspace, brief, baseline)).toThrow(
+        'unexpected files: src/unexpected.ts',
+      )
+    } finally {
+      rmSync(workspace, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps internal metadata and dependency trees opaque', () => {
+    const workspace = mkdtempSync(path.join(os.tmpdir(), 'harness-design-exact-opaque-'))
+    const brief = {
+      ...artifacts[0],
+      originalRequest: 'Create exactly index.html; do not create other files.',
+    }
+    try {
+      for (const directory of ['.git', '.taste', 'node_modules/package', '.pnpm-store/v3']) {
+        mkdirSync(path.join(workspace, directory), { recursive: true })
+        writeFileSync(path.join(workspace, directory, 'existing.json'), '{}')
+      }
+      const baseline = designWorkspaceFileBaseline(workspace)
+
+      writeFileSync(path.join(workspace, 'index.html'), '<main></main>')
+      for (const directory of ['.git', '.taste', 'node_modules/package', '.pnpm-store/v3']) {
+        writeFileSync(path.join(workspace, directory, 'created-during-build.json'), '{}')
+      }
+
+      expect(() => validateExactBuildFiles(workspace, brief, baseline)).not.toThrow()
+    } finally {
+      rmSync(workspace, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps generated dependency and cache trees out of both Design baselines', () => {
+    const workspace = mkdtempSync(path.join(os.tmpdir(), 'harness-design-generated-trees-'))
+    try {
+      writeFileSync(path.join(workspace, 'index.html'), '<main></main>')
+      // A virtualenv or a Rust target folder alone can exceed the scan's entry cap.
+      for (const directory of ['.venv/lib', 'target/debug', '.next/cache', '__pycache__']) {
+        mkdirSync(path.join(workspace, directory), { recursive: true })
+        writeFileSync(path.join(workspace, directory, 'generated.svg'), '<svg></svg>')
+      }
+
+      expect(designWorkspaceFileBaseline(workspace)).toEqual([
+        '.next/',
+        '.venv/',
+        '__pycache__/',
+        'index.html',
+        'target/',
+      ])
+      expect(designSourceQualityBaseline(workspace)).toEqual([])
+    } finally {
+      rmSync(workspace, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps package-manager caches out of the source scan', () => {
+    const workspace = mkdtempSync(path.join(os.tmpdir(), 'harness-design-package-caches-'))
+    try {
+      writeFileSync(path.join(workspace, 'index.html'), '<main></main>')
+      // A Bun cache inside the workspace pushed a fresh Astro build over the 32 MB scan (#1553).
+      for (const directory of ['.bun-cache/install', '.yarn/cache', '.npm/_cacache']) {
+        mkdirSync(path.join(workspace, directory), { recursive: true })
+        writeFileSync(path.join(workspace, directory, 'package.js'), 'export {}')
+      }
+
+      expect(designWorkspaceFileBaseline(workspace)).toEqual([
+        '.bun-cache/',
+        '.npm/',
+        '.yarn/',
+        'index.html',
+      ])
+      expect(designSourceQualityBaseline(workspace)).toEqual([])
+    } finally {
+      rmSync(workspace, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects new files inside nested internal-named directories', () => {
+    const workspace = mkdtempSync(path.join(os.tmpdir(), 'harness-design-exact-nested-internal-'))
+    const brief = {
+      ...artifacts[0],
+      originalRequest: 'Create exactly index.html; do not create other files.',
+    }
+    try {
+      mkdirSync(path.join(workspace, 'src'))
+      const baseline = designWorkspaceFileBaseline(workspace)
+
+      writeFileSync(path.join(workspace, 'index.html'), '<main></main>')
+      for (const directory of ['.git', '.taste']) {
+        mkdirSync(path.join(workspace, 'src', directory))
+        writeFileSync(path.join(workspace, 'src', directory, 'hidden.json'), '{}')
+      }
+
+      expect(() => validateExactBuildFiles(workspace, brief, baseline)).toThrow(
+        'unexpected files: src/.git/hidden.json, src/.taste/hidden.json',
+      )
+    } finally {
+      rmSync(workspace, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects a worktree pointer written into an existing directory', () => {
+    const workspace = mkdtempSync(path.join(os.tmpdir(), 'harness-design-exact-worktree-'))
+    const brief = {
+      ...artifacts[0],
+      originalRequest: 'Create exactly index.html; do not create other files.',
+    }
+    try {
+      mkdirSync(path.join(workspace, 'src'))
+      const baseline = designWorkspaceFileBaseline(workspace)
+
+      writeFileSync(path.join(workspace, 'index.html'), '<main></main>')
+      writeFileSync(path.join(workspace, 'src', '.git'), 'gitdir: ../.git/worktrees/src\n')
+      writeFileSync(path.join(workspace, 'src', 'hidden.json'), '{}')
+
+      expect(() => validateExactBuildFiles(workspace, brief, baseline)).toThrow(
+        'unexpected files: src/.git',
+      )
+    } finally {
+      rmSync(workspace, { recursive: true, force: true })
+    }
+  })
+
+  it('accepts an expected file inside a nested directory', () => {
+    const workspace = mkdtempSync(path.join(os.tmpdir(), 'harness-design-exact-nested-expected-'))
+    const brief = {
+      ...artifacts[0],
+      originalRequest: 'Create exactly src/index.ts; do not create other files.',
+    }
+    try {
+      mkdirSync(path.join(workspace, 'src'))
+      const baseline = designWorkspaceFileBaseline(workspace)
+      writeFileSync(path.join(workspace, 'src', 'index.ts'), 'export {}')
+
+      expect(() => validateExactBuildFiles(workspace, brief, baseline)).not.toThrow()
+    } finally {
+      rmSync(workspace, { recursive: true, force: true })
+    }
+  })
+
+  it.each([
+    'Only create index.html, styles.css, and app.js; no other files.',
+    'The files must be exactly index.html, styles.css, and app.js.',
+    'Create these three files: index.html, styles.css, and app.js.',
+    'Create exactly index.html styles.css and app.js for the landing page.',
+  ])('recognizes an exact file-list variant: %s', (constraint) => {
+    const workspace = mkdtempSync(path.join(os.tmpdir(), 'harness-design-exact-variant-'))
+    try {
+      for (const file of ['index.html', 'styles.css', 'app.js', 'extra.json']) {
+        writeFileSync(path.join(workspace, file), file)
+      }
+      expect(() =>
+        validateExactBuildFiles(workspace, { ...artifacts[0], constraints: [constraint] }),
+      ).toThrow('unexpected files: extra.json')
+    } finally {
+      rmSync(workspace, { recursive: true, force: true })
+    }
+  })
+
+  it('supports explicitly required dotfiles', () => {
+    const workspace = mkdtempSync(path.join(os.tmpdir(), 'harness-design-exact-dotfile-'))
+    try {
+      writeFileSync(path.join(workspace, '.nojekyll'), '')
+      writeFileSync(path.join(workspace, 'extra.json'), '')
+      expect(() =>
+        validateExactBuildFiles(workspace, {
+          ...artifacts[0],
+          constraints: ['Create exactly .nojekyll.'],
+        }),
+      ).toThrow('unexpected files: extra.json')
+    } finally {
+      rmSync(workspace, { recursive: true, force: true })
+    }
+  })
+
+  it.each([
+    'Redesign our landing page. Create only Next.js components, no plain HTML.',
+    'Write only Three.js code for the 3D scene.',
+    'Only write Vue.js; no jQuery.',
+  ])('does not read a framework name as an exact file: %s', (originalRequest) => {
+    const workspace = mkdtempSync(path.join(os.tmpdir(), 'harness-design-exact-framework-'))
+    const brief = { ...artifacts[0], originalRequest }
+    try {
+      const [, brand, page, assets] = artifacts
+      expect(designBuildPrompt(brief, brand, page, assets)).not.toContain('deliverable boundary')
+      mkdirSync(path.join(workspace, 'app'))
+      writeFileSync(path.join(workspace, 'app', 'page.tsx'), 'export default () => null')
+      expect(() => validateExactBuildFiles(workspace, brief)).not.toThrow()
+    } finally {
+      rmSync(workspace, { recursive: true, force: true })
+    }
+  })
+
+  it('does not constrain briefs without an exact file requirement', () => {
+    const workspace = mkdtempSync(path.join(os.tmpdir(), 'harness-design-open-files-'))
+    try {
+      writeFileSync(path.join(workspace, 'anything.txt'), 'kept')
+      expect(() => validateExactBuildFiles(workspace, artifacts[0])).not.toThrow()
+      for (const constraint of [
+        'Use exactly v1.0 syntax.',
+        'Create exactly the layout shown in reference.png using index.html.',
+        'The files must contain exactly the copy from copy.md.',
+      ]) {
+        expect(() =>
+          validateExactBuildFiles(workspace, { ...artifacts[0], constraints: [constraint] }),
+        ).not.toThrow()
+      }
+    } finally {
+      rmSync(workspace, { recursive: true, force: true })
+    }
+  })
+})

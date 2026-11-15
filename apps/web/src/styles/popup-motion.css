@@ -1,0 +1,93 @@
+/*
+ * Every menu and popover (Menu, AppSelect, the color picker, the update
+ * notice) opens out of its anchor: each sets transform-origin on the anchor's
+ * side, and the short travel comes from that side too. It closes faster, with
+ * a fade and a slight shrink in place.
+ */
+.popup {
+  --popup-offset: -4px;
+
+  opacity: 0;
+  transform: scale(0.98);
+  pointer-events: none;
+  transition:
+    transform var(--dur-popup-out) var(--ease-out),
+    opacity var(--dur-popup-out) var(--ease-out);
+}
+
+.popup:is(.menu--up, .app-select__listbox--up) {
+  --popup-offset: 4px;
+}
+
+.popup[data-popup-state='open'] {
+  opacity: 1;
+  transform: none;
+  pointer-events: auto;
+  transition:
+    transform var(--dur-popup-in) var(--ease-popup),
+    opacity var(--dur-popup-in) var(--ease-popup);
+}
+
+@starting-style {
+  .popup[data-popup-state='open'] {
+    opacity: 0;
+    transform: translateY(var(--popup-offset)) scale(0.96);
+  }
+}
+
+.popup[data-input-modality='keyboard'] {
+  transform: none;
+  transition: none;
+}
+
+.sheet__panel,
+.pr-dialog {
+  opacity: 1;
+  transform: none;
+  transition:
+    transform 200ms var(--ease-out),
+    opacity 160ms var(--ease-out);
+}
+
+.sheet__scrim,
+.pr-dialog-backdrop {
+  opacity: 1;
+  transition: opacity 160ms var(--ease-out);
+}
+
+@starting-style {
+  .sheet__panel,
+  .pr-dialog {
+    opacity: 0;
+    transform: translateY(6px) scale(0.97);
+  }
+
+  .sheet__scrim,
+  .pr-dialog-backdrop {
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .popup,
+  .popup[data-popup-state='open'],
+  .sheet__scrim,
+  .pr-dialog-backdrop,
+  .sheet__panel,
+  .pr-dialog {
+    transform: none;
+    transition: opacity 100ms var(--ease-out) !important;
+  }
+
+  .popup[data-input-modality='keyboard'] {
+    transition: none !important;
+  }
+
+  @starting-style {
+    .popup[data-popup-state='open'],
+    .sheet__panel,
+    .pr-dialog {
+      transform: none;
+    }
+  }
+}

@@ -1,0 +1,44 @@
+import { readFileSync } from 'node:fs'
+import { describe, expect, it } from 'vitest'
+
+const css = readFileSync(new URL('./app.css', import.meta.url), 'utf8')
+const resourcePickerCss = readFileSync(
+  new URL('./composer-resource-picker.css', import.meta.url),
+  'utf8',
+)
+const workspaceCss = readFileSync(new URL('../ui/workspace-panel.css', import.meta.url), 'utf8')
+
+describe('responsive chat pane CSS', () => {
+  it('compacts by chat width instead of whole-window width', () => {
+    expect(css).toMatch(/\.stage \{[^}]*container: chat-stage \/ inline-size;/s)
+    expect(css).toMatch(/\.composer \{[^}]*min-width: 0;/s)
+    expect(css).toMatch(/\.composer__box \{[^}]*width: 100%;[^}]*min-width: 0;/s)
+    expect(css).toMatch(
+      /@container chat-stage \(max-width: 620px\) \{[\s\S]*?\.tools \.composer__permission,[\s\S]*?width: 34px;[\s\S]*?\.composer__permission \.tool > span:not\(\.icon-morph\),[\s\S]*?display: none;/s,
+    )
+  })
+
+  it('keeps the permission icon when a narrow composer drops the label', () => {
+    // The icon is the IconMorph span next to the label span, so a bare
+    // `.tool > span` rule leaves an empty chip.
+    const labelRules = [
+      ...css.matchAll(/([^{}]*\.composer__permission \.tool > span[^{]*)\{([^}]*)\}/g),
+    ]
+    for (const [, selector] of labelRules) {
+      expect(selector).toContain('.composer__permission .tool > span:not(.icon-morph)')
+    }
+    const iconOnlyRules = labelRules.filter(([, , body]) => body?.includes('display: none'))
+    expect(iconOnlyRules).toHaveLength(2)
+    for (const [, selector] of iconOnlyRules) {
+      expect(selector).toContain('.composer__permission .tool > span:not(.icon-morph),')
+    }
+    expect(css).toMatch(
+      /@container chat-stage \(max-width: 480px\) \{[\s\S]*?\.stage__body \{[^}]*--chat-gutter: 10px;/s,
+    )
+    expect(resourcePickerCss).toMatch(
+      /@container chat-stage \(max-width: 480px\) \{[\s\S]*?\.composer-resource-picker__description,[\s\S]*?display: none;/s,
+    )
+    expect(css).toMatch(/\.tools \.composer__design \{[^}]*width: 100%;/s)
+    expect(workspaceCss).toMatch(/\.workspace-panel:not\(\.is-open\) \{[^}]*overflow: hidden;/s)
+  })
+})

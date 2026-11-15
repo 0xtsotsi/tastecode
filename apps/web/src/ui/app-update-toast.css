@@ -1,0 +1,34 @@
+/* The update-ready notice, loaded with the first update it has to show. It
+   takes the deleted-chat toast's look and place: centred under the header, so
+   it never sits on a composer, in a split or not. */
+
+.notice.notice--app-update {
+  top: 54px;
+  bottom: auto;
+  right: auto;
+  left: 50%;
+  translate: -50% 0;
+  /* The question with both choices is wider than the 420px a notice may take,
+     which cut "2 chats still running" short. */
+  max-width: calc(100vw - 36px);
+  /* The notice's own timing, plus the move below. */
+  transition-property: opacity, transform, top;
+}
+
+/* A question about running chats can open while the deleted-chat toast holds
+   this spot (it renders after this notice): it waits just below that toast,
+   38px tall plus an 8px gap, until the toast leaves. */
+.notice.notice--app-update:has(~ .notice--archive[data-state='open']) {
+  top: 100px;
+}
+
+.notice--app-update .notice__text {
+  margin-right: 4px;
+  white-space: nowrap;
+}
+
+.notice--app-update .spinner {
+  width: 16px;
+  height: 16px;
+  color: var(--text-2);
+}

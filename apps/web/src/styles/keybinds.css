@@ -1,0 +1,315 @@
+/* Keybinds read like a shortcut card on the Settings v1 rows: each action is
+   one line, wired to its shortcut by the shared dotted leader, with the key in
+   a column of its own so every shortcut lines up under the one above. The
+   leader is the state, through the row's tone (settings-system.css): faint
+   while nothing is bound, lit while the row is pointed at, in ink while keys
+   are being recorded and red when they are refused. Recording runs it towards
+   the keys, and a shortcut that lands draws it in. */
+
+/* Search is the settings text field, led by its glyph, with Clear inside its
+   right end. */
+.keybind-settings__search {
+  position: relative;
+  display: flex;
+  align-items: center;
+  margin: 0 0 28px;
+  color: var(--text-3);
+  transition: color var(--dur-fast) var(--ease-out);
+}
+
+.keybind-settings__search:focus-within {
+  color: var(--text-2);
+}
+
+.keybind-settings__search-icon {
+  position: absolute;
+  left: 8px;
+  pointer-events: none;
+}
+
+.settings .keybind-settings__search .set-input {
+  padding-left: 28px;
+}
+
+.settings .keybind-settings__search:has(.keybind-settings__search-clear) .set-input {
+  padding-right: 56px;
+}
+
+.keybind-settings__search input::-webkit-search-cancel-button {
+  display: none;
+}
+
+.keybind-settings__search-clear {
+  position: absolute;
+  right: 0;
+}
+
+/* Positioned for the recorder's hit area, which stretches over the row. */
+.keybind-row {
+  position: relative;
+}
+
+/* A long name ends before the leader instead of wrapping. */
+.keybind-row__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Recording: the leader runs towards the keys, as work in flight runs along
+   the roster's wire. */
+.keybind-row[data-recording]:not([data-tone='error']) .set-leader {
+  background: linear-gradient(90deg, var(--set-leader) 50%, transparent 50%) left center / 8px 1px
+    repeat-x;
+  animation: keybind-wire-flow 520ms linear infinite;
+}
+
+.keybind-row[data-landed] .set-leader {
+  animation: keybind-wire-draw 560ms var(--ease-out) both;
+}
+
+@keyframes keybind-wire-flow {
+  to {
+    background-position-x: 8px;
+  }
+}
+
+@keyframes keybind-wire-draw {
+  from {
+    clip-path: inset(0 100% 0 0);
+  }
+}
+
+/* The recorder is the whole row: its hit area stretches over the line. It
+   takes the last column, whether the row has its leader or, in a narrow pane,
+   has dropped it to two. */
+.keybind-recorder {
+  grid-column: -2 / -1;
+  justify-self: end;
+  padding: 0;
+  background: none;
+  border: 0;
+  color: var(--text);
+  cursor: pointer;
+  font: inherit;
+  letter-spacing: inherit;
+  line-height: inherit;
+  white-space: nowrap;
+}
+
+.keybind-recorder::after {
+  position: absolute;
+  inset: 0;
+  border-radius: var(--r-sm);
+  content: '';
+}
+
+/* Keyboard focus rings the shortcut, not the row: the row is no card. */
+.keybind-row:not([data-recording]) .keybind-recorder:focus-visible {
+  border-radius: var(--r-xs);
+  outline: var(--focus-ring);
+  outline-offset: 3px;
+}
+
+.keybind-row[data-recording] .keybind-recorder:focus-visible {
+  outline: 0;
+}
+
+.keybind-row[data-recording] .keybind-recorder {
+  cursor: default;
+}
+
+.keybind-recorder__empty {
+  color: var(--text-3);
+  transition: color var(--dur-fast) var(--ease-out);
+}
+
+.keybind-row:is(:hover, :focus-within) .keybind-recorder__empty {
+  color: var(--text-2);
+}
+
+.keybind-shortcut {
+  display: inline-flex;
+  align-items: baseline;
+  justify-content: flex-end;
+  color: inherit;
+  font-family: var(--font-ui);
+  font-size: inherit;
+  font-variant-numeric: tabular-nums;
+  font-weight: 500;
+  letter-spacing: 0;
+}
+
+.keybind-shortcut__modifier {
+  margin-right: 0.14em;
+}
+
+.keybind-shortcut__key {
+  min-width: 1em;
+  margin-left: 0.06em;
+  text-align: left;
+}
+
+/* A refused chord stays in place, in the error's ink. */
+.keybind-row[data-tone='error'] .keybind-shortcut {
+  color: var(--error);
+}
+
+/* Ctrl+Alt+Shift+ reads as one word, as Windows writes it. */
+.keybind-shortcut--words .keybind-shortcut__modifier {
+  margin-right: 0;
+}
+
+/* Recording: the modifiers wait faintly in place and take ink while held. */
+.keybind-shortcut--live .keybind-shortcut__modifier {
+  color: color-mix(in srgb, var(--text-3) 55%, transparent);
+  transition: color 90ms var(--ease-out);
+}
+
+.keybind-shortcut--live .keybind-shortcut__modifier[data-held] {
+  color: var(--text);
+}
+
+.keybind-shortcut__caret {
+  position: relative;
+  align-self: stretch;
+}
+
+.keybind-shortcut__caret::before {
+  position: absolute;
+  top: 0.12em;
+  bottom: 0.06em;
+  left: 0.06em;
+  width: 1.5px;
+  background: var(--text);
+  content: '';
+  animation: keybind-caret 1.06s steps(1) infinite;
+}
+
+@keyframes keybind-caret {
+  50% {
+    opacity: 0;
+  }
+}
+
+/* A new shortcut drops into its place as one piece, modifiers and key
+   together. */
+.keybind-shortcut[data-landed] > * {
+  animation: keybind-land var(--dur-slow) var(--ease-out) both;
+}
+
+.keybind-shortcut[data-landed]:not(:has(> *)) {
+  animation: keybind-land var(--dur-slow) var(--ease-out) both;
+}
+
+@keyframes keybind-land {
+  from {
+    opacity: 0;
+    transform: translateY(-0.35em);
+  }
+}
+
+/* The row opens under itself while recording: what the action does, what to
+   press, and what else can be done with it. */
+.keybind-row__detail {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows var(--dur-slow) var(--ease-out);
+}
+
+.keybind-row[data-recording] .keybind-row__detail {
+  grid-template-rows: 1fr;
+}
+
+/* Clipped only top and bottom, for the fold: the last quiet action hangs past
+   the right edge to sit optically flush, and its hover fill must not be cut.
+   Set as the row's note; what the action does stays a step brighter than the
+   hint under it. */
+.keybind-row__detail-inner {
+  min-height: 0;
+  overflow-x: visible;
+  overflow-y: clip;
+  font-size: var(--t-sm);
+  line-height: 1.45;
+}
+
+.keybind-row__note {
+  max-width: 60ch;
+  margin: 2px 0 0;
+  color: var(--text-2);
+}
+
+.keybind-row__line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  column-gap: 20px;
+  row-gap: 8px;
+  margin-top: 2px;
+  padding-bottom: 4px;
+}
+
+.keybind-row__hint,
+.keybind-row__message {
+  margin: 0;
+  color: var(--text-3);
+}
+
+.keybind-row__message {
+  color: var(--error);
+}
+
+.keybind-row__actions {
+  display: flex;
+  gap: 6px;
+  margin-left: auto;
+}
+
+/* The settings buttons: what the row asks for is outlined, the rest is quiet.
+   They sit above the row's own click target. */
+.keybind-row__action {
+  position: relative;
+  z-index: 1;
+}
+
+.keybind-row__action:not(.set-button--quiet) {
+  min-width: 70px;
+}
+
+/* A lone quiet action sits optically flush with the row's right edge. */
+.keybind-row__action.set-button--quiet:last-child {
+  margin-right: -10px;
+}
+
+.command-palette__shortcut {
+  flex: none;
+  margin-left: 18px;
+  padding: 2px 6px;
+  background: var(--chrome-recessed);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  color: var(--text-3);
+  font-family: var(--font-ui);
+  font-size: var(--t-sm);
+  font-variant-numeric: tabular-nums;
+  font-weight: 400;
+  letter-spacing: normal;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .keybind-recorder__empty,
+  .keybind-row__detail,
+  .keybind-settings__search,
+  .keybind-row__action,
+  .keybind-shortcut--live .keybind-shortcut__modifier {
+    transition: none;
+  }
+
+  .keybind-row .set-leader,
+  .keybind-shortcut[data-landed],
+  .keybind-shortcut[data-landed] > *,
+  .keybind-shortcut__caret::before {
+    animation: none;
+  }
+}

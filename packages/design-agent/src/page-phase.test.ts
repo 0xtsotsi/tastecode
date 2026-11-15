@@ -1,0 +1,512 @@
+import { describe, expect, it, vi } from 'vitest'
+import { designPagePrompt, parsePagePhaseOutput } from './page-phase.js'
+
+// Dashboards are parked behind DASHBOARD_REFERENCES_ENABLED; these tests keep that path working.
+vi.mock('./dashboard-references.js', () => ({ DASHBOARD_REFERENCES_ENABLED: true }))
+
+const brief = {
+  originalRequest: 'Build a coffee page.',
+  subject: 'Coffee subscription',
+  pageType: 'Landing page',
+  scope: 'One page',
+  primaryGoal: 'Sell subscriptions',
+  audience: 'Home brewers',
+  offer: 'Fresh coffee',
+  primaryAction: 'Subscribe',
+  requiredContent: [],
+  constraints: [],
+  brandInputs: [],
+  creativeControl: 'Agent decides',
+  explicitAnswers: [],
+  assumptions: [],
+  unresolved: [],
+}
+
+const brand = {
+  version: 1 as const,
+  foundation: {
+    strategy: 'extend' as const,
+    existingAssets: ['public/logo.svg'],
+    assetActions: [
+      { asset: 'public/logo.svg', action: 'protect' as const, reason: 'Supplied official mark.' },
+    ],
+    lockedDecisions: ['Keep the supplied logo.'],
+    assumptions: [],
+  },
+  creativeDirection: {
+    summary: 'Warm precision.',
+    traits: [{ quality: 'tactile', boundary: 'not rustic' }],
+    productiveTension: 'Warm craft with precise utility.',
+    signatureDevice: {
+      description: 'A cropped circular roast mark.',
+      status: 'existing' as const,
+      invariants: ['Circular silhouette'],
+    },
+    restraint: 'Use the roast mark once per major surface.',
+    avoid: [],
+  },
+  colorPalette: [{ name: 'Ink', value: '#171512', usage: 'Text' }],
+  typefaces: [{ family: 'Geist', source: 'Project', roles: ['UI'], weights: [500] }],
+  interfaceDirection: 'Editorial commerce.',
+  imageDirection: { summary: 'Product studies.', subjects: [], treatment: 'Warm.', avoid: [] },
+  motionDirection: { summary: 'Tactile.', principles: [], avoid: [] },
+  voice: { summary: 'Direct.', avoid: [] },
+}
+
+const page = {
+  version: 1,
+  page: { title: 'Northstar', route: '/', description: 'Fresh coffee delivered.' },
+  architecture: {
+    contract: 'This page helps home brewers choose a fresh subscription.',
+    mode: 'persuade_convert',
+    novelty: 'medium',
+    grid: 'A narrow copy rail with product breakouts.',
+    signatureRule: 'Product evidence breaks the right page edge.',
+    rhythm: 'Explanation alternates with proof.',
+  },
+  navigation: [],
+  navigationDesign: {
+    layoutCase: 'navigation-1',
+    layout: 'Left logo, direct links, and the primary account action at the right.',
+    behavior: ['Gain a solid surface after leaving the hero.'],
+    transformation: {
+      compact: 'Logo and one menu trigger.',
+      medium: 'Logo, priority links, and account action.',
+      expanded: 'Full direct navigation.',
+    },
+  },
+  sections: [
+    {
+      id: 'hero',
+      layoutFamily: 'hero',
+      layoutCases: ['hero-text-5', 'hero-visual-2'],
+      purpose: 'Introduce the offer.',
+      userQuestion: 'What can I subscribe to?',
+      stage: 'orient',
+      dependencies: [],
+      evidence: [],
+      copy: { heading: 'Fresh by design.', body: [], callsToAction: [] },
+      layout: 'Editorial split.',
+      motion: {
+        purpose: 'explanation',
+        trigger: 'scroll_enter',
+        behavior: 'Product proof resolves into the reading rail.',
+        durationMs: 220,
+        easing: 'cubic-bezier(0.23, 1, 0.32, 1)',
+        reducedMotion: 'Show the final composition immediately.',
+      },
+      componentNeeds: [],
+      assetNeeds: [],
+      transformation: {
+        compact: 'Copy before product media.',
+        medium: 'Compact split.',
+        expanded: 'Editorial split.',
+      },
+    },
+  ],
+  responsive: [],
+  interactions: [],
+  acceptanceCriteria: [],
+}
+
+describe('page phase', () => {
+  it('passes both upstream artifacts through clear data boundaries', () => {
+    const prompt = designPagePrompt(brief, brand, ['/tmp/reference-home.png'])
+    expect(prompt).toContain('One load motion in the hero on every kind')
+    expect(prompt).toContain('One creative moment in its own section on every kind')
+    expect(prompt).toContain('No card, row, tile, heading or photograph reveals')
+    expect(prompt).toContain('## Five rules')
+    expect(prompt).not.toContain('distinct scroll-triggered reveals')
+    expect(prompt).toContain('replace such unsupported assumptions in the page plan')
+    expect(prompt).toContain('normally plan at least eight substantive, relevant content sections')
+    expect(prompt).toContain('Visibly identify concept work or an illustrative catalog')
+    expect(prompt).toContain('<design-brief>')
+    expect(prompt).toContain('<brand-system>')
+    expect(prompt).toContain('<reference-direction-deck>')
+    expect(prompt).toContain('<supplied-reference-catalog>')
+    expect(prompt).toContain('user-reference-1')
+    expect(prompt).toContain('Inspect the pixels rather than guessing')
+    expect(prompt).toContain('"imagePath"')
+    expect(prompt).toContain('REFERENCE LOCK')
+    expect(prompt).toContain("Preserve the chosen reference's macro geometry")
+    expect(prompt).toContain('Do not invent a second signature motif')
+    expect(prompt).toContain('Do not choose new colors or typefaces')
+    expect(prompt).toContain('order sections by information dependencies')
+    expect(prompt).toContain('Compact reduces simultaneity, not content or capability')
+    expect(prompt).toContain('Treat the selected reference images as composition requirements')
+    expect(prompt).toContain('Do not add a section to use an available reference')
+    expect(prompt).toContain("Retain each selected reference's card arrangement")
+    expect(prompt).toContain("style every card in the brand's one card language")
+    expect(prompt).toContain('record stable assetNeeds for every meaningful image')
+    expect(prompt).toContain('Carry the approved brand accent into primary actions')
+    expect(prompt).toContain('Give every section one explicit motion decision')
+    expect(prompt).toContain('Derive heading placement, line count, image proportions')
+    expect(prompt).toContain(
+      'References define macro composition only: grid, column structure, media count and crop, alignment, overlap, section proportions and responsive order',
+    )
+    expect(prompt).toContain(
+      'font families come only from the approved brand system and its designTokens, and must be identical across sections',
+    )
+    expect(prompt).toContain('Never use an em dash')
+    expect(prompt).toContain(
+      'Use optional copy.eyebrow only when the selected reference actually contains a label',
+    )
+    expect(prompt).toContain(
+      'Use the following beta layout cases as the source material for Hero, Navigation, About, Feature, How It Works, Social Proof, Stats, FAQ, CTA, Pricing, Contact, and Footer',
+    )
+    expect(prompt).toContain('Place the headline at the bottom left or bottom right')
+    expect(prompt).toContain('show a wide dashboard, product preview, interface')
+    expect(prompt).toContain('Place a list of destinations with icons and subheadings on the left')
+    expect(prompt).toContain('As the user scrolls, smoothly introduce the navigation background')
+    expect(prompt).toContain('An About section may describe the company, the people who work there')
+    expect(prompt).toContain('Arrange portraits of the people in an orderly grid')
+    expect(prompt).toContain('Build an open asymmetric image-and-text grid beneath it')
+    expect(prompt).toContain('move from left to right through a smooth GSAP scroll treatment')
+    expect(prompt).toContain('Create a more experimental checkerboard composition')
+    expect(prompt).toContain('The text may reveal or fade in as the user scrolls')
+    expect(prompt).toContain('Treat Features as one of the most open section types')
+    expect(prompt).toContain('Place the heading on the left and the description on the right')
+    expect(prompt).toContain('Use one horizontal row of three cards')
+    expect(prompt).toContain('creating a stair-step composition')
+    expect(prompt).toContain('four cards above and three below')
+    expect(prompt).toContain('Present roughly two to five features with a timed progress line')
+    expect(prompt).toContain('through GSAP, horizontal scroll, or direct dragging')
+    expect(prompt).toContain('move in a controlled swirl')
+    expect(prompt).toContain('How It Works overlaps strongly with Feature layouts')
+    expect(prompt).toContain('Draw one horizontal line with numbered steps')
+    expect(prompt).toContain('left and right arrow buttons')
+    expect(prompt).toContain('Place a vertical list of steps on the left')
+    expect(prompt).toContain('Day 1 and Day 2')
+    expect(prompt).toContain('Draw a winding or snake-like line through the center')
+    expect(prompt).toContain('Treat this as a small supporting element rather than a full section')
+    expect(prompt).toContain('company logos moving from right to left')
+    expect(prompt).toContain('A static row of roughly five logos is equally valid')
+    expect(prompt).toContain('multi-row grid or logo-wall composition')
+    expect(prompt).toContain('in color or in a restrained gray treatment')
+    expect(prompt).toContain('Place a strong, fitting quote at the top left')
+    expect(prompt).toContain('only two very large numbers or a longer list')
+    expect(prompt).toContain('Use a bento arrangement for the quote, numbers')
+    expect(prompt).toContain('followed by a list of questions that open and close')
+    expect(prompt).toContain('a small table of contents on the left')
+    expect(prompt).toContain('a large "FAQ," "Questions," or another fitting heading on the left')
+    expect(prompt).toContain('designed cards that expand, or as a simple accordion list')
+    expect(prompt).toContain(
+      'Lead with a compelling invitation rather than a generic section heading',
+    )
+    expect(prompt).toContain('email input and CTA button')
+    expect(prompt).toContain('action word itself, such as "Sign up," directly inside the headline')
+    expect(prompt).toContain('images in tiles or a bento arrangement on the right')
+    expect(prompt).toContain('a compact toggle, two larger buttons')
+    expect(prompt).toContain('Place benefits in the left column and plans across the top')
+    expect(prompt).toContain('a larger neighboring card contains separate Pro and Max choices')
+    expect(prompt).toContain('a fitting background image, or a restrained shader effect')
+    expect(prompt).toContain('Use a contact form on the right or centered in the section')
+    expect(prompt).toContain('only one or two short words')
+    expect(prompt).toContain('Group destinations into columns with headings and sub-links')
+    expect(prompt).toContain('intentionally cropped by the lower edge')
+    expect(prompt).toContain('each grouped set of links inside its own card')
+    expect(prompt).toContain('one short descriptive text block')
+    const deck = /<reference-direction-deck>\s*([\s\S]*?)\s*<\/reference-direction-deck>/u.exec(
+      prompt,
+    )?.[1]
+    expect(JSON.parse(deck ?? '[]')).toHaveLength(11)
+  })
+
+  it('keeps reference geometry per section and one design language for the page', () => {
+    const deck = [
+      {
+        id: 'studio-hero',
+        family: 'hero' as const,
+        imagePath: '/library/hero.webp',
+        cue: 'Large editorial composition',
+      },
+      {
+        id: 'other-feature',
+        family: 'feature' as const,
+        imagePath: '/library/feature.webp',
+        cue: 'Three offset cards',
+      },
+    ]
+    const prompt = designPagePrompt(brief, brand, [], deck)
+    expect(prompt).toContain('ONE DESIGN LANGUAGE')
+    expect(prompt).toContain(
+      'the anchor reference (the deck entry whose role is "anchor"; in a deck without roles, the hero reference',
+    )
+    expect(prompt).toContain(
+      'References are drawn at random around the one anchor reference defined above',
+    )
+    expect(prompt).toContain(
+      'drawn first from the anchor\'s own source site (role "same-site"), then from the most similar sites ("similar-site"), and only then from the wider library ("fallback")',
+    )
+    expect(prompt).toContain(
+      'Decks saved before anchor sampling were drawn independently for each family',
+    )
+    expect(prompt).toContain('prefer the one closer to the anchor')
+    expect(prompt).toContain(
+      "render the section in the page's one design language: brand palette, approved font families, the designTokens type scale",
+    )
+    expect(prompt).toContain(
+      "Derive architecture.signatureRule from the anchor reference's geometry",
+    )
+    expect(prompt).toContain("render it in the brand's one label style")
+    expect(prompt).not.toContain("Do not fall back to one source site's look")
+    expect(prompt).not.toContain("preserve each reference's individual type scale")
+    expect(prompt).not.toContain('Keep type proportions, case, media count, crops, borders, radii')
+    expect(
+      designPagePrompt(
+        { ...brief, pageType: 'dashboard', originalRequest: 'Build an analytics dashboard' },
+        brand,
+        [],
+        [{ ...deck[0]!, id: 'workspace', family: 'dashboard' as const }],
+      ),
+    ).toContain('That reference is the anchor: every view and region uses its one type')
+  })
+
+  it('persists and validates the selected visual reference', () => {
+    const prompt = designPagePrompt(brief, brand)
+    const deck = JSON.parse(
+      /<reference-direction-deck>\s*([\s\S]*?)\s*<\/reference-direction-deck>/u.exec(prompt)?.[1] ??
+        '[]',
+    )
+    expect(() => parsePagePhaseOutput(JSON.stringify(page), deck)).toThrow(
+      'referenceDirectionId must identify an attached user reference or internal direction',
+    )
+
+    const internalLocked = parsePagePhaseOutput(
+      JSON.stringify({
+        ...page,
+        sections: [{ ...page.sections[0], referenceDirectionId: deck[0].id }],
+      }),
+      deck,
+    )
+    expect(internalLocked.sections[0]?.referenceDirectionId).toBe(deck[0].id)
+
+    const userLocked = parsePagePhaseOutput(
+      JSON.stringify({
+        ...page,
+        sections: [{ ...page.sections[0], referenceDirectionId: 'user-reference-1' }],
+      }),
+      deck,
+      ['user-reference-1'],
+    )
+    expect(userLocked.sections[0]?.referenceDirectionId).toBe('user-reference-1')
+
+    expect(() => parsePagePhaseOutput(JSON.stringify(page), [], ['user-reference-1'])).toThrow(
+      'referenceDirectionId must identify an attached user reference or internal direction',
+    )
+    expect(() =>
+      parsePagePhaseOutput(
+        JSON.stringify({
+          ...page,
+          sections: [{ ...page.sections[0], referenceDirectionId: deck[0].id }],
+        }),
+        deck,
+        ['user-reference-1'],
+      ),
+    ).toThrow('page must select at least one attached user reference')
+  })
+
+  it('parses the final response through the page validator', () => {
+    expect(parsePagePhaseOutput(JSON.stringify(page))).toEqual(page)
+  })
+  it('uses reviewed image IDs instead of imposing legacy layout recipes on new runs', () => {
+    const deck = [
+      {
+        id: 'studio-hero',
+        family: 'hero' as const,
+        imagePath: '/library/desktop.png',
+        mobileImagePath: '/library/mobile.png',
+        cue: 'Large editorial composition',
+      },
+    ]
+    const prompt = designPagePrompt(brief, brand, [], deck)
+    expect(prompt).toContain('/library/mobile.png')
+    expect(prompt).not.toContain('Use the following beta layout cases')
+    const result = parsePagePhaseOutput(
+      JSON.stringify({
+        ...page,
+        navigationDesign: { ...page.navigationDesign, layoutCase: 'reference-navigation' },
+        sections: [
+          {
+            ...page.sections[0],
+            referenceDirectionId: 'studio-hero',
+            layoutCases: ['studio-hero'],
+          },
+        ],
+      }),
+      deck,
+      [],
+      true,
+    )
+    expect(result.sections[0]?.layoutCases).toEqual(['studio-hero'])
+    expect(() =>
+      parsePagePhaseOutput(
+        JSON.stringify({
+          ...result,
+          sections: [{ ...result.sections[0], referenceDirectionId: 'unknown' }],
+        }),
+        deck,
+        [],
+        true,
+      ),
+    ).toThrow('must identify')
+  })
+
+  it('rejects page-phase output without a concrete layout selection', () => {
+    const { layoutFamily: _layoutFamily, layoutCases: _layoutCases, ...section } = page.sections[0]!
+
+    expect(() => parsePagePhaseOutput(JSON.stringify({ ...page, sections: [section] }))).toThrow(
+      'must select a layoutFamily and layoutCases',
+    )
+  })
+
+  it('plans a complete operating dashboard and round-trips its saved reference through the page lock', () => {
+    const appBrief = {
+      ...brief,
+      pageType: 'dashboard',
+      originalRequest: 'Build an analytics dashboard',
+    }
+    const deck = [
+      {
+        id: 'analytics-workspace',
+        family: 'dashboard' as const,
+        imagePath: '/library/desktop.webp',
+        mobileImagePath: '/library/mobile.webp',
+        cue: 'Sidebar, filters, chart and activity table.',
+      },
+    ]
+    const prompt = designPagePrompt(appBrief, brand, [], deck)
+    expect(prompt).toContain('Use architecture.mode operate_monitor and layoutFamily dashboard')
+    expect(prompt).toContain('single complete shell')
+    expect(prompt).toContain('representative local data')
+    expect(prompt).not.toContain('normally plan at least eight')
+    expect(prompt).not.toContain('Plan hero and media entrances')
+    expect(prompt).not.toContain('Plan and implement a visible hero entrance')
+    const result = parsePagePhaseOutput(
+      JSON.stringify({
+        ...page,
+        architecture: { ...page.architecture, mode: 'operate_monitor' },
+        sections: [
+          {
+            ...page.sections[0],
+            id: 'workspace',
+            layoutFamily: 'dashboard',
+            referenceDirectionId: 'analytics-workspace',
+            layoutCases: ['analytics-workspace'],
+          },
+        ],
+      }),
+      deck,
+      [],
+      true,
+    )
+    expect(result.architecture.mode).toBe('operate_monitor')
+    expect(result.sections[0]?.referenceDirectionId).toBe('analytics-workspace')
+    const demoPage = {
+      ...result,
+      sections: [
+        {
+          ...result.sections[0],
+          copy: {
+            heading: 'Revenue',
+            body: ['Demo data', 'Revenue $24,000', '26 orders'],
+            callsToAction: [],
+          },
+        },
+      ],
+    }
+    expect(() => parsePagePhaseOutput(JSON.stringify(demoPage), deck, [], true)).not.toThrow()
+    for (const copy of [
+      { heading: 'Balance $12,400', body: ['Demo data'], callsToAction: [] },
+      { heading: 'Demo data', body: ['Balance $12,400'], callsToAction: [] },
+    ]) {
+      expect(() =>
+        parsePagePhaseOutput(
+          JSON.stringify({ ...demoPage, sections: [{ ...demoPage.sections[0], copy }] }),
+          deck,
+          [],
+          true,
+        ),
+      ).not.toThrow()
+    }
+    expect(() =>
+      parsePagePhaseOutput(
+        JSON.stringify({
+          ...demoPage,
+          sections: [
+            {
+              ...demoPage.sections[0],
+              copy: { ...demoPage.sections[0]!.copy, body: ['Demo data', 'Reduce costs by 20%'] },
+            },
+          ],
+        }),
+        deck,
+        [],
+        true,
+      ),
+    ).toThrow('copy/objective-claim')
+    expect(() =>
+      parsePagePhaseOutput(
+        JSON.stringify({
+          ...demoPage,
+          sections: [
+            {
+              ...demoPage.sections[0],
+              copy: { ...demoPage.sections[0]!.copy, body: ['$24,000 revenue'] },
+            },
+          ],
+        }),
+        deck,
+        [],
+        true,
+      ),
+    ).toThrow('copy/objective-claim')
+    expect(() =>
+      parsePagePhaseOutput(
+        JSON.stringify({ ...result, sections: [{ ...result.sections[0], layoutFamily: 'hero' }] }),
+        deck,
+        [],
+        true,
+      ),
+    ).toThrow('must belong to hero')
+  })
+
+  it('rejects cases from a different layout family', () => {
+    expect(() =>
+      parsePagePhaseOutput(
+        JSON.stringify({
+          ...page,
+          sections: [{ ...page.sections[0], layoutCases: ['feature-grid-3'] }],
+        }),
+      ),
+    ).toThrow('not a hero case')
+  })
+
+  it('allows feature compositions for how-it-works sections', () => {
+    expect(() =>
+      parsePagePhaseOutput(
+        JSON.stringify({
+          ...page,
+          sections: [
+            {
+              ...page.sections[0],
+              layoutFamily: 'how_it_works',
+              layoutCases: ['feature-heading-5', 'feature-grid-3'],
+            },
+          ],
+        }),
+      ),
+    ).not.toThrow()
+  })
+
+  it('rejects the same composition in adjacent sections', () => {
+    expect(() =>
+      parsePagePhaseOutput(
+        JSON.stringify({
+          ...page,
+          sections: [page.sections[0], { ...page.sections[0], id: 'hero-followup' }],
+        }),
+      ),
+    ).toThrow('adjacent sections must not repeat the same layout composition')
+  })
+})

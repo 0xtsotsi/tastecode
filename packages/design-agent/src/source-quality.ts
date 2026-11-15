@@ -1,0 +1,392 @@
+import { createHash } from 'node:crypto'
+import path from 'node:path'
+import type { AssetManifest } from './assets.js'
+import type { PageBlueprint } from './page.js'
+import {
+  containedWorkspaceFile,
+  DesignScanLimitError,
+  readWorkspaceFile,
+  workspaceEntries,
+  normalizeWorkspaceFile,
+} from './workspace-files.js'
+
+const MAX_SOURCE_SCAN_BYTES = 32_000_000
+
+export class DesignSourceQualityError extends Error {}
+
+/** Reject the recurring generated card-rail motif before Preview and after Repair. */
+export function validateDesignSourceQuality(
+  workspacePath: string,
+  reportedFiles: readonly string[] = [],
+  baseline: readonly string[] = [],
+  assets?: AssetManifest,
+  page?: PageBlueprint,
+): void {
+  // Reported folders such as dist are informational; their files are scanned below.
+  for (const file of reportedFiles)
+    containedWorkspaceFile(workspacePath, file, 'reported Build file', true)
+  const previous = new Map<string, number>()
+  for (const violation of baseline) previous.set(violation, (previous.get(violation) ?? 0) + 1)
+  // Source patterns cannot distinguish a copied reference border from invented decoration.
+  // Reference-bound geometry is judged against the actual images in visual Review.
+  const referenceBound =
+    !!page?.sections.length && page.sections.every((section) => section.referenceDirectionId)
+  // Native chart/icon SVG, inline or as a standalone icon file, belongs to the implemented
+  // dashboard, not the acquired asset set. So do the 1px dividers an app screen uses between
+  // KPI cells and panels. Visual Review checks them against the locked screen references or
+  // the dealt app sheet; an app screen has no references, so this does not require them.
+  const nativeDashboard =
+    !!page?.sections.length &&
+    page.architecture?.mode === 'operate_monitor' &&
+    page.sections.every((section) => section.layoutFamily === 'dashboard')
+  const violations = designSourceViolations(
+    workspacePath,
+    assets,
+    referenceBound || nativeDashboard,
+    nativeDashboard,
+  ).filter((violation) => {
+    const remaining = previous.get(violation) ?? 0
+    if (!remaining) return true
+    previous.set(violation, remaining - 1)
+    return false
+  })
+  if (violations.length) {
+    throw new DesignSourceQualityError(
+      `design source quality failed; remove newly introduced card rails or unmanifested SVG substitutes: ${countedViolations(violations)}`,
+    )
+  }
+}
+
+/** One entry per distinct violation, so a repeated fragment reads once with its count. */
+function countedViolations(violations: readonly string[]): string {
+  const counts = new Map<string, number>()
+  for (const violation of violations) counts.set(violation, (counts.get(violation) ?? 0) + 1)
+  return [...counts]
+    .map(([violation, count]) => (count > 1 ? `${violation} (${count}×)` : violation))
+    .join('; ')
+}
+
+export function designSourceQualityBaseline(
+  workspacePath: string,
+  assets?: AssetManifest,
+): string[] {
+  return designSourceViolations(workspacePath, assets)
+}
+
+function designSourceViolations(
+  workspacePath: string,
+  assets?: AssetManifest,
+  referenceBound = false,
+  nativeDashboard = false,
+): string[] {
+  const violations: string[] = []
+  const cardRails: string[] = []
+  const approvedSvgFiles = new Set(
+    (assets?.assets ?? []).flatMap((asset) => {
+      if (!asset.role || !['functional_icon', 'logo', 'data_diagram'].includes(asset.role)) {
+        return []
+      }
+      const approvedPath =
+        asset.status === 'ready' && asset.source && asset.destination
+          ? asset.destination
+          : asset.status === 'existing' && asset.source?.kind === 'project'
+            ? asset.source.reference
+            : asset.status === 'existing' && asset.source?.kind === 'user'
+              ? asset.destination
+              : undefined
+      const normalized = approvedPath ? normalizeWorkspaceFile(approvedPath) : undefined
+      return normalized &&
+        ['.svg', '.html', '.jsx', '.tsx', '.vue', '.svelte'].includes(
+          path.extname(normalized).toLowerCase(),
+        )
+        ? [normalized]
+        : []
+    }),
+  )
+  let totalBytes = 0
+  for (const normalized of designSourceFiles(workspacePath)) {
+    const extension = path.extname(normalized).toLowerCase()
+    const absolute = path.join(workspacePath, normalized)
+    // HTML can embed reference images; bound it by the same budget as the full scan.
+    const bytes = readWorkspaceFile(absolute, MAX_SOURCE_SCAN_BYTES)
+    totalBytes += bytes.length
+    if (totalBytes > MAX_SOURCE_SCAN_BYTES)
+      throw new DesignScanLimitError('Design source scan exceeds 32 MB')
+    const source = bytes.toString('utf8').replace(/\/\*[\s\S]*?\*\//g, '')
+
+    if (extension === '.svg') {
+      // A browser or app icon file and a single icon glyph are interface, not a drawn substitute
+      // for imagery; a standalone illustration still is, in a dashboard too.
+      if (
+        !approvedSvgFiles.has(normalized) &&
+        !SITE_ICON_FILE.test(path.posix.basename(normalized)) &&
+        !isIconSvg(source)
+      ) {
+        violations.push(
+          `${normalized}: unmanifested standalone SVG substitute ${sourceFingerprint(source)}`,
+        )
+      }
+      continue
+    }
+
+    if (['.css', '.scss', '.sass', '.less'].includes(extension)) {
+      scanCssCardRails(source, normalized, cardRails)
+    } else if (extension === '.vue' || extension === '.svelte' || extension === '.html') {
+      for (const style of source.matchAll(/<style\b[^>]*>([\s\S]*?)<\/style>/gi)) {
+        scanCssCardRails(style[1]!, normalized, cardRails)
+      }
+    } else {
+      for (const match of source.matchAll(/(?:css|styled(?:\.\w+|\([^)]*\)))\s*`([\s\S]*?)`/g)) {
+        const css = match[1] ?? ''
+        scanCssCardRails(css, normalized, cardRails)
+        const declarationContext = source.slice(Math.max(0, match.index! - 160), match.index)
+        if (isCardLike(declarationContext)) {
+          scanCssCardRails(`.generated-card { ${css} }`, normalized, cardRails)
+        }
+      }
+    }
+    scanMarkupCardRails(source, normalized, cardRails)
+    if (!nativeDashboard && !approvedSvgFiles.has(normalized)) {
+      for (const fragment of svgFragments(source)) {
+        // Inline arrows, checks and menu glyphs are icons, however often a page repeats them.
+        if (isIconSvg(fragment)) continue
+        violations.push(
+          `${normalized}: unmanifested inline SVG substitute ${sourceFingerprint(fragment)}`,
+        )
+      }
+    }
+  }
+  return (referenceBound ? violations : [...violations, ...cardRails]).sort()
+}
+
+/** Files a browser or OS shows as the site's icon (favicon.svg, Next.js app/icon.svg, …). */
+const SITE_ICON_FILE =
+  /^(?:favicon|icon|apple-icon|apple-touch-icon|mask-icon|safari-pinned-tab)(?:[-_.@][\w.@-]*)?\.svg$/i
+
+/** Icon sets ship glyphs of a few hundred bytes to a few KB; larger files are artwork. */
+const ICON_SVG_MAX_BYTES = 6_000
+const ICON_SVG_MAX_GRID = 640
+
+/**
+ * A standalone SVG that reads as one icon glyph: small, roughly square, and free of raster
+ * images, text, gradients, patterns and filters, which mark illustrations and drawn stand-ins.
+ */
+function isIconSvg(source: string): boolean {
+  const markup = source.replace(/<!--[\s\S]*?-->/g, '')
+  if (Buffer.byteLength(markup) > ICON_SVG_MAX_BYTES) return false
+  if (/<(?:image|text|foreignObject|linearGradient|radialGradient|pattern|filter)\b/i.test(markup))
+    return false
+  // An empty frame draws nothing; an icon draws at least one shape.
+  if (!/<(?:path|circle|ellipse|rect|line|polyline|polygon|use)\b/i.test(markup)) return false
+  const root = /<svg\b[^>]*>/i.exec(markup)?.[0]
+  const box = root ? svgBox(root) : undefined
+  if (!box) return false
+  const ratio = box.width / box.height
+  // Icon sets draw on grids of 16 to 512 units (Font Awesome up to 640x512); a scene drawn
+  // on a 1200-unit canvas is artwork even when it is small and square enough.
+  return ratio >= 0.5 && ratio <= 2 && Math.max(box.width, box.height) <= ICON_SVG_MAX_GRID
+}
+
+/** The drawing box of a root `<svg>` tag from its viewBox, or from numeric width and height. */
+function svgBox(tag: string): { width: number; height: number } | undefined {
+  const viewBox = /(?<![\w:-])viewBox\s*=\s*["']([^"']*)["']/i.exec(tag)?.[1]
+  if (viewBox !== undefined) {
+    const [, , width, height, ...rest] = viewBox
+      .trim()
+      .split(/[\s,]+/)
+      .map(Number)
+    return width! > 0 && height! > 0 && !rest.length
+      ? { width: width!, height: height! }
+      : undefined
+  }
+  const length = (name: string) => {
+    const value = new RegExp(
+      `(?<![\\w:-])${name}\\s*=\\s*["']\\s*([\\d.]+)(?:px)?\\s*["']`,
+      'i',
+    ).exec(tag)?.[1]
+    const amount = Number(value)
+    return amount > 0 ? amount : undefined
+  }
+  const width = length('width')
+  const height = length('height')
+  return width && height ? { width, height } : undefined
+}
+
+function sourceFingerprint(source: string): string {
+  return createHash('sha256').update(source).digest('hex').slice(0, 12)
+}
+
+function* svgFragments(source: string): Generator<string> {
+  let start: number | undefined
+  let depth = 0
+  for (const match of source.matchAll(/<svg\b[^<>]*\/>|<svg\b|<\/svg\s*>/gi)) {
+    if (match[0][1] !== '/') {
+      if (match[0].endsWith('/>')) {
+        if (depth === 0) yield match[0]
+      } else if (depth++ === 0) start = match.index
+    } else if (depth > 0 && --depth === 0) {
+      yield source.slice(start, match.index + match[0].length)
+      start = undefined
+    }
+  }
+  if (start !== undefined) yield source.slice(start)
+}
+
+function* cssBlocks(source: string): Generator<{ selector: string; body: string }> {
+  let segmentStart = 0
+  let bodyStart: number | undefined
+  let selector = ''
+  for (const match of source.matchAll(/[{}]/g)) {
+    if (match[0] === '{') {
+      selector = source.slice(segmentStart, match.index).trim().slice(-200)
+      bodyStart = match.index + 1
+    } else {
+      if (bodyStart !== undefined) {
+        yield { selector, body: source.slice(bodyStart, match.index) }
+      }
+      bodyStart = undefined
+    }
+    segmentStart = match.index + 1
+  }
+}
+
+function scanCssCardRails(source: string, file: string, violations: string[]): void {
+  for (const { selector, body } of cssBlocks(source)) {
+    if (!isCardLike(selector)) continue
+
+    if (
+      /\bborder-(?:left|right|inline-start|inline-end)(?:-width)?\s*:\s*(?!0(?:px|rem|em)?(?:\s|;|$)|none(?:\s|;|$))/i.test(
+        body,
+      )
+    ) {
+      violations.push(`${file}: ${selector} uses a one-sided card-edge border`)
+    }
+    if (/\bbox-shadow\s*:[^;]*\binset\b[^;]*(?:^|\s)-?(?:[1-8](?:\.\d+)?)px\s+0\b/i.test(body)) {
+      violations.push(`${file}: ${selector} uses an inset card-edge rail`)
+    }
+    if (hasNarrowHorizontalGradientRail(body)) {
+      violations.push(`${file}: ${selector} uses a narrow card-edge gradient rail`)
+    }
+
+    const fullBlock =
+      /\bheight\s*:\s*100%/i.test(body) ||
+      /\binset-block\s*:\s*0\b/i.test(body) ||
+      (/\btop\s*:\s*0\b/i.test(body) && /\bbottom\s*:\s*0\b/i.test(body)) ||
+      /\balign-self\s*:\s*stretch\b/i.test(body)
+    const atEdge =
+      /\b(?:left|right|inset-inline-start|inset-inline-end)\s*:\s*0\b/i.test(body) ||
+      /::?(?:before|after)|(?:^|[\s>+~])(?::?(?:first|last)-child|\.[\w-]*(?:rail|strip|accent|rule))/i.test(
+        selector,
+      )
+    const narrow =
+      /\b(?:width|inline-size|flex-basis)\s*:\s*(?:[1-8](?:\.\d+)?px|0?\.\d+rem)\b/i.test(body)
+    if (fullBlock && atEdge && (narrow || /::?(?:before|after)/i.test(selector))) {
+      violations.push(`${file}: ${selector} draws a full-height narrow card-edge strip`)
+    }
+  }
+}
+
+function hasNarrowHorizontalGradientRail(body: string): boolean {
+  for (const match of body.matchAll(
+    /\b(?:background|background-image)\s*:\s*([^;]*linear-gradient\([^;]*\))/gi,
+  )) {
+    const gradient = match[1] ?? ''
+    if (!/linear-gradient\(\s*(?:to\s+(?:left|right)|(?:90|270)deg)\b/i.test(gradient)) {
+      continue
+    }
+    const smallStops = new Map<string, number>()
+    for (const stop of gradient.matchAll(/(-?\d+(?:\.\d+)?)(px|rem|%)/gi)) {
+      const value = Number(stop[1])
+      const unit = stop[2]!.toLowerCase()
+      const isNarrow =
+        value >= 0 &&
+        ((unit === 'px' && value <= 8) ||
+          (unit === 'rem' && value <= 0.5) ||
+          (unit === '%' && value <= 2))
+      if (isNarrow) smallStops.set(unit, (smallStops.get(unit) ?? 0) + 1)
+    }
+    if ([...smallStops.values()].some((count) => count >= 2)) return true
+  }
+  return false
+}
+
+function scanMarkupCardRails(source: string, file: string, violations: string[]): void {
+  for (const match of source.matchAll(/class(?:Name)?\s*=\s*["'`]([^"'`]+)["'`]/g)) {
+    const classes = match[1] ?? ''
+    const tokens = classes.split(/\s+/).map((token) => token.replace(/^(?:[\w-]+:)+/u, ''))
+    if (isCardLike(classes) && tokens.some((token) => /^border-(?:l|r|s|e)(?:-|$)/u.test(token))) {
+      violations.push(`${file}: card-like class uses a one-sided border utility`)
+    }
+
+    const fullBlock =
+      tokens.includes('inset-y-0') ||
+      tokens.includes('self-stretch') ||
+      (tokens.includes('top-0') && tokens.includes('bottom-0'))
+    const atEdge = tokens.some((token) => /^(?:left|right|start|end)-0$/u.test(token))
+    const narrow = tokens.some(
+      (token) => token === 'w-px' || /^w-\[(?:[1-8](?:\.\d+)?)px\]$/u.test(token),
+    )
+    const nearby = source.slice(
+      Math.max(0, match.index! - 600),
+      match.index! + match[0].length + 600,
+    )
+    if (fullBlock && atEdge && narrow && isCardLike(nearby)) {
+      violations.push(`${file}: card markup contains a full-height narrow edge strip`)
+    }
+  }
+
+  for (const match of source.matchAll(
+    /(?:borderLeft|borderRight|borderInlineStart|borderInlineEnd)\s*:\s*([^,}\n]+)/g,
+  )) {
+    const nearby = source.slice(Math.max(0, match.index! - 500), match.index! + 500)
+    if (isCardLike(nearby) && !/^\s*(?:0|['"]none['"])/i.test(match[1] ?? '')) {
+      violations.push(`${file}: card-like inline style uses a one-sided border`)
+    }
+  }
+}
+
+function isCardLike(value: string): boolean {
+  return /(?:^|[\s.>+~#_\-"'])(?:card|tile|panel|step|feature|price|proof|testimonial|stat)(?:s|Card)?(?=$|[\s.>+~#_:\-"'])|(?:Card|Tile|Panel)\b/.test(
+    value,
+  )
+}
+
+/** Workspace source the Design checks scan: generated code, not dependencies, builds or tests. */
+export function designSourceFiles(workspacePath: string): string[] {
+  const extensions = new Set([
+    '.css',
+    '.scss',
+    '.sass',
+    '.less',
+    '.html',
+    '.js',
+    '.mjs',
+    '.cjs',
+    '.jsx',
+    '.ts',
+    '.tsx',
+    '.vue',
+    '.svelte',
+    '.svg',
+  ])
+  // Dependency and cache trees are already opaque to every workspace scan.
+  const ignoredDirectories = new Set([
+    '.git',
+    '.taste',
+    'dist',
+    'build',
+    'out',
+    'coverage',
+    'vendor',
+  ])
+  return workspaceEntries(workspacePath, ignoredDirectories)
+    .filter(
+      ({ relative, file }) =>
+        file &&
+        extensions.has(path.extname(relative).toLowerCase()) &&
+        !/(?:\.(?:test|spec)\.[cm]?[jt]sx?$|(?:^|\/)__tests__\/)/i.test(relative) &&
+        // Minified and bundled files are shipped libraries or build output, not authored design.
+        !/[.-](?:min|bundle)\.(?:[cm]?js|css)$/i.test(relative),
+    )
+    .map(({ relative }) => relative)
+}

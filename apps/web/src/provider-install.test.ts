@@ -1,0 +1,360 @@
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { TestTransport } from './test-transport.js'
+import {
+  beginInstall,
+  beginLogin,
+  cancelInstall,
+  deviceCode,
+  firstAuthUrl,
+  installKey,
+  installState,
+  lastPrintableLine,
+  loginKey,
+  resetInstalls,
+  signedInEmail,
+} from './provider-install.js'
+
+afterEach(() => {
+  vi.restoreAllMocks()
+  resetInstalls()
+})
+
+const ESC = String.fromCharCode(27)
+const BEL = String.fromCharCode(7)
+
+describe('lastPrintableLine', () => {
+  it('reports the last line a human would see, without terminal control noise', () => {
+    const log = [
+      `${ESC}]0;npm${BEL}`, // OSC title update
+      `${ESC}[32madded 12 packages${ESC}[0m`,
+      '',
+      '  ',
+    ].join('\r\n')
+    expect(lastPrintableLine(log)).toBe('added 12 packages')
+  })
+
+  it('treats a bare carriage return as a line break, the way progress bars use it', () => {
+    expect(lastPrintableLine('downloading 10%\rdownloading 99%')).toBe('downloading 99%')
+  })
+
+  it('is empty when nothing printable arrived yet', () => {
+    expect(lastPrintableLine(`${ESC}[2J`)).toBe('')
+  })
+})
+
+describe('deviceCode', () => {
+  it('finds a labelled user code', () => {
+    expect(deviceCode('Enter the code: WDJB-MJHT to continue')).toBe('WDJB-MJHT')
+    expect(deviceCode('Your one-time code 384756 expires in 15 minutes')).toBe('384756')
+  })
+
+  it('finds a bare dashed code without a label', () => {
+    expect(deviceCode('First, copy this\n\n  ABCD-1234\n\nthen press Enter')).toBe('ABCD-1234')
+  })
+
+  it('never reads a code out of a URL', () => {
+    expect(deviceCode('Visit https://example.com/activate?user_code=WDJB-MJHT')).toBeUndefined()
+    expect(deviceCode('https://github.com/login/device and code XKCD-4096\n')).toBe('XKCD-4096')
+  })
+
+  it('ignores prose and control noise', () => {
+    expect(deviceCode(`${ESC}[32mWaiting for browser approval...${ESC}[0m`)).toBeUndefined()
+    expect(deviceCode('open your dashboard for details')).toBeUndefined()
+  })
+})
+
+describe('beginInstall', () => {
+  function fakeTransport() {
+    return new TestTransport(async (method) => {
+      if (method === 'providers.install') return { terminalId: 'term-1' }
+      throw new Error(`Unexpected request: ${method}`)
+    })
+  }
+
+  it('tracks one run per target and does not start a second while one is going', async () => {
+    const transport = fakeTransport()
+    const target = { provider: 'acp' as const, agent: 'gemini' }
+    await beginInstall(transport, target)
+    await beginInstall(transport, target)
+    expect(
+      transport.requests.filter((request) => request.method !== 'terminal.status'),
+    ).toHaveLength(1)
+    expect(installState(installKey(target))?.phase).toBe('running')
+  })
+
+  it('keeps the log and marks failure with the exit code when the command dies', async () => {
+    const transport = fakeTransport()
+    const target = { provider: 'opencode' as const }
+    await beginInstall(transport, target)
+
+    transport.emit('terminal.output', { terminalId: 'term-1', data: 'npm ERR! EACCES\r\n' })
+    transport.emit('terminal.exit', { terminalId: 'term-1', exitCode: 243 })
+
+    const state = installState(installKey(target))
+    expect(state?.phase).toBe('failed')
+    expect(state?.exitCode).toBe(243)
+    expect(state?.lastLine).toBe('npm ERR! EACCES')
+    expect(state?.log).toContain('EACCES')
+  })
+
+  it('marks success on a clean exit so the UI can refresh the provider list', async () => {
+    const transport = fakeTransport()
+    const target = { provider: 'opencode' as const }
+    await beginInstall(transport, target)
+
+    transport.emit('terminal.exit', { terminalId: 'term-1', exitCode: 0 })
+    expect(installState(installKey(target))?.phase).toBe('succeeded')
+  })
+})
+
+describe('beginLogin', () => {
+  function fakeTransport() {
+    return new TestTransport(async (method) => {
+      if (method === 'providers.install' || method === 'providers.launch') {
+        return { terminalId: 'term-login-1' }
+      }
+      throw new Error(`Unexpected request: ${method}`)
+    })
+  }
+
+  it('asks the server to launch the sign-in CLI, never naming a command', async () => {
+    const transport = fakeTransport()
+    await beginLogin(transport, { provider: 'acp', agent: 'gemini' })
+    expect(transport.requests).toContainEqual({
+      method: 'providers.launch',
+      params: { provider: 'acp', agent: 'gemini', columns: 320, rows: 30 },
+    })
+  })
+
+  it('signs in as a further account in a terminal of its own', async () => {
+    const transport = fakeTransport()
+    await beginLogin(transport, { provider: 'codex', accountId: 'work' }, () => {})
+    await beginLogin(transport, { provider: 'codex', accountId: 'default' }, () => {})
+    const launches = transport.requests.filter((request) => request.method === 'providers.launch')
+    expect(launches.map((request) => request.params)).toEqual([
+      { provider: 'codex', accountId: 'work', columns: 320, rows: 30 },
+      { provider: 'codex', columns: 320, rows: 30 },
+    ])
+    expect(loginKey({ provider: 'codex', accountId: 'work' })).toBe('login:codex@work')
+    expect(loginKey({ provider: 'codex', accountId: 'default' })).toBe(
+      loginKey({ provider: 'codex' }),
+    )
+    expect(installState('login:codex@work')?.phase).toBe('running')
+    expect(installState(loginKey({ provider: 'codex' }))?.phase).toBe('running')
+  })
+
+  it('keeps a login and an install for the same target apart in the store', async () => {
+    const transport = fakeTransport()
+    const target = { provider: 'opencode' as const }
+    await beginInstall(transport, target)
+    await beginLogin(transport, target)
+    expect(loginKey(target)).not.toBe(installKey(target))
+    expect(installState(installKey(target))?.phase).toBe('running')
+    expect(installState(loginKey(target))?.phase).toBe('running')
+    expect(
+      transport.requests.filter((request) => request.method !== 'terminal.status'),
+    ).toHaveLength(2)
+  })
+
+  it('reattaches instead of launching twice while a login is running', async () => {
+    const transport = fakeTransport()
+    const target = { provider: 'acp' as const, agent: 'kimi' }
+    await beginLogin(transport, target, () => {})
+    await beginLogin(transport, target, () => {})
+    expect(
+      transport.requests.filter((request) => request.method !== 'terminal.status'),
+    ).toHaveLength(1)
+  })
+
+  it('opens the first auth URL the CLI prints, exactly once', async () => {
+    const transport = new TestTransport(async (method) => {
+      if (method === 'providers.launch') return { terminalId: 'term-login-2' }
+      throw new Error(`Unexpected request: ${method}`)
+    })
+    const opened: string[] = []
+
+    await beginLogin(transport, { provider: 'acp', agent: 'gemini' }, (url) => opened.push(url))
+    transport.emit('terminal.output', {
+      terminalId: 'term-login-2',
+      data: 'Starting sign-in...\r\n',
+    })
+    transport.emit('terminal.output', {
+      terminalId: 'term-login-2',
+      data: 'Open this URL: https://accounts.example.test/auth?code=abc\r\n',
+    })
+    transport.emit('terminal.output', {
+      terminalId: 'term-login-2',
+      data: 'Or later https://example.test/other\r\n',
+    })
+
+    expect(opened).toEqual(['https://accounts.example.test/auth?code=abc'])
+    expect(installState(loginKey({ provider: 'acp', agent: 'gemini' }))?.openedAuthUrl).toBe(
+      'https://accounts.example.test/auth?code=abc',
+    )
+  })
+})
+
+describe('firstAuthUrl', () => {
+  const ESCAPE = String.fromCharCode(27)
+
+  it('finds the URL under terminal control noise', () => {
+    expect(firstAuthUrl(`${ESCAPE}[32mVisit https://x.test/login?a=1${ESCAPE}[0m now`)).toBe(
+      'https://x.test/login?a=1',
+    )
+  })
+
+  it('is empty when the CLI has not printed a link yet', () => {
+    expect(firstAuthUrl('warming up...')).toBeUndefined()
+  })
+
+  it('keeps terminal text out of an xAI device code', () => {
+    expect(
+      firstAuthUrl('https://accounts.x.ai/oauth2/device?user_code=XCG6-Q2QCConfirm this code\r\n'),
+    ).toBe('https://accounts.x.ai/oauth2/device?user_code=XCG6-Q2QC')
+  })
+
+  it('skips a link that does not parse instead of throwing', () => {
+    expect(firstAuthUrl('Listening on http://localhost:${PORT} ')).toBeUndefined()
+    expect(firstAuthUrl('bad https://host:99999/x then https://x.test/device ')).toBe(
+      'https://x.test/device',
+    )
+  })
+
+  it('stops a link at a closing bracket', () => {
+    expect(firstAuthUrl('Open [https://a.test/device](https://a.test/device)\n')).toBe(
+      'https://a.test/device',
+    )
+  })
+})
+
+describe('signedInEmail', () => {
+  it('reads the account confirmed by the provider CLI', () => {
+    expect(signedInEmail(`${ESC}[32m✓ Signed in as grok.user@example.com${ESC}[0m`)).toBe(
+      'grok.user@example.com',
+    )
+    expect(signedInEmail('Waiting for authorization...')).toBeUndefined()
+  })
+})
+
+describe('cancelInstall', () => {
+  it('stops the owned sign-in once and ignores late output and exit events', async () => {
+    let finishClose!: () => void
+    let run = 0
+    const transport = new TestTransport(async (method) => {
+      if (method === 'providers.launch') return { terminalId: `login-${++run}` }
+      if (method === 'terminal.close') {
+        await new Promise<void>((resolve) => {
+          finishClose = resolve
+        })
+        return {}
+      }
+      throw new Error(`unexpected ${method}`)
+    })
+    const open = vi.fn()
+    const target = { provider: 'claude-code' as const }
+    const key = loginKey(target)
+    await beginLogin(transport, target, open)
+    const cancel = cancelInstall(transport, key)
+    expect(cancelInstall(transport, key)).toBe(cancel)
+    await vi.waitFor(() => expect(installState(key)?.canceling).toBe(true))
+    transport.emit('terminal.output', {
+      terminalId: 'login-1',
+      data: 'https://example.test/auth\n',
+    })
+    expect(open).not.toHaveBeenCalled()
+    expect(installState(key)?.phase).toBe('running')
+    finishClose()
+    await cancel
+    expect(installState(key)?.phase).toBe('canceled')
+    await beginLogin(transport, target, open)
+    transport.emit('terminal.exit', { terminalId: 'login-1', exitCode: 130 })
+    expect(installState(key)?.terminalId).toBe('login-2')
+    expect(installState(key)?.phase).toBe('running')
+    expect(transport.requests.filter(({ method }) => method === 'terminal.close')).toEqual([
+      { method: 'terminal.close', params: { terminalId: 'login-1' } },
+    ])
+  })
+
+  it('stays canceled when the stopped CLI exits before the stop answers', async () => {
+    let finishClose!: () => void
+    let answerStatus!: () => void
+    let closing = false
+    const transport = new TestTransport(async (method) => {
+      if (method === 'providers.launch') return { terminalId: 'login-hangup' }
+      if (method === 'terminal.status') {
+        if (!closing) return { status: 'running', output: '', outputOffset: 0, exitCode: null }
+        await new Promise<void>((resolve) => {
+          answerStatus = resolve
+        })
+        return { status: 'exited', output: '', outputOffset: 0, exitCode: 129 }
+      }
+      if (method === 'terminal.close') {
+        closing = true
+        await new Promise<void>((resolve) => {
+          finishClose = resolve
+        })
+        return {}
+      }
+      throw new Error(`unexpected ${method}`)
+    })
+    const target = { provider: 'claude-code' as const }
+    const key = loginKey(target)
+    await beginLogin(transport, target, () => {})
+    const cancel = cancelInstall(transport, key)
+    await vi.waitFor(() => expect(installState(key)?.canceling).toBe(true))
+    transport.emit('terminal.exit', { terminalId: 'login-hangup', exitCode: 129 })
+    // Nothing is left to stop once the CLI is gone, even before the stop answers.
+    expect(installState(key)).toMatchObject({ phase: 'canceled', canceling: false })
+    finishClose()
+    await cancel
+    answerStatus()
+    await vi.waitFor(() =>
+      expect(transport.requests.filter(({ method }) => method === 'terminal.status')).toHaveLength(
+        2,
+      ),
+    )
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(installState(key)).toMatchObject({ phase: 'canceled', canceling: false, exitCode: 129 })
+  })
+
+  it('keeps a failed stop available for retry', async () => {
+    let rejectClose = true
+    const transport = new TestTransport(async (method) => {
+      if (method === 'providers.launch') return { terminalId: 'login-retry' }
+      if (method === 'terminal.close') {
+        if (rejectClose) throw new Error('Could not stop sign-in')
+        return {}
+      }
+      throw new Error(`unexpected ${method}`)
+    })
+    const target = { provider: 'codex' as const }
+    await beginLogin(transport, target, () => {})
+    await expect(cancelInstall(transport, loginKey(target))).rejects.toThrow('Could not stop')
+    expect(installState(loginKey(target))).toMatchObject({ phase: 'running', canceling: false })
+    rejectClose = false
+    await cancelInstall(transport, loginKey(target))
+    expect(installState(loginKey(target))?.phase).toBe('canceled')
+  })
+
+  it('cancels a terminal that arrives after cancellation was requested', async () => {
+    let launched!: (value: { terminalId: string }) => void
+    const transport = new TestTransport(async (method) => {
+      if (method === 'providers.launch')
+        return new Promise((resolve) => {
+          launched = resolve
+        })
+      if (method === 'terminal.close') return {}
+      throw new Error(`unexpected ${method}`)
+    })
+    const target = { provider: 'grok' as const }
+    const start = beginLogin(transport, target, () => {})
+    const cancel = cancelInstall(transport, loginKey(target))
+    launched({ terminalId: 'late-login' })
+    await Promise.all([start, cancel])
+    expect(installState(loginKey(target))?.phase).toBe('canceled')
+    expect(transport.requests).toContainEqual({
+      method: 'terminal.close',
+      params: { terminalId: 'late-login' },
+    })
+  })
+})

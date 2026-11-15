@@ -1,0 +1,54 @@
+pnpm-lock.yaml
+dist/
+dist-electron/
+out/
+build/
+coverage/
+node_modules/
+target/
+.agent/
+.agents/
+.claude/
+.codex/
+.continue/
+.cursor/
+.gemini/
+.harness/
+.opencode/
+.osaku/
+.pi/
+.roo/
+.windsurf/
+tools/oxlint/anti-slop/
+
+# Icon Composer owns this bundle's JSON layout.
+apps/desktop/assets/*.icon/
+apps/mobile/assets/*.icon/
+
+# Vendor protocol bindings. Produced by `codex app-server generate-ts`;
+# reformatting them would make every regeneration a noisy diff.
+packages/adapter-codex/src/generated/
+
+# Unmodified tasteskill files; provenance.json pins their SHA-256 and a test checks it.
+packages/design-agent/references/app-screens/app.json
+packages/design-agent/references/app-screens/app-screens.md
+packages/design-agent/references/app-screens/app.css
+packages/design-agent/references/app-screens/charts.js
+packages/design-agent/references/tasteskill-web/SKILL.md
+packages/design-agent/references/tasteskill-web/copy.md
+packages/design-agent/references/tasteskill-web/layout-v4.md
+packages/design-agent/references/tasteskill-web/motion.md
+packages/design-agent/references/tasteskill-web/photos.md
+
+# Expo generates these from app.json; they are not checked in.
+apps/mobile/ios/
+apps/mobile/android/
+apps/mobile/.expo/
+
+# Upstream skill files, fetched by packages/default-skills (gitignored).
+packages/default-skills/bundle/
+
+# Upstream skill text with TasteCode's edits; kept in the upstream's own wrapping so the
+# edits stay readable against it.
+packages/default-skills/patches/*/SKILL.md
+packages/default-skills/patches/*/references/

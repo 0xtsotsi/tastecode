@@ -1,0 +1,186 @@
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { describe, expect, it } from 'vitest'
+import { argumentPromptLimit, captureCli, quoteCmdArgument, spawnCli } from './cli.js'
+
+const argumentsToPreserve = [
+  '',
+  'plain',
+  '--version',
+  'repos/owner/repo/pulls/1/files?per_page=100&page=1',
+  'a&b|c<d>e^f%PATH%!NAME!(g)',
+  'two words',
+  'a\tb',
+  '"quoted"',
+  'a\\"b',
+  'path with spaces\\',
+  'path with spaces\\\\',
+  '"; echo unintended & rem "',
+  '日本語 with spaces',
+]
+
+function unescapeCmd(value: string): string {
+  return value.replace(/\^(.)/gs, '$1')
+}
+
+function parseWindowsArgument(value: string): string {
+  let result = ''
+  let backslashes = 0
+  for (const character of value) {
+    if (character === '\\') {
+      backslashes += 1
+      continue
+    }
+    if (character === '"') {
+      result += '\\'.repeat(Math.floor(backslashes / 2))
+      if (backslashes % 2) result += '"'
+    } else {
+      result += '\\'.repeat(backslashes) + character
+    }
+    backslashes = 0
+  }
+  return result + '\\'.repeat(backslashes)
+}
+
+describe('cmd argument quoting', () => {
+  it.each(['plain', '--version', 'owner/repository', 'C:\\safe\\path\\', 'name=value'])(
+    'leaves safe argument %s unchanged',
+    (value) => {
+      expect(quoteCmdArgument(value)).toBe(value)
+      expect(quoteCmdArgument(value, true)).toBe(value)
+    },
+  )
+
+  it.each(['&', '|', '<', '>', '^', '%', '!', '"', '(', ')', ' ', '\t'])(
+    'escapes cmd metacharacter %j, not just spaces',
+    (character) => {
+      const value = `a${character}b`
+      const escaped = character === '"' ? '\\^"' : `^${character}`
+      expect(quoteCmdArgument(value)).toBe(`^"a${escaped}b^"`)
+    },
+  )
+
+  it.each([false, true])('round-trips Windows argv with batch=%s', (batch) => {
+    for (const value of argumentsToPreserve) {
+      let command = quoteCmdArgument(value, batch)
+      if (batch) command = unescapeCmd(command)
+      expect(parseWindowsArgument(unescapeCmd(command))).toBe(value)
+    }
+  })
+
+  it('escapes both parses of forwarding batch shims', () => {
+    expect(quoteCmdArgument('a&b', true)).toBe('^^^"a^^^&b^^^"')
+    expect(quoteCmdArgument('', true)).toBe('^^^"^^^"')
+  })
+
+  it.each(['a\nb', 'a\rb', 'a\0b'])('rejects unrepresentable batch input %j', (value) => {
+    expect(() => quoteCmdArgument(value)).toThrow('line breaks or NUL')
+    expect(() => quoteCmdArgument(value, true)).toThrow('line breaks or NUL')
+  })
+
+  it.skipIf(process.platform !== 'win32')(
+    'preserves literal arguments through an actual forwarding cmd shim',
+    async () => {
+      const directory = mkdtempSync(path.join(os.tmpdir(), 'harness-cli-'))
+      try {
+        const command = path.join(directory, 'echo args.cmd')
+        writeFileSync(command, `@echo off\r\n"${process.execPath}" "%~dp0echo.cjs" %*\r\n`)
+        writeFileSync(
+          path.join(directory, 'echo.cjs'),
+          'process.stdout.write(JSON.stringify(process.argv.slice(2)))',
+        )
+        const result = await captureCli(
+          spawnCli(command, argumentsToPreserve, {
+            env: { NAME: 'must-not-expand' },
+          }),
+        )
+        expect(result.code).toBe(0)
+        expect(JSON.parse(result.stdout)).toEqual(argumentsToPreserve)
+      } finally {
+        rmSync(directory, { recursive: true, force: true })
+      }
+    },
+  )
+  it.skipIf(process.platform !== 'win32')(
+    'does not run a shim from the working directory for a command missing from PATH',
+    async () => {
+      const workspace = mkdtempSync(path.join(os.tmpdir(), 'harness-cwd-'))
+      try {
+        writeFileSync(
+          path.join(workspace, 'harness-missing-tool.cmd'),
+          '@echo off\r\necho shadowed\r\n',
+        )
+        const result = await captureCli(spawnCli('harness-missing-tool', [], { cwd: workspace }))
+        expect(result.stdout).not.toContain('shadowed')
+        expect(result.code).not.toBe(0)
+      } finally {
+        rmSync(workspace, { recursive: true, force: true })
+      }
+    },
+  )
+
+  it.skipIf(process.platform !== 'win32')(
+    'runs the PATH command, not a same-named shim in the working directory',
+    async () => {
+      const workspace = mkdtempSync(path.join(os.tmpdir(), 'harness-cwd-'))
+      try {
+        writeFileSync(path.join(workspace, 'node.cmd'), '@echo off\r\necho shadowed\r\n')
+        const result = await captureCli(
+          spawnCli('node', ['-e', 'process.stdout.write("real")'], { cwd: workspace }),
+        )
+        expect(result.code).toBe(0)
+        expect(result.stdout).toBe('real')
+      } finally {
+        rmSync(workspace, { recursive: true, force: true })
+      }
+    },
+  )
+})
+
+describe('argument prompt limit', () => {
+  it('leaves room under each system command-line limit', () => {
+    // Quoting can double a prompt full of quotes under Windows' 32,767.
+    expect(argumentPromptLimit('win32') * 2).toBeLessThan(32_767)
+    // Three UTF-8 bytes per code unit must stay under Linux's 128 KiB per argument.
+    expect(argumentPromptLimit('linux') * 3).toBeLessThan(128 * 1024)
+    expect(argumentPromptLimit('darwin')).toBeGreaterThan(argumentPromptLimit('linux'))
+  })
+})
+
+describe('command overrides', () => {
+  it.skipIf(process.platform === 'win32')(
+    'uses one executable for detection and launches, then clears it',
+    async () => {
+      const { chmodSync, realpathSync } = await import('node:fs')
+      const { commandVersion, locateCommand, locateCommandSync, runCli, setCommandOverride } =
+        await import('./cli.js')
+      const directory = mkdtempSync(path.join(os.tmpdir(), 'cli override '))
+      const executable = path.join(directory, 'custom executable')
+      writeFileSync(
+        executable,
+        '#!/usr/bin/env node\nconsole.log("wrapper 1.2.3", process.argv.slice(2).join(" "))\n',
+      )
+      chmodSync(executable, 0o755)
+      try {
+        setCommandOverride('tastecode-test-command', executable)
+        expect(await locateCommand('tastecode-test-command')).toBe(executable)
+        expect(locateCommandSync('tastecode-test-command')).toBe(executable)
+        const { cliPath } = await import('./updates.js')
+        expect(await cliPath('tastecode-test-command')).toBe(realpathSync(executable))
+        expect(await commandVersion('tastecode-test-command')).toContain('1.2.3')
+        expect((await runCli('tastecode-test-command', ['hello world'])).stdout).toContain(
+          'hello world',
+        )
+        expect((await captureCli(spawnCli('tastecode-test-command', ['test']))).stdout).toContain(
+          'test',
+        )
+        setCommandOverride('tastecode-test-command')
+        expect(await locateCommand('tastecode-test-command')).toBeUndefined()
+      } finally {
+        setCommandOverride('tastecode-test-command')
+        rmSync(directory, { recursive: true, force: true })
+      }
+    },
+  )
+})

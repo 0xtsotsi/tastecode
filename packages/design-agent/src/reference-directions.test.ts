@@ -1,0 +1,199 @@
+import { existsSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+import { describe, expect, it, vi } from 'vitest'
+import type { BrandSystem } from './brand.js'
+import type { DesignBrief } from './brief.js'
+import { WEBSITE_LAYOUT_FAMILIES } from './page.js'
+import {
+  REFERENCE_DIRECTIONS,
+  lockPageReferenceDirections,
+  referenceDirectionsForBrand,
+  selectReferenceDirectionDeck,
+  type ReferenceDirection,
+} from './reference-directions.js'
+
+// Dashboards are parked behind DASHBOARD_REFERENCES_ENABLED; these tests keep that path working.
+vi.mock('./dashboard-references.js', () => ({ DASHBOARD_REFERENCES_ENABLED: true }))
+
+const brief: DesignBrief = {
+  originalRequest: 'Build a calm launch page for a material research studio.',
+  subject: 'Material research studio',
+  pageType: 'Landing page',
+  scope: 'Single responsive page',
+  primaryGoal: 'Turn qualified visitors into project enquiries',
+  audience: 'Design leaders and product founders',
+  offer: 'Research-led product and brand direction',
+  primaryAction: 'Start a project',
+  requiredContent: [],
+  constraints: [],
+  brandInputs: ['Warm mineral palette'],
+  creativeControl: 'Choose the visual direction',
+  explicitAnswers: [],
+  assumptions: [],
+  unresolved: [],
+}
+
+const brand: BrandSystem = {
+  version: 1,
+  foundation: {
+    strategy: 'create',
+    existingAssets: [],
+    assetActions: [],
+    lockedDecisions: [],
+    assumptions: [],
+  },
+  creativeDirection: {
+    summary: 'Quiet material confidence with precise editorial contrast.',
+    traits: [{ quality: 'Tactile', boundary: 'Never rustic' }],
+    productiveTension: 'Warm matter and exact structure',
+    signatureDevice: {
+      description: 'Cropped material studies interrupt the grid.',
+      status: 'candidate',
+      invariants: ['The crop must reveal real texture.'],
+    },
+    restraint: 'One dominant gesture per section.',
+    avoid: ['Generic dashboard decoration'],
+  },
+  colorPalette: [
+    { name: 'Mineral', value: '#d8d0c2', usage: 'Primary surface' },
+    { name: 'Ink', value: '#171715', usage: 'Text and contrast' },
+  ],
+  typefaces: [
+    { family: 'Inter', source: 'system', roles: ['display', 'body'], weights: [400, 600] },
+  ],
+  interfaceDirection: 'Editorial structure with tactile image-led proof.',
+  imageDirection: {
+    summary: 'Close material studies and composed working scenes.',
+    subjects: ['Materials', 'People at work'],
+    treatment: 'Natural light and preserved image ratio.',
+    avoid: ['Decorative abstract renders'],
+  },
+  motionDirection: {
+    summary: 'Measured spatial continuity.',
+    principles: ['Motion explains hierarchy.'],
+    avoid: ['Continuous ambient motion'],
+  },
+  voice: {
+    summary: 'Direct, calm, and specific.',
+    avoid: ['Empty superlatives'],
+  },
+}
+
+describe('reference directions', () => {
+  it('keeps the 132-file library valid and selects one deterministic cue per family', () => {
+    expect(REFERENCE_DIRECTIONS).toHaveLength(132)
+    expect(new Set(REFERENCE_DIRECTIONS.map(({ id }) => id)).size).toBe(132)
+    expect(new Set(REFERENCE_DIRECTIONS.map(({ imagePath }) => imagePath)).size).toBe(132)
+    expect(new Set(REFERENCE_DIRECTIONS.map(({ family }) => family))).toEqual(
+      new Set(WEBSITE_LAYOUT_FAMILIES),
+    )
+
+    for (const entry of REFERENCE_DIRECTIONS) {
+      expect(entry.id).toMatch(/^direction-\d{3}$/u)
+      expect(entry.cue.trim().length).toBeGreaterThan(20)
+      expect(entry.imagePath).toBe(`references/directions/${entry.family}/${entry.id}.webp`)
+      expect(existsSync(fileURLToPath(new URL(`../${entry.imagePath}`, import.meta.url)))).toBe(
+        true,
+      )
+    }
+
+    const firstDeck = selectReferenceDirectionDeck(brief, brand)
+    const secondDeck = selectReferenceDirectionDeck(brief, brand)
+
+    expect(firstDeck).toEqual(secondDeck)
+    expect(firstDeck).toHaveLength(WEBSITE_LAYOUT_FAMILIES.length)
+    expect(firstDeck.map(({ family }) => family)).toEqual(WEBSITE_LAYOUT_FAMILIES)
+    expect(new Set(firstDeck.map(({ family }) => family)).size).toBe(WEBSITE_LAYOUT_FAMILIES.length)
+  })
+
+  it('does not reshuffle composition references when only brand styling changes', () => {
+    const restyledBrand: BrandSystem = {
+      ...brand,
+      colorPalette: [
+        { name: 'Paper', value: '#f6f3ed', usage: 'Primary surface' },
+        { name: 'Cobalt', value: '#1947e5', usage: 'Accent' },
+      ],
+      typefaces: [
+        {
+          family: 'Helvetica Neue',
+          source: 'system',
+          roles: ['display', 'body'],
+          weights: [400, 700],
+        },
+      ],
+    }
+
+    expect(selectReferenceDirectionDeck(brief, restyledBrand).map(({ id }) => id)).toEqual(
+      selectReferenceDirectionDeck(brief, brand).map(({ id }) => id),
+    )
+  })
+
+  it('does not substitute legacy marketing directions for a dashboard', () => {
+    expect(() => selectReferenceDirectionDeck({ ...brief, pageType: 'dashboard' }, brand)).toThrow(
+      'reviewed dashboard reference library',
+    )
+  })
+
+  it('locks either an attached user reference or a family-matched internal direction', () => {
+    const deck = selectReferenceDirectionDeck(brief, brand)
+    const page = {
+      version: 1 as const,
+      sections: [
+        { id: 'hero', layoutFamily: 'hero' as const, referenceDirectionId: 'user-reference-1' },
+      ],
+    } as Parameters<typeof lockPageReferenceDirections>[0]
+
+    expect(lockPageReferenceDirections(page, deck, ['user-reference-1']).sections[0]).toMatchObject(
+      { referenceDirectionId: 'user-reference-1' },
+    )
+    expect(() => lockPageReferenceDirections(page, deck)).toThrow(
+      'must identify an attached user reference or internal direction',
+    )
+  })
+
+  describe('Brand references', () => {
+    const entry = (
+      id: string,
+      family: ReferenceDirection['family'],
+      extra: Partial<ReferenceDirection> = {},
+    ): ReferenceDirection => ({ id, family, cue: id, imagePath: `${id}.webp`, ...extra })
+
+    it('keeps the anchor and at most two same-site compositions in deck order', () => {
+      const deck = [
+        entry('hero', 'hero', { site: 'a.example', role: 'anchor', style: 'Quiet serif.' }),
+        entry('feature-b', 'feature', { site: 'b.example', role: 'similar-site' }),
+        entry('feature-a', 'feature', { site: 'a.example', role: 'same-site' }),
+        entry('about-c', 'about', { site: 'c.example', role: 'fallback' }),
+        entry('about-a', 'about', { site: 'a.example', role: 'same-site' }),
+        entry('pricing-a', 'pricing', { site: 'a.example', role: 'same-site' }),
+      ]
+
+      expect(referenceDirectionsForBrand(deck).map(({ id }) => id)).toEqual([
+        'hero',
+        'feature-a',
+        'about-a',
+      ])
+    })
+
+    it('gives Brand only the anchor when no other composition shares its site', () => {
+      const deck = [
+        entry('feature-b', 'feature', { site: 'b.example', role: 'fallback' }),
+        entry('hero', 'hero', { role: 'anchor' }),
+        entry('about-b', 'about', { site: 'b.example', role: 'fallback' }),
+      ]
+
+      expect(referenceDirectionsForBrand(deck).map(({ id }) => id)).toEqual(['hero'])
+    })
+
+    it('keeps the full deck for decks saved before anchor sampling', () => {
+      const deck = [
+        entry('hero', 'hero', { source: 'https://a.example' }),
+        entry('feature', 'feature', { source: 'https://b.example' }),
+        entry('about', 'about'),
+      ]
+
+      expect(referenceDirectionsForBrand(deck)).toEqual(deck)
+      expect(referenceDirectionsForBrand([])).toEqual([])
+    })
+  })
+})
