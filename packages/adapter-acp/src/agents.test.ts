@@ -35,6 +35,29 @@ describe('ACP persisted sessions', () => {
     expect(findAgentSpec('gemini')).toMatchObject({ command: 'gemini', retired: true })
   })
 
+  it('offers GG Coder and MiniMax as agents of their own', () => {
+    expect(findAgentSpec('ggcoder')).toMatchObject({
+      name: 'GG Coder',
+      command: 'ggcoder',
+      args: ['acp'],
+      sessionModels: true,
+    })
+    // MiniMax runs on the same CLI, launched for MiniMax, and offers only
+    // the models of that provider.
+    expect(findAgentSpec('minimax')).toMatchObject({
+      name: 'MiniMax',
+      command: 'ggcoder',
+      args: ['acp', '--provider', 'minimax'],
+      sessionModels: true,
+      modelProvider: 'minimax',
+    })
+    // GG Coder itself leaves out the providers TasteCode ships on their own,
+    // so no model is offered twice.
+    expect(findAgentSpec('ggcoder')?.excludeModelProviders).toContain('minimax')
+    expect(LISTED_AGENTS.some((agent) => agent.id === 'ggcoder')).toBe(true)
+    expect(LISTED_AGENTS.some((agent) => agent.id === 'minimax')).toBe(true)
+  })
+
   it('reports Kimi signed in only once the login left its credential file', async () => {
     const home = mkdtempSync(join(tmpdir(), 'acp-home-'))
     try {

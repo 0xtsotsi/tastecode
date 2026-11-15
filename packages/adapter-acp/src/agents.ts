@@ -74,6 +74,18 @@ export type AcpAgentSpec = {
   /** ACP config option used to select a model after creating a session. */
   modelConfigId?: string
   /**
+   * Only the models of this model provider are offered. An agent that serves
+   * many providers in one session names the provider of a model in the option
+   * description; a spec that pins one provider uses that to narrow the list.
+   */
+  modelProvider?: string
+  /**
+   * Model providers this agent does not offer. A runtime that speaks for many
+   * providers leaves out the ones TasteCode offers on its own, so the model
+   * list holds no model twice.
+   */
+  excludeModelProviders?: readonly string[]
+  /**
    * No longer offered anywhere in the product. The spec itself must remain:
    * resuming a persisted session still needs the launch command, and deleting
    * the row would turn old threads into a crash instead of a session.
@@ -369,6 +381,50 @@ export const ACP_AGENTS: AcpAgentSpec[] = [
     // Dropped from the roster on Leon's call (2026-08-08); existing qwen
     // threads still resume through this spec, same as gemini.
     retired: true,
+  },
+  {
+    id: 'ggcoder',
+    name: 'GG Coder',
+    maker: 'Ken Kai',
+    command: 'ggcoder',
+    args: ['acp'],
+    // Initialize and session/new captured from ggcoder 5.100.1 on 2026-11-15:
+    // it answers with its own model list and takes a model as a session
+    // config option, like the other agents here. Its initialize also reports
+    // image prompts, so attachments reach the model as images.
+    verified: true,
+    sessionModels: true,
+    // The CLI lists the models of every provider it serves in one session.
+    // The providers TasteCode ships on their own, and MiniMax, which has a
+    // row of its own, are left out so no model is offered twice.
+    excludeModelProviders: ['anthropic', 'openai', 'xai', 'minimax'],
+    setup: cliSetup(
+      'https://github.com/kenkaiiii/gg-framework',
+      'npm install -g @kenkaiiii/ggcoder',
+      true,
+    ),
+  },
+  {
+    id: 'minimax',
+    name: 'MiniMax',
+    maker: 'MiniMax',
+    // The same CLI, launched for MiniMax, so MiniMax is a provider of its own
+    // in the list instead of a model under GG Coder.
+    command: 'ggcoder',
+    args: ['acp', '--provider', 'minimax'],
+    // Initialize and session/new captured from ggcoder 5.100.1 on 2026-11-15:
+    // MiniMax M3 and MiniMax M3.1 Flash answer with image input, which the
+    // design mode needs.
+    verified: true,
+    sessionModels: true,
+    // The CLI lists every provider it serves in one session; only the MiniMax
+    // models belong to this provider.
+    modelProvider: 'minimax',
+    setup: cliSetup(
+      'https://github.com/kenkaiiii/gg-framework',
+      'npm install -g @kenkaiiii/ggcoder',
+      true,
+    ),
   },
 ]
 

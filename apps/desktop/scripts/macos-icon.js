@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process'
-import { copyFile, cp, mkdir, mkdtemp, rm } from 'node:fs/promises'
+import { copyFile, cp, mkdir, mkdtemp, readdir, rm } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -10,7 +10,8 @@ const here = path.dirname(fileURLToPath(import.meta.url))
 const iconSourcePath = path.resolve(here, '../assets/tastecode-icon.icon')
 const iconPngPath = path.resolve(here, '../assets/tastecode-app-icon.png')
 
-const iconsetSizes = [
+/** The sizes an .icns holds, as the names iconutil expects them. */
+const ICONSET_SIZES = [
   ['icon_16x16.png', 16],
   ['icon_16x16@2x.png', 32],
   ['icon_32x32.png', 32],
@@ -23,22 +24,66 @@ const iconsetSizes = [
   ['icon_512x512@2x.png', 1024],
 ]
 
-async function buildIcnsWithoutActool(outputPath) {
+/**
+ * actool compiles the Icon Composer document, but it ships with the full Xcode
+ * app and not with the Command Line Tools. Without it the icon is built from
+ * the app icon PNG, which every Mac has the tools for.
+ *
+ * `xcrun` only finds actool once the developer directory points at a full
+ * Xcode, which takes a root password to set. The binary itself sits in the
+ * Xcode app, so the apps in /Applications are searched too and the matching
+ * developer directory is handed to actool.
+ */
+const XCODE_APPS = '/Applications'
+
+/** The actool of the full Xcode this Mac has, with its developer directory. */
+async function findActool() {
+  try {
+    const { stdout } = await execFileAsync('xcrun', ['--find', 'actool'])
+    const found = stdout.trim()
+    if (found) return { path: found, developerDir: undefined }
+  } catch {
+    // No full Xcode in the developer directory: the apps below are the way.
+  }
+
+  let entries = []
+  try {
+    entries = await readdir(XCODE_APPS)
+  } catch {
+    return undefined
+  }
+  for (const entry of entries.sort().reverse()) {
+    if (!entry.startsWith('Xcode')) continue
+    const developerDir = path.join(XCODE_APPS, entry, 'Contents', 'Developer')
+    const candidate = path.join(developerDir, 'usr', 'bin', 'actool')
+    try {
+      await execFileAsync('/usr/bin/test', ['-x', candidate])
+      return { path: candidate, developerDir }
+    } catch {
+      continue
+    }
+  }
+  return undefined
+}
+
+async function buildIcnsFromPng(outputPath) {
   const iconsetDirectory = `${outputPath}.iconset`
   await mkdir(iconsetDirectory, { recursive: true })
-  for (const [name, size] of iconsetSizes) {
-    const target = path.join(iconsetDirectory, name)
-    await execFileAsync('/usr/bin/sips', [
-      '-z',
-      String(size),
-      String(size),
-      iconPngPath,
-      '--out',
-      target,
-    ])
+  try {
+    for (const [name, size] of ICONSET_SIZES) {
+      await execFileAsync('/usr/bin/sips', [
+        '-z',
+        String(size),
+        String(size),
+        iconPngPath,
+        '--out',
+        path.join(iconsetDirectory, name),
+      ])
+    }
+    await execFileAsync('/usr/bin/iconutil', ['-c', 'icns', iconsetDirectory, '-o', outputPath])
+  } finally {
+    await rm(iconsetDirectory, { recursive: true, force: true })
   }
-  await execFileAsync('/usr/bin/iconutil', ['-c', 'icns', iconsetDirectory, '-o', outputPath])
-  await rm(iconsetDirectory, { recursive: true, force: true })
 }
 
 async function setPlistString(plistPath, key, value) {
@@ -66,10 +111,9 @@ export async function installMacOSIcon(appBundle) {
     await mkdir(resourcesDirectory, { recursive: true })
     const plistPath = path.join(appBundle, 'Contents', 'Info.plist')
 
-    let usedFallback = false
-    try {
-      await execFileAsync('xcrun', [
-        'actool',
+    const actool = await findActool()
+    if (actool) {
+      await execFileAsync(actool.path, [
         iconDocument,
         '--compile',
         outputDirectory,
@@ -94,30 +138,24 @@ export async function installMacOSIcon(appBundle) {
         '26.0',
         '--platform',
         'macosx',
-      ])
-    } catch (error) {
-      // actool ships with the full Xcode app, not with the Command Line Tools.
-      // Fall back to a plain icns so the dev bundle still gets an icon.
-      usedFallback = true
-      console.warn('[desktop] actool unavailable, building the icon with iconutil instead')
-      const icnsPath = path.join(outputDirectory, 'Icon.icns')
-      await buildIcnsWithoutActool(icnsPath)
-      await copyFile(icnsPath, path.join(resourcesDirectory, 'icon.icns'))
-      await setPlistString(plistPath, 'CFBundleIconFile', 'icon.icns')
-    }
+      ], { env: { ...process.env, DEVELOPER_DIR: actool.developerDir ?? process.env.DEVELOPER_DIR } })
 
-    if (!usedFallback) {
-      await Promise.all([
-        copyFile(
-          path.join(outputDirectory, 'Assets.car'),
-          path.join(resourcesDirectory, 'Assets.car'),
-        ),
-        copyFile(path.join(outputDirectory, 'Icon.icns'), path.join(resourcesDirectory, 'icon.icns')),
-      ])
-
-      await setPlistString(plistPath, 'CFBundleIconFile', 'icon.icns')
+      await copyFile(
+        path.join(outputDirectory, 'Assets.car'),
+        path.join(resourcesDirectory, 'Assets.car'),
+      )
       await setPlistString(plistPath, 'CFBundleIconName', 'Icon')
+    } else {
+      // Without actool the bundle only gets the plain icns below.
+      console.warn('[desktop] actool needs the full Xcode; building the icon with iconutil')
     }
+
+    // The icns is the legacy icon macOS falls back to. actool does not write
+    // one for an Icon Composer document, so it is built from the app icon PNG.
+    const icnsPath = path.join(outputDirectory, 'icon.icns')
+    await buildIcnsFromPng(icnsPath)
+    await copyFile(icnsPath, path.join(resourcesDirectory, 'icon.icns'))
+    await setPlistString(plistPath, 'CFBundleIconFile', 'icon.icns')
   } finally {
     await rm(temporaryDirectory, { recursive: true, force: true })
   }

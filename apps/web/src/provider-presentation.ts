@@ -55,6 +55,8 @@ const ACP_AGENTS = {
   gemini: { label: 'Gemini CLI', mark: 'gemini' },
   kimi: { label: 'Kimi CLI', mark: 'kimi' },
   qwen: { label: 'Qwen Code', mark: 'qwen' },
+  ggcoder: { label: 'GG Coder', mark: 'acp' },
+  minimax: { label: 'MiniMax', mark: 'acp' },
   devin: { label: 'Devin', mark: 'devin' },
   copilot: { label: 'GitHub Copilot', mark: 'copilot' },
   droid: { label: 'Droid', mark: 'droid' },

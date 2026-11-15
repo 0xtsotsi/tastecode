@@ -128,6 +128,8 @@ type AcpLaunchSpec = Pick<
   | 'supportedVersion'
   | 'modelArg'
   | 'modelConfigId'
+  | 'modelProvider'
+  | 'excludeModelProviders'
   | 'loginArgs'
   | 'sessionModels'
 >
@@ -499,7 +501,15 @@ export class AcpAdapter extends EventEmitter<AcpAdapterEvents> {
           { cwd: folder, mcpServers: [] },
           { result: NewSessionResultSchema },
         )
-        return { signedIn: true, models: sessionModels(session) }
+        return {
+          signedIn: true,
+          models: sessionModels(session, {
+            ...(this.#spec.modelProvider ? { provider: this.#spec.modelProvider } : {}),
+            ...(this.#spec.excludeModelProviders
+              ? { excludeProviders: this.#spec.excludeModelProviders }
+              : {}),
+          }),
+        }
       } catch (cause) {
         if (isAuthRequired(cause)) return { signedIn: false, models: [] }
         throw cause

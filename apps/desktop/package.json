@@ -18,7 +18,7 @@
     "test:release-tools": "node --test ../../tools/scripts/release-tools.test.js",
     "typecheck": "tsc -b",
     "start": "tsc -b && node scripts/build-main.js && node scripts/build-preload.js && node scripts/start.js",
-    "test": "vitest run src --passWithNoTests",
+    "test": "vitest run src --passWithNoTests && node --test scripts/*.test.js",
     "dist": "pnpm -w licenses:verify && pnpm --filter @harness/default-skills sync && pnpm -w build && node scripts/build-preload.js && electron-builder -c.extraMetadata.tastecodeEdition=dev",
     "dist:dir": "pnpm -w licenses:verify && pnpm --filter @harness/default-skills sync && pnpm -w build && node scripts/build-preload.js && electron-builder --dir -c.extraMetadata.tastecodeEdition=dev",
     "dist:release": "pnpm -w licenses:verify && pnpm --filter @harness/default-skills sync && pnpm -w build && node scripts/build-preload.js && electron-builder",

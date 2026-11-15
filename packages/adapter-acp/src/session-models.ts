@@ -18,8 +18,16 @@ export function modelConfigOption(
  * The models a new session offers, as the agent names them. The config
  * option is preferred because `session/set_config_option` is how a chat
  * applies the choice; the older `models` list answers for agents without one.
+ *
+ * `provider` narrows the list to the models of one model provider, for an
+ * agent that serves several of them in a single session; `excludeProviders`
+ * leaves out the ones another agent of ours already offers.
  */
-export function sessionModels(session: NewSessionResult): Model[] {
+export function sessionModels(
+  session: NewSessionResult,
+  filter: { provider?: string; excludeProviders?: readonly string[] } = {},
+): Model[] {
+  const excluded = new Set((filter.excludeProviders ?? []).map((entry) => entry.toLowerCase()))
   const select = modelConfigOption(session)
   if (select) {
     const values = (select.options ?? []).flatMap((entry) =>
@@ -29,6 +37,9 @@ export function sessionModels(session: NewSessionResult): Model[] {
     return values.flatMap((value) => {
       if (!value.value || seen.has(value.value)) return []
       seen.add(value.value)
+      const provider = value.description?.trim().toLowerCase()
+      if (filter.provider !== undefined && provider !== filter.provider.toLowerCase()) return []
+      if (provider !== undefined && excluded.has(provider)) return []
       return [
         model(value.value, value.name, value.description, value.value === select.currentValue),
       ]
