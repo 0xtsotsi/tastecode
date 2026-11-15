@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process'
-import { copyFile, cp, mkdir, mkdtemp, rm } from 'node:fs/promises'
+import { copyFile, cp, mkdir, mkdtemp, readdir, rm } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -31,25 +31,34 @@ const ICONSET_SIZES = [
  *
  * `xcrun` only finds actool once the developer directory points at a full
  * Xcode, which takes a root password to set. The binary itself sits in the
- * Xcode app, so it is looked up there too and used without switching.
+ * Xcode app, so the apps in /Applications are searched too and the matching
+ * developer directory is handed to actool.
  */
-const ACTOOL_PATHS = [
-  '/Applications/Xcode.app/Contents/Developer/usr/bin/actool',
-  '/Applications/Xcode-beta.app/Contents/Developer/usr/bin/actool',
-]
+const XCODE_APPS = '/Applications'
 
+/** The actool of the full Xcode this Mac has, with its developer directory. */
 async function findActool() {
   try {
     const { stdout } = await execFileAsync('xcrun', ['--find', 'actool'])
     const found = stdout.trim()
-    if (found) return found
+    if (found) return { path: found, developerDir: undefined }
   } catch {
-    // No full Xcode in the developer directory: the paths below are the way.
+    // No full Xcode in the developer directory: the apps below are the way.
   }
-  for (const candidate of ACTOOL_PATHS) {
+
+  let entries = []
+  try {
+    entries = await readdir(XCODE_APPS)
+  } catch {
+    return undefined
+  }
+  for (const entry of entries.sort().reverse()) {
+    if (!entry.startsWith('Xcode')) continue
+    const developerDir = path.join(XCODE_APPS, entry, 'Contents', 'Developer')
+    const candidate = path.join(developerDir, 'usr', 'bin', 'actool')
     try {
       await execFileAsync('/usr/bin/test', ['-x', candidate])
-      return candidate
+      return { path: candidate, developerDir }
     } catch {
       continue
     }
@@ -104,7 +113,7 @@ export async function installMacOSIcon(appBundle) {
 
     const actool = await findActool()
     if (actool) {
-      await execFileAsync(actool, [
+      await execFileAsync(actool.path, [
         iconDocument,
         '--compile',
         outputDirectory,
@@ -129,25 +138,21 @@ export async function installMacOSIcon(appBundle) {
         '26.0',
         '--platform',
         'macosx',
-      ])
+      ], { env: { ...process.env, DEVELOPER_DIR: actool.developerDir ?? process.env.DEVELOPER_DIR } })
 
-      await Promise.all([
-        copyFile(
-          path.join(outputDirectory, 'Assets.car'),
-          path.join(resourcesDirectory, 'Assets.car'),
-        ),
-        copyFile(path.join(outputDirectory, 'Icon.icns'), path.join(resourcesDirectory, 'icon.icns')),
-      ])
-
-      await setPlistString(plistPath, 'CFBundleIconFile', 'icon.icns')
+      await copyFile(
+        path.join(outputDirectory, 'Assets.car'),
+        path.join(resourcesDirectory, 'Assets.car'),
+      )
       await setPlistString(plistPath, 'CFBundleIconName', 'Icon')
-      return
+    } else {
+      // Without actool the bundle only gets the plain icns below.
+      console.warn('[desktop] actool needs the full Xcode; building the icon with iconutil')
     }
 
-    // Without actool the dev bundle gets a plain icns instead of the compiled
-    // asset catalog, so the app still shows its own icon in the Dock.
-    console.warn('[desktop] actool needs the full Xcode; building the icon with iconutil')
-    const icnsPath = path.join(outputDirectory, 'Icon.icns')
+    // The icns is the legacy icon macOS falls back to. actool does not write
+    // one for an Icon Composer document, so it is built from the app icon PNG.
+    const icnsPath = path.join(outputDirectory, 'icon.icns')
     await buildIcnsFromPng(icnsPath)
     await copyFile(icnsPath, path.join(resourcesDirectory, 'icon.icns'))
     await setPlistString(plistPath, 'CFBundleIconFile', 'icon.icns')

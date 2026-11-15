@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, describe, it } from 'node:test'
@@ -40,6 +40,19 @@ describe('the macOS app icon', () => {
       join(bundle, 'Contents', 'Info.plist'),
     ])
     assert.equal(plist.trim(), 'icon.icns')
+  })
+
+  it('compiles the asset catalog when actool is there', { skip: process.platform !== 'darwin' }, async () => {
+    const bundle = makeBundle('with-assets')
+    await installMacOSIcon(bundle)
+
+    const car = join(bundle, 'Contents', 'Resources', 'Assets.car')
+    if (!existsSync(car)) {
+      // No full Xcode on this Mac: the icns is all the bundle gets.
+      assert.ok(existsSync(join(bundle, 'Contents', 'Resources', 'icon.icns')))
+      return
+    }
+    assert.ok(statSync(car).size > 0)
   })
 
   it('leaves a bundle alone on other platforms', { skip: process.platform === 'darwin' }, async () => {
