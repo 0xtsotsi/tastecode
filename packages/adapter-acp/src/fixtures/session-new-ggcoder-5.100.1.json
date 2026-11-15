@@ -1,0 +1,59 @@
+{
+  "sessionId": "ggcoder-session",
+  "configOptions": [
+    {
+      "id": "model",
+      "name": "Model",
+      "category": "model",
+      "type": "select",
+      "currentValue": "MiniMax-M3.1-Flash",
+      "options": [
+        {
+          "value": "gemini-3.1-pro-preview",
+          "name": "Gemini 3.1 Pro (Preview)",
+          "description": "gemini"
+        },
+        {
+          "value": "kimi-k3",
+          "name": "Kimi K3",
+          "description": "moonshot"
+        },
+        {
+          "value": "glm-5.3",
+          "name": "GLM-5.3",
+          "description": "glm"
+        },
+        {
+          "value": "MiniMax-M3.1-Flash",
+          "name": "MiniMax M3.1 Flash",
+          "description": "minimax"
+        },
+        {
+          "value": "MiniMax-M3",
+          "name": "MiniMax M3",
+          "description": "minimax"
+        },
+        {
+          "value": "deepseek-v4-pro",
+          "name": "DeepSeek V4 Pro",
+          "description": "deepseek"
+        }
+      ]
+    }
+  ],
+  "modes": {
+    "currentModeId": "default",
+    "availableModes": [
+      {
+        "id": "default",
+        "name": "Default",
+        "description": "Full tool access"
+      },
+      {
+        "id": "plan",
+        "name": "Plan",
+        "description": "Read-only research until a plan is approved"
+      }
+    ]
+  }
+}

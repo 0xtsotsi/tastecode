@@ -10,7 +10,8 @@ const here = path.dirname(fileURLToPath(import.meta.url))
 const iconSourcePath = path.resolve(here, '../assets/tastecode-icon.icon')
 const iconPngPath = path.resolve(here, '../assets/tastecode-app-icon.png')
 
-const iconsetSizes = [
+/** The sizes an .icns holds, as the names iconutil expects them. */
+const ICONSET_SIZES = [
   ['icon_16x16.png', 16],
   ['icon_16x16@2x.png', 32],
   ['icon_32x32.png', 32],
@@ -23,22 +24,38 @@ const iconsetSizes = [
   ['icon_512x512@2x.png', 1024],
 ]
 
-async function buildIcnsWithoutActool(outputPath) {
+/**
+ * actool compiles the Icon Composer document, but it ships with the full Xcode
+ * app and not with the Command Line Tools. Without it the icon is built from
+ * the app icon PNG, which every Mac has the tools for.
+ */
+async function actoolAvailable() {
+  try {
+    await execFileAsync('xcrun', ['--find', 'actool'])
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function buildIcnsFromPng(outputPath) {
   const iconsetDirectory = `${outputPath}.iconset`
   await mkdir(iconsetDirectory, { recursive: true })
-  for (const [name, size] of iconsetSizes) {
-    const target = path.join(iconsetDirectory, name)
-    await execFileAsync('/usr/bin/sips', [
-      '-z',
-      String(size),
-      String(size),
-      iconPngPath,
-      '--out',
-      target,
-    ])
+  try {
+    for (const [name, size] of ICONSET_SIZES) {
+      await execFileAsync('/usr/bin/sips', [
+        '-z',
+        String(size),
+        String(size),
+        iconPngPath,
+        '--out',
+        path.join(iconsetDirectory, name),
+      ])
+    }
+    await execFileAsync('/usr/bin/iconutil', ['-c', 'icns', iconsetDirectory, '-o', outputPath])
+  } finally {
+    await rm(iconsetDirectory, { recursive: true, force: true })
   }
-  await execFileAsync('/usr/bin/iconutil', ['-c', 'icns', iconsetDirectory, '-o', outputPath])
-  await rm(iconsetDirectory, { recursive: true, force: true })
 }
 
 async function setPlistString(plistPath, key, value) {
@@ -66,8 +83,7 @@ export async function installMacOSIcon(appBundle) {
     await mkdir(resourcesDirectory, { recursive: true })
     const plistPath = path.join(appBundle, 'Contents', 'Info.plist')
 
-    let usedFallback = false
-    try {
+    if (await actoolAvailable()) {
       await execFileAsync('xcrun', [
         'actool',
         iconDocument,
@@ -95,18 +111,7 @@ export async function installMacOSIcon(appBundle) {
         '--platform',
         'macosx',
       ])
-    } catch (error) {
-      // actool ships with the full Xcode app, not with the Command Line Tools.
-      // Fall back to a plain icns so the dev bundle still gets an icon.
-      usedFallback = true
-      console.warn('[desktop] actool unavailable, building the icon with iconutil instead')
-      const icnsPath = path.join(outputDirectory, 'Icon.icns')
-      await buildIcnsWithoutActool(icnsPath)
-      await copyFile(icnsPath, path.join(resourcesDirectory, 'icon.icns'))
-      await setPlistString(plistPath, 'CFBundleIconFile', 'icon.icns')
-    }
 
-    if (!usedFallback) {
       await Promise.all([
         copyFile(
           path.join(outputDirectory, 'Assets.car'),
@@ -117,7 +122,16 @@ export async function installMacOSIcon(appBundle) {
 
       await setPlistString(plistPath, 'CFBundleIconFile', 'icon.icns')
       await setPlistString(plistPath, 'CFBundleIconName', 'Icon')
+      return
     }
+
+    // Without actool the dev bundle gets a plain icns instead of the compiled
+    // asset catalog, so the app still shows its own icon in the Dock.
+    console.warn('[desktop] actool needs the full Xcode; building the icon with iconutil')
+    const icnsPath = path.join(outputDirectory, 'Icon.icns')
+    await buildIcnsFromPng(icnsPath)
+    await copyFile(icnsPath, path.join(resourcesDirectory, 'icon.icns'))
+    await setPlistString(plistPath, 'CFBundleIconFile', 'icon.icns')
   } finally {
     await rm(temporaryDirectory, { recursive: true, force: true })
   }

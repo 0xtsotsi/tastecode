@@ -98,8 +98,27 @@ describe('ACP session models', () => {
     ])
   })
 
-  it('flattens grouped options and drops repeats', () => {
+  it('keeps only the models of one provider when the agent serves many', () => {
+    // GG Coder lists the models of every provider it serves in one session.
+    const ggcoder = fixture('session-new-ggcoder-5.100.1.json')
+    expect(sessionModels(ggcoder).map((model) => model.id)).toEqual([
+      'gemini-3.1-pro-preview',
+      'kimi-k3',
+      'glm-5.3',
+      'MiniMax-M3.1-Flash',
+      'MiniMax-M3',
+      'deepseek-v4-pro',
+    ])
     expect(
+      sessionModels(ggcoder, { provider: 'minimax' }).map((model) => model.id),
+    ).toEqual(['MiniMax-M3.1-Flash', 'MiniMax-M3'])
+    expect(sessionModels(ggcoder, { provider: 'minimax' })[0]?.isDefault).toBe(true)
+    expect(
+      sessionModels(ggcoder, { excludeProviders: ['minimax', 'glm'] }).map((model) => model.id),
+    ).toEqual(['gemini-3.1-pro-preview', 'kimi-k3', 'deepseek-v4-pro'])
+  })
+
+  it('flattens grouped options and drops repeats', () => {    expect(
       sessionModels({
         configOptions: [
           {
@@ -130,8 +149,15 @@ describe('ACP session probe', () => {
     expect(probe.models.map((model) => model.id)).toEqual(['devstral-2', 'devstral-small', 'local'])
   })
 
-  it('reports signed out when the agent refuses the session with auth_required', async () => {
-    answers = {
+  it('reports only the models of the provider an agent is pinned to', async () => {
+    const ggcoder = fixture('session-new-ggcoder-5.100.1.json')
+    answers = { initialize, 'session/new': () => ggcoder as JsonRpcValue }
+    const probe = await new AcpAdapter('minimax').probeSession()
+    expect(probe.signedIn).toBe(true)
+    expect(probe.models.map((model) => model.id)).toEqual(['MiniMax-M3.1-Flash', 'MiniMax-M3'])
+  })
+
+  it('reports signed out when the agent refuses the session with auth_required', async () => {    answers = {
       initialize,
       // Droid 0.233.0, Copilot 1.0.100, Qoder 1.1.74 and CodeBuddy all answer so.
       'session/new': () => {
